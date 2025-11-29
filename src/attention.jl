@@ -1,4 +1,4 @@
-module Samba2
+module attention
 
 import LuxCore, Lux, NNlib, Random
 
