@@ -1,8 +1,8 @@
 module Attention
 
-import Lux
-import Random
-import NNlib
+using Lux
+using Random
+using NNlib
 
 const LuxAttentionSupertype = isdefined(Lux, :AbstractExplicitLayer) ?
                               Lux.AbstractExplicitLayer :
@@ -63,45 +63,53 @@ function SWAttention(
 end
 
 # 2. PARAMETER INITIALIZATION
-function Lux.initialparameters(
-    random_number_generator::Random.AbstractRNG,
-    layer::SWAttention,
-)
+# Explicitly define this to ensure params are structured correctly and accessible by field name
+function Lux.initialparameters(rng::Random.AbstractRNG, layer::SWAttention)
     return (
-        query_projection_params = Lux.initialparameters(
-            random_number_generator,
-            layer.QueryProjection,
-        ),
-        key_projection_params = Lux.initialparameters(
-            random_number_generator,
-            layer.KeyProjection,
-        ),
-        value_projection_params = Lux.initialparameters(
-            random_number_generator,
-            layer.ValueProjection,
-        ),
-        output_projection_params = Lux.initialparameters(
-            random_number_generator,
-            layer.OutputProjection,
-        ),
+        QueryProjection = Lux.initialparameters(rng, layer.QueryProjection),
+        KeyProjection = Lux.initialparameters(rng, layer.KeyProjection),
+        ValueProjection = Lux.initialparameters(rng, layer.ValueProjection),
+        OutputProjection = Lux.initialparameters(rng, layer.OutputProjection),
     )
 end
 
-# 3. STATE INITIALIZATION (Stateless layer)
-function Lux.initialstates(_rng::Random.AbstractRNG, layer::SWAttention)
+# 3. STATE INITIALIZATION
+# We need a custom initialstates to include both child states and our mask
+function Lux.initialstates(rng::Random.AbstractRNG, layer::SWAttention)
+    # Initialize mask based on the hint sequence_length
     mask = build_sliding_window_mask(layer.sequence_length, layer.window_size)
-    return (; window_mask = mask)
+    
+    # recursively initialize child states
+    child_states = (
+        QueryProjection = Lux.initialstates(rng, layer.QueryProjection),
+        KeyProjection = Lux.initialstates(rng, layer.KeyProjection),
+        ValueProjection = Lux.initialstates(rng, layer.ValueProjection),
+        OutputProjection = Lux.initialstates(rng, layer.OutputProjection),
+    )
+    
+    return merge(child_states, (; window_mask = mask))
 end
 
 # 4. FORWARD PASS
 function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
-    window_mask = state.window_mask
-
     # ---------------------------------------------------------
-    # A. Handle Dimensions
+    # A. Handle Dimensions & Masking
     # ---------------------------------------------------------
     # Expected Input: (Features, Time) or (Features, Time, Batch)
     is_input_batched = ndims(input_tensor) == 3
+    
+    # Get current sequence length T
+    current_T = is_input_batched ? size(input_tensor, 2) : size(input_tensor, 2)
+    
+    # Dynamic Masking Check
+    cached_mask = state.window_mask
+    # Check if cached mask is valid for current input T. 
+    # Assuming square mask (T, T).
+    active_mask = if size(cached_mask, 1) == current_T
+        cached_mask
+    else
+        build_sliding_window_mask(current_T, layer.window_size)
+    end
 
     # Standardize to 3D Tensor: (Features, Time, Batch)
     input_3d_tensor =
@@ -116,73 +124,38 @@ function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
     # Reshape to 2D (Features, Time * Batch) for efficient Dense Layer processing
     input_flattened_for_projection = reshape(input_3d_tensor, feature_dimension, :)
 
-    # Apply Dense Layers
-    # Note: Lux Dense layers return a tuple (output, state), we only need the output [1]
-    query_projected_flat = layer.QueryProjection(
-        input_flattened_for_projection,
-        params.query_projection_params,
-        state,
-    )[1]
-    key_projected_flat = layer.KeyProjection(
-        input_flattened_for_projection,
-        params.key_projection_params,
-        state,
-    )[1]
-    value_projected_flat = layer.ValueProjection(
-        input_flattened_for_projection,
-        params.value_projection_params,
-        state,
-    )[1]
+    # Apply Dense Layers with correct params/state
+    # Params are automatically structured by Lux as (QueryProjection=..., etc.)
+    # State is structured by us in initialstates
+    
+    q_flat, q_st = layer.QueryProjection(input_flattened_for_projection, params.QueryProjection, state.QueryProjection)
+    k_flat, k_st = layer.KeyProjection(input_flattened_for_projection, params.KeyProjection, state.KeyProjection)
+    v_flat, v_st = layer.ValueProjection(input_flattened_for_projection, params.ValueProjection, state.ValueProjection)
 
     # Reshape back to 3D: (Features, Time, Batch)
-    query_tensor =
-        reshape(query_projected_flat, feature_dimension, sequence_length, batch_size)
-    key_tensor = reshape(key_projected_flat, feature_dimension, sequence_length, batch_size)
-    value_tensor =
-        reshape(value_projected_flat, feature_dimension, sequence_length, batch_size)
+    query_tensor = reshape(q_flat, feature_dimension, sequence_length, batch_size)
+    key_tensor   = reshape(k_flat, feature_dimension, sequence_length, batch_size)
+    value_tensor = reshape(v_flat, feature_dimension, sequence_length, batch_size)
 
     # ---------------------------------------------------------
     # C. Multi-Head Splitting
     # ---------------------------------------------------------
-    # Current Shape: (Head_Dim * Heads, Time, Batch)
-    # Target Shape:  (Head_Dim, Heads, Time, Batch)
+    # Target Shape: (Head_Dim, Heads, Time, Batch) -> (Head_Dim, Time, Heads, Batch)
+    
+    reshape_and_permute = x -> begin
+        x_r = reshape(x, layer.head_dimension, layer.number_of_heads, sequence_length, batch_size)
+        permutedims(x_r, (1, 3, 2, 4))
+    end
 
-    query_reshaped = reshape(
-        query_tensor,
-        layer.head_dimension,
-        layer.number_of_heads,
-        sequence_length,
-        batch_size,
-    )
-    key_reshaped = reshape(
-        key_tensor,
-        layer.head_dimension,
-        layer.number_of_heads,
-        sequence_length,
-        batch_size,
-    )
-    value_reshaped = reshape(
-        value_tensor,
-        layer.head_dimension,
-        layer.number_of_heads,
-        sequence_length,
-        batch_size,
-    )
-
-    # Permute for Batched Multiplication: (Head_Dim, Time, Heads, Batch)
-    # We want Time and Head_Dim to interact in the matrix multiplication
-    query_permuted = permutedims(query_reshaped, (1, 3, 2, 4))
-    key_permuted = permutedims(key_reshaped, (1, 3, 2, 4))
-    value_permuted = permutedims(value_reshaped, (1, 3, 2, 4))
+    query_permuted = reshape_and_permute(query_tensor)
+    key_permuted   = reshape_and_permute(key_tensor)
+    value_permuted = reshape_and_permute(value_tensor)
 
     # ---------------------------------------------------------
     # D. Attention Score Calculation
     # ---------------------------------------------------------
-    # Operation: K^T * Q
+    # K^T * Q
     # Key Transposed: (Time, Head_Dim, Heads, Batch)
-    # Query:          (Head_Dim, Time, Heads, Batch)
-    # Result:         (Time, Time, Heads, Batch)
-
     key_transposed_for_score = permutedims(key_permuted, (2, 1, 3, 4))
 
     # Compute raw scores scaled by sqrt(d_k)
@@ -194,7 +167,8 @@ function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
     # E. Sliding Window Masking
     # ---------------------------------------------------------
     masked_attention_scores =
-        apply_sliding_window_mask(attention_scores_raw, window_mask)
+        apply_sliding_window_mask(attention_scores_raw, active_mask)
+    
     # ---------------------------------------------------------
     # F. Normalization (SigSoftmax Attention)
     # ---------------------------------------------------------
@@ -203,11 +177,7 @@ function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
     # ---------------------------------------------------------
     # G. Weighted Aggregation
     # ---------------------------------------------------------
-    # Operation: Value * Weights
-    # Value:   (Head_Dim, Time, Heads, Batch)
-    # Weights: (Time, Time, Heads, Batch)
-    # Result:  (Head_Dim, Time, Heads, Batch)
-
+    # Value * Weights
     weighted_values = NNlib.batched_mul(value_permuted, normalized_attention_weights)
 
     # ---------------------------------------------------------
@@ -216,28 +186,36 @@ function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
     # Permute back: (Head_Dim, Heads, Time, Batch)
     weighted_values_permuted = permutedims(weighted_values, (1, 3, 2, 4))
 
-    # Merge Heads: (Head_Dim * Heads, Time, Batch) -> (Feature_Dim, Time, Batch)
+    # Merge Heads: (Feature_Dim, Time, Batch)
     output_merged_heads =
         reshape(weighted_values_permuted, feature_dimension, sequence_length, batch_size)
 
-    # Flatten for Dense Layer: (Feature_Dim, Time * Batch)
+    # Flatten for Dense Layer
     output_flattened_for_projection = reshape(output_merged_heads, feature_dimension, :)
 
-    # Apply Output Projection
-    final_output_flat = layer.OutputProjection(
+    final_output_flat, o_st = layer.OutputProjection(
         output_flattened_for_projection,
-        params.output_projection_params,
-        state,
-    )[1]
+        params.OutputProjection,
+        state.OutputProjection
+    )
 
     # Restore 3D Shape
     final_output_3d =
         reshape(final_output_flat, feature_dimension, sequence_length, batch_size)
 
-    # Handle Batch Dimension (drop if input wasn't batched)
+    # Handle Batch Dimension
     final_output = is_input_batched ? final_output_3d : dropdims(final_output_3d, dims = 3)
+    
+    # Update State
+    new_state = (
+        QueryProjection = q_st,
+        KeyProjection = k_st,
+        ValueProjection = v_st,
+        OutputProjection = o_st,
+        window_mask = active_mask
+    )
 
-    return final_output, state
+    return final_output, new_state
 end
 
 end # module
