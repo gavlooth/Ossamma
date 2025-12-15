@@ -528,11 +528,16 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # =========================================================================
     # 6. Final Normalization
     # =========================================================================
-    normalized, norm_state = model.FinalNorm(hidden, params.FinalNorm, state.FinalNorm)
+    # LayerNorm expects 2D input, flatten 3D → 2D → normalize → reshape back
+    hidden_shape = size(hidden)
+    hidden_flat = reshape(hidden, model.embedding_dimension, :)
+    normalized_flat, norm_state = model.FinalNorm(hidden_flat, params.FinalNorm, state.FinalNorm)
+    normalized = reshape(normalized_flat, hidden_shape)
 
     # =========================================================================
     # 7. Output Head → Logits
     # =========================================================================
+    # Dense layer can handle 3D input directly
     logits, out_state = model.OutputHead(normalized, params.OutputHead, state.OutputHead)
     # logits: (vocab_size, seq_len, batch)
 
@@ -604,9 +609,14 @@ function unmask_step(
     num_to_unmask::Int,
     mask_token_id::Int,
 )
-    # Get predictions and confidence
-    predictions = argmax(logits, dims = 1)
-    predictions = dropdims(predictions, dims = 1)  # (seq_len,) or (seq_len, batch)
+    # logits: (vocab_size, seq_len, batch) or (vocab_size, seq_len)
+
+    # Get predictions - extract the vocab index (first dimension)
+    # argmax returns CartesianIndex for 3D, so we extract just the vocab index
+    predictions_raw = argmax(logits, dims = 1)
+    # Extract just the first index (vocab position) from each CartesianIndex
+    predictions = map(ci -> ci[1], predictions_raw)
+    predictions = dropdims(predictions, dims = 1)  # (seq_len, batch) or (seq_len,)
 
     # Get confidence (max probability)
     probs = NNlib.softmax(logits, dims = 1)
@@ -671,8 +681,8 @@ function generate(
     tokens_per_step = ceil(Int, seq_len / num_steps)
 
     for step in 1:num_steps
-        # Current mask ratio (decreasing)
-        mask_ratio = 1.0f0 - (step - 1) / num_steps
+        # Current mask ratio (decreasing) - ensure Float32
+        mask_ratio = Float32(1.0 - (step - 1) / num_steps)
 
         # Forward pass
         inputs = (token_ids = current_ids, mask_ratio = mask_ratio)
