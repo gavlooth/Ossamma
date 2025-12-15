@@ -513,17 +513,27 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # time_emb: (time_dim, batch)
 
     # =========================================================================
-    # 5. Process through OssammaBlocks
+    # 5. Process through OssammaBlocks (Zygote-friendly: no push!)
     # =========================================================================
-    block_states = []
-    for (i, block) in enumerate(model.Blocks)
-        block_key = Symbol("Block_$i")
-        block_params = params.Blocks[block_key]
-        block_state = state.Blocks[block_key]
-
-        hidden, new_block_state = block((hidden, time_emb), block_params, block_state)
-        push!(block_states, new_block_state)
+    # Use foldl to process blocks functionally
+    function process_blocks(hidden_in, blocks, params_blocks, state_blocks, time_emb, n_layers)
+        # Process each block and collect states using recursion/fold
+        function fold_block(acc, i)
+            h, states = acc
+            block_key = Symbol("Block_$i")
+            block = blocks[i]
+            block_params = params_blocks[block_key]
+            block_state = state_blocks[block_key]
+            new_h, new_state = block((h, time_emb), block_params, block_state)
+            (new_h, (states..., new_state))
+        end
+        foldl(fold_block, 1:n_layers; init=(hidden_in, ()))
     end
+
+    hidden, block_states_tuple = process_blocks(
+        hidden, model.Blocks, params.Blocks, state.Blocks, time_emb, model.number_of_layers
+    )
+    block_states = collect(block_states_tuple)
 
     # =========================================================================
     # 6. Final Normalization

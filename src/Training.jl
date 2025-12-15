@@ -66,33 +66,36 @@ end
 """
     masked_cross_entropy_vectorized(logits, targets, mask)
 
-Vectorized version of masked cross-entropy (more Zygote-friendly).
+Vectorized version of masked cross-entropy (Zygote-friendly).
+Uses logsoftmax and sparse indexing.
 """
 function masked_cross_entropy_vectorized(logits, targets, mask)
     vocab_size, seq_len, batch_size = size(logits)
+    n_positions = seq_len * batch_size
 
-    # Log softmax
-    log_probs = NNlib.logsoftmax(logits, dims=1)
+    # Flatten for cross-entropy: (vocab, seq*batch)
+    logits_flat = reshape(logits, vocab_size, n_positions)
+    targets_flat = vec(targets)  # (seq*batch,)
+    mask_flat = vec(Float32.(mask))  # (seq*batch,) as Float32 for multiplication
 
-    # One-hot encode targets: (vocab, seq, batch)
-    targets_onehot = zeros(Float32, vocab_size, seq_len, batch_size)
-    for b in 1:batch_size
-        for s in 1:seq_len
-            targets_onehot[targets[s, b], s, b] = 1.0f0
-        end
-    end
+    # Compute log softmax - numerically stable
+    log_probs = NNlib.logsoftmax(logits_flat, dims=1)  # (vocab, seq*batch)
 
-    # Element-wise multiply and sum over vocab dimension
-    # Result: (seq, batch)
-    target_log_probs = dropdims(sum(log_probs .* targets_onehot, dims=1), dims=1)
+    # For cross-entropy, we need log_probs[targets[i], i] for each position i
+    # Create linear indices for gathering
+    linear_idx = targets_flat .+ vocab_size .* (0:n_positions-1)
 
-    # Mask and average
-    n_masked = sum(mask)
+    # Gather the log probs at target positions
+    log_probs_vec = vec(log_probs)  # flatten to 1D
+    target_log_probs = log_probs_vec[linear_idx]  # (seq*batch,)
+
+    # Mask and average - only count masked positions
+    n_masked = sum(mask_flat)
     if n_masked == 0
-        return 0.0f0
+        return Float32(0.0)
     end
 
-    loss = -sum(target_log_probs .* mask) / n_masked
+    loss = -sum(target_log_probs .* mask_flat) / n_masked
     return loss
 end
 
@@ -288,15 +291,15 @@ Configuration for training loop.
 """
 Base.@kwdef struct TrainingConfig
     batch_size::Int = 32
-    learning_rate::Float32 = 1e-4f0
-    min_learning_rate::Float32 = 1e-6f0
+    learning_rate::Float32 = Float32(1e-4)
+    min_learning_rate::Float32 = Float32(1e-6)
     warmup_steps::Int = 1000
     total_steps::Int = 100000
     eval_every::Int = 1000
     log_every::Int = 100
     save_every::Int = 5000
     mask_schedule::Symbol = :cosine
-    gradient_clip::Float32 = 1.0f0
+    gradient_clip::Float32 = Float32(1.0)
 end
 
 """
