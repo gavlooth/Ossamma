@@ -217,14 +217,14 @@ function warmup_cosine_schedule(
     total_steps::Int,
     base_lr::Float32,
     min_lr::Float32 = 0.0f0,
-)
+)::Float32
     if step < warmup_steps
-        # Linear warmup
-        return base_lr * step / warmup_steps
+        # Linear warmup - ensure Float32 throughout
+        return base_lr * Float32(step) / Float32(warmup_steps)
     else
-        # Cosine decay
-        progress = (step - warmup_steps) / (total_steps - warmup_steps)
-        return min_lr + 0.5f0 * (base_lr - min_lr) * (1 + cos(Float32(π) * progress))
+        # Cosine decay - ensure Float32 throughout
+        progress = Float32(step - warmup_steps) / Float32(total_steps - warmup_steps)
+        return min_lr + 0.5f0 * (base_lr - min_lr) * (1.0f0 + cos(Float32(π) * progress))
     end
 end
 

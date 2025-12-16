@@ -611,6 +611,244 @@ function prepare_custom_dataset(
 end
 
 # ============================================================================
+# Direct Text Download (Reliable Fallback)
+# ============================================================================
+
+"""
+    download_text_from_url(url; cache_dir) -> String
+
+Download raw text directly from a URL. Useful as a fallback when HuggingFace APIs fail.
+"""
+function download_text_from_url(
+    url::String;
+    cache_dir::String = joinpath(homedir(), ".cache", "ossamma", "texts"),
+)
+    mkpath(cache_dir)
+
+    # Create cache filename from URL
+    safe_name = replace(replace(url, r"[^a-zA-Z0-9]" => "_"), r"_+" => "_")
+    safe_name = safe_name[1:min(100, length(safe_name))]
+    cache_file = joinpath(cache_dir, "$(safe_name).txt")
+
+    if isfile(cache_file)
+        println("Loading from cache: $cache_file")
+        return read(cache_file, String)
+    end
+
+    println("Downloading: $url")
+    try
+        response = Downloads.download(url, IOBuffer())
+        text = String(take!(response))
+
+        # Cache the result
+        open(cache_file, "w") do f
+            write(f, text)
+        end
+        println("  Downloaded $(length(text)) characters")
+        println("  Cached to: $cache_file")
+
+        return text
+    catch e
+        error("Failed to download from $url: $e")
+    end
+end
+
+# Project Gutenberg book URLs (public domain, reliable)
+const GUTENBERG_BOOKS = Dict{Symbol, String}(
+    :alice => "https://www.gutenberg.org/cache/epub/11/pg11.txt",           # Alice in Wonderland
+    :pride => "https://www.gutenberg.org/cache/epub/1342/pg1342.txt",       # Pride and Prejudice
+    :sherlock => "https://www.gutenberg.org/cache/epub/1661/pg1661.txt",    # Sherlock Holmes
+    :frankenstein => "https://www.gutenberg.org/cache/epub/84/pg84.txt",    # Frankenstein
+    :dracula => "https://www.gutenberg.org/cache/epub/345/pg345.txt",       # Dracula
+    :moby_dick => "https://www.gutenberg.org/cache/epub/2701/pg2701.txt",   # Moby Dick
+    :war_peace => "https://www.gutenberg.org/cache/epub/2600/pg2600.txt",   # War and Peace
+    :tale_two_cities => "https://www.gutenberg.org/cache/epub/98/pg98.txt", # Tale of Two Cities
+    :great_expectations => "https://www.gutenberg.org/cache/epub/1400/pg1400.txt", # Great Expectations
+    :emma => "https://www.gutenberg.org/cache/epub/158/pg158.txt",          # Emma
+)
+
+"""
+    prepare_gutenberg(; books, seq_length, batch_size, max_vocab_size, rng)
+
+Download and prepare Project Gutenberg books for training.
+This is a reliable fallback when HuggingFace APIs fail.
+
+Arguments:
+- books: List of book symbols from GUTENBERG_BOOKS, or :all for all books
+- seq_length: Sequence length for training
+- batch_size: Batch size
+- max_vocab_size: Maximum vocabulary size
+- rng: Random number generator
+
+Returns (train_loader, val_loader, tokenizer).
+"""
+function prepare_gutenberg(;
+    books::Union{Vector{Symbol}, Symbol} = [:alice, :pride, :sherlock],
+    seq_length::Int = 128,
+    batch_size::Int = 32,
+    max_vocab_size::Int = 10000,
+    val_split::Float64 = 0.1,
+    rng::Random.AbstractRNG = Random.default_rng(),
+)
+    println("=" ^ 60)
+    println("Preparing Project Gutenberg dataset")
+    println("=" ^ 60)
+
+    # Handle :all case
+    book_list = if books == :all
+        collect(keys(GUTENBERG_BOOKS))
+    elseif books isa Symbol
+        [books]
+    else
+        books
+    end
+
+    println("Books to download: $(join(book_list, ", "))")
+
+    # Download all books
+    all_texts = String[]
+    for book in book_list
+        if !haskey(GUTENBERG_BOOKS, book)
+            println("Warning: Unknown book '$book', skipping")
+            continue
+        end
+
+        url = GUTENBERG_BOOKS[book]
+        println("\nDownloading: $book")
+        try
+            text = download_text_from_url(url)
+
+            # Clean up Gutenberg header/footer
+            text = clean_gutenberg_text(text)
+
+            push!(all_texts, text)
+            println("  Cleaned text: $(length(text)) characters")
+        catch e
+            println("  Failed to download $book: $e")
+        end
+    end
+
+    if isempty(all_texts)
+        error("No texts could be downloaded")
+    end
+
+    # Split texts into chunks for training
+    println("\nProcessing texts...")
+    chunk_size = seq_length * 4  # Reasonable chunk size
+    chunks = String[]
+
+    for text in all_texts
+        # Split into paragraphs first
+        paragraphs = split(text, r"\n\n+")
+        current_chunk = ""
+
+        for para in paragraphs
+            para = strip(String(para))
+            if isempty(para)
+                continue
+            end
+
+            if length(current_chunk) + length(para) < chunk_size
+                current_chunk *= " " * para
+            else
+                if length(current_chunk) > seq_length
+                    push!(chunks, strip(current_chunk))
+                end
+                current_chunk = para
+            end
+        end
+
+        if length(current_chunk) > seq_length
+            push!(chunks, strip(current_chunk))
+        end
+    end
+
+    println("  Created $(length(chunks)) text chunks")
+
+    # Shuffle and split into train/val
+    Random.shuffle!(rng, chunks)
+    val_size = max(1, floor(Int, length(chunks) * val_split))
+    train_texts = chunks[1:end-val_size]
+    val_texts = chunks[end-val_size+1:end]
+
+    println("  Train chunks: $(length(train_texts))")
+    println("  Val chunks: $(length(val_texts))")
+
+    # Build tokenizer
+    println("\nBuilding tokenizer...")
+    tokenizer = Tokenizer()
+    build_vocab!(tokenizer, train_texts; max_vocab_size = max_vocab_size)
+    println("  Vocabulary size: $(get_vocab_size(tokenizer))")
+
+    # Create data loaders
+    println("\nCreating data loaders...")
+    train_loader = create_dataloader(tokenizer, train_texts; seq_length, batch_size, rng=rng)
+    val_loader = create_dataloader(tokenizer, val_texts; seq_length, batch_size, shuffle=false, rng=rng)
+
+    println("\nDataset ready!")
+    println("  Train batches: $(length(train_loader))")
+    println("  Val batches: $(length(val_loader))")
+    println("  Vocab size: $(get_vocab_size(tokenizer))")
+    println("  Mask token ID: $(get_mask_token_id(tokenizer) + 1)")
+
+    return train_loader, val_loader, tokenizer
+end
+
+"""
+    clean_gutenberg_text(text) -> String
+
+Remove Project Gutenberg headers and footers from text.
+"""
+function clean_gutenberg_text(text::String)
+    # Find start marker
+    start_markers = [
+        "*** START OF THE PROJECT GUTENBERG",
+        "*** START OF THIS PROJECT GUTENBERG",
+        "*END*THE SMALL PRINT",
+    ]
+
+    end_markers = [
+        "*** END OF THE PROJECT GUTENBERG",
+        "*** END OF THIS PROJECT GUTENBERG",
+        "End of the Project Gutenberg",
+        "End of Project Gutenberg",
+    ]
+
+    # Find content start
+    content_start = 1
+    for marker in start_markers
+        idx = findfirst(marker, text)
+        if idx !== nothing
+            # Find the next newline after the marker
+            newline_idx = findnext('\n', text, idx[end])
+            if newline_idx !== nothing
+                content_start = newline_idx + 1
+            end
+            break
+        end
+    end
+
+    # Find content end
+    content_end = length(text)
+    for marker in end_markers
+        idx = findfirst(marker, text)
+        if idx !== nothing
+            content_end = idx[1] - 1
+            break
+        end
+    end
+
+    cleaned = text[content_start:content_end]
+
+    # Remove excessive whitespace
+    cleaned = replace(cleaned, r"\r\n" => "\n")
+    cleaned = replace(cleaned, r"\n{3,}" => "\n\n")
+    cleaned = strip(cleaned)
+
+    return cleaned
+end
+
+# ============================================================================
 # Exports
 # ============================================================================
 
@@ -618,5 +856,6 @@ export Tokenizer, build_vocab!, encode, decode, get_mask_token_id, get_vocab_siz
 export HuggingFaceDataset, list_hf_datasets, download_hf_dataset, get_texts
 export TextDataLoader, create_dataloader, reset!
 export prepare_tinystories, prepare_wikitext, prepare_custom_dataset
+export prepare_gutenberg, download_text_from_url, GUTENBERG_BOOKS
 
 end # module

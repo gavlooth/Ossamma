@@ -100,6 +100,9 @@ end
 function (layer::LinearAttentionLayer)(inputs::Tuple, parameters, state)
     input_tensor, time_input = inputs
 
+    # Get actual sequence length from input (supports variable length)
+    actual_seq_len = size(input_tensor, 2)
+
     # 1. Projections
     query_tensor, query_state = layer.QueryProjection(input_tensor, parameters.QueryProjection, state.QueryProjection)
     key_tensor, key_state = layer.KeyProjection(input_tensor, parameters.KeyProjection, state.KeyProjection)
@@ -109,7 +112,7 @@ function (layer::LinearAttentionLayer)(inputs::Tuple, parameters, state)
     time_embedding, time_state = layer.TimeProjection(time_input, parameters.TimeProjection, state.TimeProjection)
     time_broadcast = reshape(time_embedding, layer.head_dimension, 1, 1, size(time_input, 2))
 
-    reshape_to_heads(tensor) = reshape(tensor, layer.head_dimension, layer.number_of_heads, layer.sequence_length, :)
+    reshape_to_heads(tensor) = reshape(tensor, layer.head_dimension, layer.number_of_heads, actual_seq_len, :)
     query_heads = reshape_to_heads(query_tensor)
     key_heads = reshape_to_heads(key_tensor)
     value_heads = reshape_to_heads(value_tensor)
@@ -126,16 +129,28 @@ function (layer::LinearAttentionLayer)(inputs::Tuple, parameters, state)
         layer.KeyFeatureLinear(collapse_dimensions(key_with_time), parameters.KeyFeatureLinear, state.KeyFeatureLinear)
 
     # Reshape back to (D, Heads, Seq, Batch) for broadcasting
-    query_features_linear = reshape(query_features_raw, layer.head_dimension, layer.number_of_heads, layer.sequence_length, :)
-    key_features_linear = reshape(key_features_raw, layer.head_dimension, layer.number_of_heads, layer.sequence_length, :)
+    query_features_linear = reshape(query_features_raw, layer.head_dimension, layer.number_of_heads, actual_seq_len, :)
+    key_features_linear = reshape(key_features_raw, layer.head_dimension, layer.number_of_heads, actual_seq_len, :)
 
     # 4. Position Injection & STABILIZED Activation
-    position_indices = 1:layer.sequence_length
+    # Clamp position indices to embedding size (handles variable seq lengths)
+    max_pos = min(actual_seq_len, layer.sequence_length)
+    position_indices = 1:max_pos
     position_cosine_raw, position_cosine_state = layer.PositionEmbeddingCosine(position_indices, parameters.PositionEmbeddingCosine, state.PositionEmbeddingCosine)
     position_sine_raw, position_sine_state = layer.PositionEmbeddingSine(position_indices, parameters.PositionEmbeddingSine, state.PositionEmbeddingSine)
 
-    position_cosine = reshape(position_cosine_raw, layer.head_dimension, 1, layer.sequence_length, 1)
-    position_sine = reshape(position_sine_raw, layer.head_dimension, 1, layer.sequence_length, 1)
+    # Handle case where actual_seq_len > max_pos by padding with last position
+    if actual_seq_len > max_pos
+        # Repeat last position embedding for positions beyond max
+        pad_size = actual_seq_len - max_pos
+        last_cos = position_cosine_raw[:, end:end]
+        last_sin = position_sine_raw[:, end:end]
+        position_cosine_raw = hcat(position_cosine_raw, repeat(last_cos, 1, pad_size))
+        position_sine_raw = hcat(position_sine_raw, repeat(last_sin, 1, pad_size))
+    end
+
+    position_cosine = reshape(position_cosine_raw, layer.head_dimension, 1, actual_seq_len, 1)
+    position_sine = reshape(position_sine_raw, layer.head_dimension, 1, actual_seq_len, 1)
 
     # --- The Fix: Multiply First, Softplus Last ---
     # This allows negative embeddings to flip the signal,
@@ -154,7 +169,7 @@ function (layer::LinearAttentionLayer)(inputs::Tuple, parameters, state)
     # (Applying LN per token vector)
     # Flatten to 2D for LayerNorm, then reshape back to 4D
     flatten_for_norm(tensor) = reshape(tensor, layer.head_dimension, :)
-    unflatten_from_norm(tensor) = reshape(tensor, layer.head_dimension, layer.number_of_heads, layer.sequence_length, :)
+    unflatten_from_norm(tensor) = reshape(tensor, layer.head_dimension, layer.number_of_heads, actual_seq_len, :)
 
     query_stream_cosine_flat, feature_norm_state_one = layer.FeatureNorm(flatten_for_norm(query_stream_cosine), parameters.FeatureNorm, state.FeatureNorm)
     query_stream_cosine = unflatten_from_norm(query_stream_cosine_flat)
@@ -169,7 +184,7 @@ function (layer::LinearAttentionLayer)(inputs::Tuple, parameters, state)
     key_stream_sine = unflatten_from_norm(key_stream_sine_flat)
 
     # 6. Linear Attention (Standard)
-    merge_batch_dimensions(tensor) = reshape(tensor, layer.head_dimension, layer.sequence_length, :)
+    merge_batch_dimensions(tensor) = reshape(tensor, layer.head_dimension, actual_seq_len, :)
     value_sequence = merge_batch_dimensions(value_heads)
 
     function run_attention_stream(query_stream, key_stream)
@@ -182,7 +197,7 @@ function (layer::LinearAttentionLayer)(inputs::Tuple, parameters, state)
     attention_output = run_attention_stream(query_stream_cosine, key_stream_cosine) .+ run_attention_stream(query_stream_sine, key_stream_sine)
 
     # 7. Final Projection
-    output_reshaped = reshape(attention_output, layer.embedding_dimension, layer.sequence_length, :)
+    output_reshaped = reshape(attention_output, layer.embedding_dimension, actual_seq_len, :)
     final_output, output_state = layer.OutputProjection(output_reshaped, parameters.OutputProjection, state.OutputProjection)
 
     # Update State

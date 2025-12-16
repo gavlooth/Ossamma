@@ -64,9 +64,9 @@ const CONFIG = (
     use_production_config = false,  # Set true for full production (149M params)
                                     # false uses smaller config for faster iteration
 
-    # Dataset (HuggingFace API limits to ~10k rows per request)
-    dataset = :tinystories,  # :tinystories, :wikitext, :synthetic
-    num_train_samples = 5000,   # Keep under 10k for HF API
+    # Dataset options: :gutenberg (reliable), :tinystories, :wikitext, :synthetic
+    dataset = :gutenberg,  # Use :gutenberg for reliable text data
+    num_train_samples = 5000,   # Keep under 10k for HF API (not used for gutenberg)
     num_val_samples = 500,
 
     # Training hyperparameters
@@ -147,7 +147,15 @@ rng = Random.MersenneTwister(42)
 println("[Data] Loading dataset: $(CONFIG.dataset)")
 flush(stdout)
 
-train_loader, val_loader, tokenizer = if CONFIG.dataset == :tinystories
+train_loader, val_loader, tokenizer = if CONFIG.dataset == :gutenberg
+    prepare_gutenberg(;
+        books = :all,  # All 10 classic novels for more training data
+        seq_length = CONFIG.seq_length,
+        batch_size = CONFIG.batch_size,
+        max_vocab_size = model_config.vocab_size,
+        rng = rng,
+    )
+elseif CONFIG.dataset == :tinystories
     prepare_tinystories(;
         num_train_rows = CONFIG.num_train_samples,
         num_val_rows = CONFIG.num_val_samples,
@@ -199,7 +207,7 @@ elseif CONFIG.dataset == :synthetic
 
     (train_loader, val_loader, tokenizer)
 else
-    error("Unknown dataset: $(CONFIG.dataset). Options: :tinystories, :wikitext, :synthetic")
+    error("Unknown dataset: $(CONFIG.dataset). Options: :gutenberg, :tinystories, :wikitext, :synthetic")
 end
 
 actual_vocab_size = get_vocab_size(tokenizer)
