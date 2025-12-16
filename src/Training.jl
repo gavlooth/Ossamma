@@ -66,36 +66,42 @@ end
 """
     masked_cross_entropy_vectorized(logits, targets, mask)
 
-Vectorized version of masked cross-entropy (Zygote-friendly).
-Uses logsoftmax and sparse indexing.
+Vectorized version of masked cross-entropy (Zygote-compatible).
+Uses one-hot encoding created outside the gradient tape.
 """
 function masked_cross_entropy_vectorized(logits, targets, mask)
     vocab_size, seq_len, batch_size = size(logits)
-    n_positions = seq_len * batch_size
 
-    # Flatten for cross-entropy: (vocab, seq*batch)
-    logits_flat = reshape(logits, vocab_size, n_positions)
-    targets_flat = vec(targets)  # (seq*batch,)
-    mask_flat = vec(Float32.(mask))  # (seq*batch,) as Float32 for multiplication
+    # Log softmax
+    log_probs = NNlib.logsoftmax(logits, dims=1)
 
-    # Compute log softmax - numerically stable
-    log_probs = NNlib.logsoftmax(logits_flat, dims=1)  # (vocab, seq*batch)
-
-    # For cross-entropy, we need log_probs[targets[i], i] for each position i
-    # Create linear indices for gathering
-    linear_idx = targets_flat .+ vocab_size .* (0:n_positions-1)
-
-    # Gather the log probs at target positions
-    log_probs_vec = vec(log_probs)  # flatten to 1D
-    target_log_probs = log_probs_vec[linear_idx]  # (seq*batch,)
-
-    # Mask and average - only count masked positions
-    n_masked = sum(mask_flat)
-    if n_masked == 0
-        return Float32(0.0)
+    # Create one-hot encoding outside gradient computation
+    # Zygote.@ignore prevents differentiation through this block
+    targets_onehot = Zygote.@ignore begin
+        oh = zeros(Float32, vocab_size, seq_len, batch_size)
+        for b in 1:batch_size
+            for s in 1:seq_len
+                t = targets[s, b]
+                if 1 <= t <= vocab_size
+                    oh[t, s, b] = 1.0f0
+                end
+            end
+        end
+        oh
     end
 
-    loss = -sum(target_log_probs .* mask_flat) / n_masked
+    # Element-wise multiply and sum over vocab dimension
+    # Result: (seq, batch) - this IS differentiated
+    target_log_probs = dropdims(sum(log_probs .* targets_onehot, dims=1), dims=1)
+
+    # Mask and average
+    mask_float = Float32.(mask)
+    n_masked = sum(mask_float)
+    if n_masked == 0
+        return 0.0f0
+    end
+
+    loss = -sum(target_log_probs .* mask_float) / n_masked
     return loss
 end
 
@@ -291,15 +297,15 @@ Configuration for training loop.
 """
 Base.@kwdef struct TrainingConfig
     batch_size::Int = 32
-    learning_rate::Float32 = Float32(1e-4)
-    min_learning_rate::Float32 = Float32(1e-6)
+    learning_rate::Float32 = 1e-4f0
+    min_learning_rate::Float32 = 1e-6f0
     warmup_steps::Int = 1000
     total_steps::Int = 100000
     eval_every::Int = 1000
     log_every::Int = 100
     save_every::Int = 5000
     mask_schedule::Symbol = :cosine
-    gradient_clip::Float32 = Float32(1.0)
+    gradient_clip::Float32 = 1.0f0
 end
 
 """

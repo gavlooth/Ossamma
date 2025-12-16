@@ -1,7 +1,7 @@
 module Ossamma
 
 """
-Ossamma -> Oscillatory State Space Attention Masked Morphed Architecture
+Ossamma -> Oscillatory State Space Attention Masked Mixer Architecture
 
 Architecture:
 - Input → LayerNorm (time-conditioned with scale, shift, α_bias)
@@ -301,7 +301,7 @@ end
 include("LLaDA.jl")
 using .LLaDA: LLaDAModel, TimeMLPEmbedding, SinusoidalTimeEmbedding
 using .LLaDA: LLaDAConfig, load_config, save_config, config_from_dict
-using .LLaDA: default_config, small_config, base_config, large_config
+using .LLaDA: default_config, small_config, base_config, large_config, production_config
 using .LLaDA: apply_mask, sample_mask_ratio, unmask_step, generate
 
 # ============================================================================
@@ -326,7 +326,7 @@ export OssammaBlock, TimeConditionedLayerNorm
 # LLaDA model and utilities
 export LLaDAModel, TimeMLPEmbedding, SinusoidalTimeEmbedding
 export LLaDAConfig, load_config, save_config, config_from_dict
-export default_config, small_config, base_config, large_config
+export default_config, small_config, base_config, large_config, production_config
 export apply_mask, sample_mask_ratio, unmask_step, generate
 
 # Training utilities

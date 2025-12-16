@@ -79,19 +79,22 @@ end
 Create config from a parsed TOML dictionary.
 """
 function config_from_dict(data::Dict)
-    # Flatten nested sections
+    # Recursively flatten nested sections
     flat = Dict{Symbol, Any}()
 
-    # Handle nested [model], [training], [generation] sections
-    for (section, values) in data
-        if values isa Dict
-            for (key, val) in values
+    function flatten!(d::Dict, prefix::String = "")
+        for (key, val) in d
+            if val isa Dict
+                # Recurse into nested dicts
+                flatten!(val, prefix * key * "_")
+            else
+                # Use the key directly (ignoring prefix for backward compatibility)
                 flat[Symbol(key)] = val
             end
-        else
-            flat[Symbol(section)] = values
         end
     end
+
+    flatten!(data)
 
     # Convert mask_schedule string to Symbol
     if haskey(flat, :mask_schedule) && flat[:mask_schedule] isa String
@@ -226,6 +229,31 @@ function large_config()
         number_of_layers = 24,
         time_dimension = 256,
         state_dimension = 1024,
+    )
+end
+
+"""
+    production_config() -> LLaDAConfig
+
+Return a production-ready configuration optimized for 24GB+ GPUs.
+Well-balanced for serious training with sensible oscillator dynamics.
+"""
+function production_config()
+    LLaDAConfig(
+        vocab_size = 32000,
+        max_sequence_length = 1024,
+        embedding_dimension = 768,
+        number_of_heads = 12,
+        number_of_layers = 12,
+        time_dimension = 256,
+        state_dimension = 768,
+        window_size = 128,
+        min_frequency = 0.01f0,
+        max_frequency = 5.0f0,
+        default_time_step = 0.05f0,
+        default_num_steps = 50,
+        default_temperature = 0.8f0,
+        mask_schedule = :cosine,
     )
 end
 
@@ -513,27 +541,20 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # time_emb: (time_dim, batch)
 
     # =========================================================================
-    # 5. Process through OssammaBlocks (Zygote-friendly: no push!)
+    # 5. Process through OssammaBlocks (Zygote-compatible using foldl)
     # =========================================================================
-    # Use foldl to process blocks functionally
-    function process_blocks(hidden_in, blocks, params_blocks, state_blocks, time_emb, n_layers)
-        # Process each block and collect states using recursion/fold
-        function fold_block(acc, i)
-            h, states = acc
-            block_key = Symbol("Block_$i")
-            block = blocks[i]
-            block_params = params_blocks[block_key]
-            block_state = state_blocks[block_key]
-            new_h, new_state = block((h, time_emb), block_params, block_state)
-            (new_h, (states..., new_state))
-        end
-        foldl(fold_block, 1:n_layers; init=(hidden_in, ()))
-    end
+    # Use foldl to avoid mutation (push!) which Zygote doesn't support
+    (hidden, block_states) = foldl(
+        enumerate(model.Blocks);
+        init = (hidden, ())
+    ) do (h, states), (i, block)
+        block_key = Symbol("Block_$i")
+        block_params = params.Blocks[block_key]
+        block_state = state.Blocks[block_key]
 
-    hidden, block_states_tuple = process_blocks(
-        hidden, model.Blocks, params.Blocks, state.Blocks, time_emb, model.number_of_layers
-    )
-    block_states = collect(block_states_tuple)
+        new_h, new_block_state = block((h, time_emb), block_params, block_state)
+        (new_h, (states..., new_block_state))
+    end
 
     # =========================================================================
     # 6. Final Normalization
@@ -557,8 +578,9 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # =========================================================================
     # 8. Update State
     # =========================================================================
+    # block_states is already a tuple from foldl
     new_block_states = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
-        Tuple(block_states)
+        block_states
     )
 
     new_state = (
@@ -734,7 +756,7 @@ export LLaDAModel, TimeMLPEmbedding, SinusoidalTimeEmbedding
 
 # Configuration
 export LLaDAConfig, load_config, save_config, config_from_dict
-export default_config, small_config, base_config, large_config
+export default_config, small_config, base_config, large_config, production_config
 
 # Diffusion utilities
 export apply_mask, sample_mask_ratio, unmask_step, generate

@@ -1,0 +1,60 @@
+# LLaDA Model Configuration - Production Ready
+# Optimized for 24GB+ GPU (A100, RTX 4090, etc.)
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+[model]
+vocab_size = 32000          # Standard BPE vocabulary
+max_sequence_length = 1024  # Good for most text generation tasks
+embedding_dimension = 768   # BERT-base sized, well-tested dimension
+number_of_heads = 12        # 64 dims per head (standard attention head size)
+number_of_layers = 12       # Substantial depth for complex patterns
+mask_token_id = -1          # -1 = append [MASK] to vocab
+
+[model.dimensions]
+time_dimension = 256        # Rich time/mask-ratio conditioning
+state_dimension = 768       # Match embedding dim for full oscillator expressiveness
+
+[model.attention]
+window_size = 128           # ~12.5% of sequence for local attention patterns
+
+# Oscillator SSM Parameters
+# Frequencies represent "cycles per unit time" - log-spaced across oscillators
+# Lower = slow/global patterns, Higher = fast/local patterns
+[model.oscillator]
+min_frequency = 0.01        # Very slow oscillations for long-range dependencies
+max_frequency = 5.0         # Fast oscillations for word-level patterns
+default_time_step = 0.05    # Fine temporal resolution
+
+# =============================================================================
+# Training Hyperparameters
+# =============================================================================
+[training]
+batch_size = 16             # Conservative for 24GB with this model size
+learning_rate = 3e-4        # Standard for transformer-scale models
+min_learning_rate = 1e-6    # Floor for cosine decay
+warmup_steps = 4000         # Stable warmup for SSM dynamics
+total_steps = 200000        # Substantial training
+gradient_clip = 1.0         # Standard gradient clipping
+mask_schedule = "cosine"    # Better sample distribution for diffusion
+
+[training.checkpoints]
+eval_every = 1000
+log_every = 100
+save_every = 5000
+
+# =============================================================================
+# Generation Settings
+# =============================================================================
+[generation]
+default_num_steps = 50      # More denoising steps for coherent output
+default_temperature = 0.8   # Slightly focused sampling
+
+# =============================================================================
+# Data Configuration (customize for your dataset)
+# =============================================================================
+[data]
+train_path = "data/train.txt"
+val_path = "data/val.txt"
+tokenizer = "bpe"
