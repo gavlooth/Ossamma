@@ -10,8 +10,8 @@ if [ "$(id -u)" = "0" ]; then
     echo "Running as root - creating claude user..."
     useradd -m -s /bin/bash claude 2>/dev/null || true
 
-    # Install as claude user
-    su - claude -c 'curl -fsSL https://claude.ai/install.sh | bash'
+    # Install as claude user with proper HOME
+    runuser -u claude -- bash -c 'cd ~ && curl -fsSL https://claude.ai/install.sh | bash'
 
     # Create wrapper script to run as claude user
     cat > /usr/local/bin/claude << 'WRAPPER'
