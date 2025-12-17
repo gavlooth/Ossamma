@@ -123,28 +123,28 @@ function finish!(pb::ProgressBar)
     update!(pb, pb.total)
 end
 
-# Higher complexity configuration - balanced for compilation time
+# Higher complexity configuration - MAX GPU utilization for RTX 5090
 const CONFIG = (
-    # Model architecture - 4 layers to reduce JIT compilation time
-    embedding_dim = 384,      # Reasonable size
-    num_heads = 6,            # 6 heads
-    num_layers = 4,           # Reduced from 8 for faster compilation
-    seq_length = 128,         # Shorter for faster training
+    # Model architecture - meaningful LLM size
+    embedding_dim = 512,      # Larger embedding
+    num_heads = 8,            # 8 heads
+    num_layers = 6,           # 6 layers (~32M params)
+    seq_length = 256,         # Longer context
 
-    # Training - CPU-friendly batch size
-    batch_size = 16,          # Smaller batch
-    num_epochs = 15,          # Fewer epochs
-    learning_rate = 2e-4,     # Slightly higher LR
+    # Training - LARGE batch for 32GB VRAM
+    batch_size = 64,          # Large batch for RTX 5090
+    num_epochs = 20,          # More epochs
+    learning_rate = 3e-4,     # Higher LR for large batch
     min_lr = 1e-6,
     warmup_steps = 200,
 
     # Tokenization
-    max_vocab_size = 8000,    # Word-level vocab
-    min_word_freq = 3,        # Filter rare words
+    max_vocab_size = 10000,   # Larger vocab
+    min_word_freq = 2,        # Keep more words
 
     # Checkpointing
     checkpoint_dir = "checkpoints_llm",
-    log_every = 25,
+    log_every = 10,           # More frequent logging
     save_every_epoch = 1,
 )
 
@@ -427,9 +427,9 @@ model_config = LLaDAConfig(
     number_of_heads = CONFIG.num_heads,
     number_of_layers = CONFIG.num_layers,
     mask_token_id = tokenizer.mask_id,
-    time_dimension = 96,
+    time_dimension = 128,
     state_dimension = CONFIG.embedding_dim,
-    window_size = 32,  # Smaller window for 128 seq length
+    window_size = 64,  # Window for 256 seq length
     mask_schedule = :cosine,
 )
 
