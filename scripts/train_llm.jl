@@ -18,8 +18,25 @@ using Zygote
 using Optimisers
 using Statistics: mean
 using Serialization
-using NNlib: logsoftmax
+using NNlib: logsoftmax, onehotbatch
 using Printf
+
+# GPU support
+using CUDA
+using LuxCUDA
+
+# Check GPU availability
+if CUDA.functional()
+    println("✓ CUDA available: $(CUDA.name(CUDA.device()))"); flush(stdout)
+    println("  Memory: $(round(CUDA.total_memory() / 1e9, digits=1)) GB"); flush(stdout)
+    # Allow scalar operations - some operations fall back to CPU
+    # This is slower but necessary until all ops are GPU-native
+    CUDA.allowscalar(true)
+    const GPU_DEVICE = gpu_device()
+else
+    println("✗ CUDA not available, using CPU"); flush(stdout)
+    const GPU_DEVICE = cpu_device()
+end
 
 include(joinpath(dirname(@__DIR__), "src", "Ossamma.jl"))
 using .Ossamma
@@ -106,20 +123,20 @@ function finish!(pb::ProgressBar)
     update!(pb, pb.total)
 end
 
-# Higher complexity configuration
+# Higher complexity configuration - balanced for compilation time
 const CONFIG = (
-    # Model architecture - meaningful LLM size
-    embedding_dim = 512,      # Increased from 128
-    num_heads = 8,            # Increased from 4
-    num_layers = 8,           # Increased from 4
-    seq_length = 256,         # Longer context
+    # Model architecture - 4 layers to reduce JIT compilation time
+    embedding_dim = 384,      # Reasonable size
+    num_heads = 6,            # 6 heads
+    num_layers = 4,           # Reduced from 8 for faster compilation
+    seq_length = 128,         # Shorter for faster training
 
-    # Training
-    batch_size = 8,           # Smaller batch for larger model
-    num_epochs = 20,          # More epochs
-    learning_rate = 1e-4,     # Lower LR for stability
+    # Training - CPU-friendly batch size
+    batch_size = 16,          # Smaller batch
+    num_epochs = 15,          # Fewer epochs
+    learning_rate = 2e-4,     # Slightly higher LR
     min_lr = 1e-6,
-    warmup_steps = 500,
+    warmup_steps = 200,
 
     # Tokenization
     max_vocab_size = 8000,    # Word-level vocab
@@ -127,7 +144,7 @@ const CONFIG = (
 
     # Checkpointing
     checkpoint_dir = "checkpoints_llm",
-    log_every = 50,
+    log_every = 25,
     save_every_epoch = 1,
 )
 
@@ -410,14 +427,19 @@ model_config = LLaDAConfig(
     number_of_heads = CONFIG.num_heads,
     number_of_layers = CONFIG.num_layers,
     mask_token_id = tokenizer.mask_id,
-    time_dimension = 128,
+    time_dimension = 96,
     state_dimension = CONFIG.embedding_dim,
-    window_size = 64,
+    window_size = 32,  # Smaller window for 128 seq length
     mask_schedule = :cosine,
 )
 
 model = LLaDAModel(model_config)
 ps, st = Lux.setup(rng, model)
+
+# Move to GPU
+ps = ps |> GPU_DEVICE
+st = st |> GPU_DEVICE
+println("  Model moved to: $(typeof(GPU_DEVICE))"); flush(stdout)
 
 function count_params(p)
     total = 0
@@ -439,34 +461,42 @@ println("  Architecture: $(CONFIG.num_layers) layers, $(CONFIG.num_heads) heads,
 # Loss Function with Padding Mask
 # ============================================================================
 
-function compute_loss_with_padding(model, params, state, batch, tokenizer, mask_ratio)
+function compute_loss_with_padding(model, params, state, batch_cpu, tokenizer, mask_ratio)
     pad_id = tokenizer.pad_id
-    mask_id = tokenizer.mask_id
+    vocab_size = tokenizer.vocab_size
+
+    # Move batch to GPU
+    batch = CuArray(batch_cpu)
 
     inputs = (token_ids = batch, mask_ratio = mask_ratio)
     logits, new_state = model(inputs, params, state)
 
-    vocab_size = size(logits, 1)
-    seq_len, batch_size = size(batch)
+    seq_len, batch_sz = size(batch)
+    n = seq_len * batch_sz
 
     # Flatten
-    logits_flat = reshape(logits, vocab_size, :)
-    targets_flat = reshape(batch, :)
+    logits_flat = reshape(logits, vocab_size, :)  # (vocab, n)
+    targets_flat = reshape(batch, :)               # (n,) - on GPU
 
     # Numerically stable log softmax
-    log_probs = logsoftmax(logits_flat, dims=1)
+    log_probs = logsoftmax(logits_flat, dims=1)   # (vocab, n)
 
-    # Compute loss only on non-padding tokens
-    loss = 0.0f0
-    count = 0
-    for i in 1:length(targets_flat)
-        if targets_flat[i] != pad_id
-            loss -= log_probs[targets_flat[i], i]
-            count += 1
-        end
-    end
+    # GPU-friendly one-hot: create on CPU then transfer as Float32 array
+    targets_cpu = Array(targets_flat)
+    one_hot_cpu = Float32.(onehotbatch(targets_cpu, 1:vocab_size))  # (vocab, n) Float32 on CPU
+    one_hot = CuArray(one_hot_cpu)  # Move to GPU
 
-    loss = count > 0 ? loss / count : 0.0f0
+    # Gather target log probs via element-wise multiply and sum
+    target_log_probs = sum(log_probs .* one_hot, dims=1)  # (1, n)
+
+    # Create padding mask (1 for non-pad, 0 for pad) on GPU
+    mask_cpu = Float32.(targets_cpu .!= pad_id)  # (n,) on CPU
+    mask = CuArray(reshape(mask_cpu, 1, :))  # (1, n) on GPU
+
+    # Masked cross-entropy loss
+    num_tokens = sum(mask)
+    loss = -sum(target_log_probs .* mask) / max(num_tokens, 1.0f0)
+
     return loss, new_state
 end
 

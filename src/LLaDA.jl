@@ -17,6 +17,28 @@ using TOML
 # Import parent module components
 using ..Ossamma: OssammaBlock, LuxLayer
 
+# Helper to detect and transfer to GPU arrays without requiring CUDA at compile time
+function to_device_like(target, x::AbstractArray)
+    # Check if target is a CUDA array by inspecting type name
+    target_type = string(typeof(target))
+    if occursin("CuArray", target_type)
+        # Get the CUDA module from the target's type
+        cuda_mod = parentmodule(typeof(target))
+        # Use the CuArray constructor from the same module
+        while cuda_mod !== Main && !isdefined(cuda_mod, :CuArray)
+            cuda_mod = parentmodule(cuda_mod)
+        end
+        if isdefined(cuda_mod, :CuArray)
+            return cuda_mod.CuArray(x)
+        end
+    end
+    return x
+end
+
+function is_gpu_array(x)
+    return occursin("CuArray", string(typeof(x)))
+end
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -282,12 +304,13 @@ function (layer::SinusoidalTimeEmbedding)(t, params, state)
     # t: scalar or (1, batch) - mask ratio in [0, 1]
     half_dim = layer.time_dimension ÷ 2
 
-    # Frequency bands
-    freqs = exp.(-(log(layer.max_period)) .* collect(0:half_dim-1) ./ half_dim)
+    # Frequency bands - create on CPU then transfer to match input device
+    freqs_cpu = Float32.(exp.(-(log(layer.max_period)) .* collect(0:half_dim-1) ./ half_dim))
+    freqs = to_device_like(t, freqs_cpu)
 
     # Handle batched input
     if ndims(t) == 0 || (ndims(t) == 2 && size(t, 1) == 1)
-        t_flat = ndims(t) == 0 ? [t] : vec(t)
+        t_flat = ndims(t) == 0 ? reshape([t[1]], :) : vec(t)
         # (half_dim,) * (batch,)' → (half_dim, batch)
         args = freqs * t_flat'
     else
@@ -513,9 +536,11 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     token_emb = reshape(token_emb_flat, model.embedding_dimension, seq_len, batch_size)
 
     # =========================================================================
-    # 2. Position Embedding
+    # 2. Position Embedding (ensure same device as input)
     # =========================================================================
-    position_indices = collect(1:seq_len)
+    # Create position indices on same device as token_ids
+    position_indices_cpu = collect(1:seq_len)
+    position_indices = to_device_like(token_ids, position_indices_cpu)
     pos_emb_raw, pos_state = model.PositionEmbedding(position_indices, params.PositionEmbedding, state.PositionEmbedding)
     # pos_emb_raw: (embedding_dim, seq_len)
     pos_emb = reshape(pos_emb_raw, model.embedding_dimension, seq_len, 1)  # Broadcast over batch
@@ -528,14 +553,15 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # =========================================================================
     # 4. Time Embedding (mask ratio conditioning)
     # =========================================================================
-    # Ensure mask_ratio is (1, batch) shape
-    t_input = if ndims(mask_ratio) == 0
-        fill(mask_ratio, 1, batch_size)
+    # Ensure mask_ratio is (1, batch) shape and on same device as input
+    t_input_cpu = if ndims(mask_ratio) == 0
+        fill(Float32(mask_ratio), 1, batch_size)
     elseif ndims(mask_ratio) == 1
-        reshape(mask_ratio, 1, :)
+        reshape(Float32.(mask_ratio), 1, :)
     else
-        mask_ratio
+        Float32.(mask_ratio)
     end
+    t_input = to_device_like(token_ids, t_input_cpu)
 
     time_emb, time_state = model.TimeEmbedding(t_input, params.TimeEmbedding, state.TimeEmbedding)
     # time_emb: (time_dim, batch)
