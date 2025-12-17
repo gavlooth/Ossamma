@@ -314,11 +314,28 @@ using .Training: warmup_cosine_schedule, evaluate, compute_accuracy
 using .Training: TrainingConfig, load_training_config, train!
 
 # ============================================================================
+# Classification Model
+# ============================================================================
+include("Classification.jl")
+using .Classification: OssammaClassifier, ClassifierConfig
+using .Classification: SequencePooling, FixedTimeEmbedding
+using .Classification: tiny_classifier, small_classifier, base_classifier
+
+# ============================================================================
+# NER Model (Token-level classification)
+# ============================================================================
+include("NER.jl")
+using .NER: OssammaNER, NERConfig
+using .NER: tiny_ner, small_ner, base_ner
+using .NER: ner_cross_entropy, predict_labels, extract_entities
+using .NER: RAG_LABELS, ENTITY_TYPES, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
+
+# ============================================================================
 # Exports
 # ============================================================================
 
 # Re-export submodules for callers who want direct access.
-export Dlinoss, Attention, LinearAttention, ossm, LLaDA
+export Dlinoss, Attention, LinearAttention, ossm, LLaDA, Classification, NER
 
 # Main block
 export OssammaBlock, TimeConditionedLayerNorm
@@ -337,5 +354,16 @@ export TrainingConfig, load_training_config, train!
 
 # Provide conventional aliases for the main layer types.
 export DLinOSS, SWAttention, OscSSM
+
+# Classification model
+export OssammaClassifier, ClassifierConfig
+export SequencePooling, FixedTimeEmbedding
+export tiny_classifier, small_classifier, base_classifier
+
+# NER model
+export OssammaNER, NERConfig
+export tiny_ner, small_ner, base_ner
+export ner_cross_entropy, predict_labels, extract_entities
+export RAG_LABELS, ENTITY_TYPES, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
 
 end

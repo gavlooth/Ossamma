@@ -10,6 +10,152 @@ Both are designed as standalone Lux layers that can be composed into larger netw
 
 ---
 
+## LLaDA Model (Text Diffusion LLM)
+
+The main model to be trained is **LLaDAModel** - a discrete text diffusion language model using Ossamma architecture.
+
+```
+                          ┌──────────────────────────────────────────────────────────────┐
+                          │                      LLaDAModel                               │
+                          │              Text Diffusion Language Model                    │
+                          └──────────────────────────────────────────────────────────────┘
+                                                      │
+                          ┌───────────────────────────┼───────────────────────────┐
+                          │                           │                           │
+                    ┌─────▼─────┐             ┌───────▼───────┐           ┌───────▼───────┐
+                    │  Token    │             │   Position    │           │    Time       │
+                    │ Embedding │             │   Embedding   │           │  Embedding    │
+                    │(vocab→dim)│             │  (pos→dim)    │           │ (sinusoidal   │
+                    └─────┬─────┘             └───────┬───────┘           │  + MLP)       │
+                          │                           │                   └───────┬───────┘
+                          └────────────┬──────────────┘                           │
+                                       │ + (add)                        mask_ratio t ∈ [0,1]
+                                       ▼                                          │
+                          ┌────────────────────────┐                              │
+                          │     hidden (d, L, B)   │◄─────────────────────────────┘
+                          └────────────┬───────────┘
+                                       │
+                          ╔════════════▼════════════╗
+                          ║                         ║
+                          ║  OssammaBlock × N       ║  (N = number_of_layers)
+                          ║                         ║
+                          ╚════════════╤════════════╝
+                                       │
+                          ┌────────────▼────────────┐
+                          │      LayerNorm          │
+                          └────────────┬────────────┘
+                                       │
+                          ┌────────────▼────────────┐
+                          │   Output Head (Dense)   │
+                          │     dim → vocab_size    │
+                          └────────────┬────────────┘
+                                       │
+                          ┌────────────▼────────────┐
+                          │   Logits (V, L, B)      │
+                          └─────────────────────────┘
+```
+
+### OssammaBlock Detail
+
+```
+╔═══════════════════════════════════════════════════════════════════════════════════════════╗
+║                                    OssammaBlock                                            ║
+║     Oscillatory State Space Attention Masked Mixer Architecture                           ║
+╠═══════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                           ║
+║   Input ────────────────────────────────┬─────────────────────────────── Residual         ║
+║             │                           │                                    │            ║
+║             ▼                           │                                    │            ║
+║   ┌─────────────────────────────┐       │                                    │            ║
+║   │ Time-Conditioned LayerNorm  │◄──time_emb                                 │            ║
+║   │  (scale, shift, α_bias)     │       │                                    │            ║
+║   └─────────────┬───────────────┘       │                                    │            ║
+║                 │                       │                                    │            ║
+║      ┌──────────┴──────────────────────────────────────────┐                 │            ║
+║      │                                                      │                │            ║
+║      ▼                                                      ▼                │            ║
+║ ┌─────────────────────────────────────────────┐    ┌───────────────────┐     │            ║
+║ │      Global-Spectral GLU Branch             │    │ Local-Sharp Branch│     │            ║
+║ │                                             │    │                   │     │            ║
+║ │  Dense(d→2d)                                │    │   SWAttention     │     │            ║
+║ │      │                                      │    │   (Sliding        │     │            ║
+║ │      ├─────────────┬────────────┐           │    │    Window         │     │            ║
+║ │  content_half   gate_half       │           │    │    Softmax)       │     │            ║
+║ │      │              │           │           │    │                   │     │            ║
+║ │      ▼              ▼           │           │    └─────────┬─────────┘     │            ║
+║ │ ┌──────────┐  ┌──────────┐     │           │              │               │            ║
+║ │ │ Linear   │  │ DLinOSS  │     │           │              │               │            ║
+║ │ │ Attention│  │(Oscillator│    │           │              │               │            ║
+║ │ │          │  │   SSM)    │    │           │              │               │            ║
+║ │ └────┬─────┘  └────┬─────┘     │           │              │               │            ║
+║ │      │             │           │           │              │               │            ║
+║ │      │         sigmoid         │           │              │               │            ║
+║ │      │             │           │           │              │               │            ║
+║ │      └──────⊙──────┘  (gate)   │           │              │               │            ║
+║ │             │                  │           │              │               │            ║
+║ │         Dense(d→d)             │           │              │               │            ║
+║ │             │                  │           │              │               │            ║
+║ └─────────────┼──────────────────┘           │              │               │            ║
+║               │ glu_output                   │   local_out  │               │            ║
+║               │                              │              │               │            ║
+║               └──────────────┬───────────────┴──────────────┘               │            ║
+║                              │                                              │            ║
+║                              ▼                                              │            ║
+║                   ┌──────────────────────┐                                  │            ║
+║                   │   Adaptive Mixing    │                                  │            ║
+║                   │ α·GLU + (1-α)·Local  │◄── α = σ(f(x) + α_bias(t))       │            ║
+║                   └──────────┬───────────┘                                  │            ║
+║                              │                                              │            ║
+║                              └──────────────────┬────────────────────────────┘            ║
+║                                                 │ + (residual)                           ║
+║                                                 ▼                                        ║
+║                                              Output                                       ║
+╚═══════════════════════════════════════════════════════════════════════════════════════════╝
+```
+
+### Key Components
+
+| Component | Description |
+|-----------|-------------|
+| **DLinOSS** | Damped oscillators with ρ·R(θ) rotation, selective Δt |
+| **LinearAttention** | O(L) complexity, ELU+1 feature map |
+| **SWAttention** | Local window softmax attention with causal masking |
+
+### Training Mode (Text Diffusion)
+
+```
+  "The cat sat on mat"                 Fully Masked               Iterative Denoising
+          │                                 │                            │
+          ▼                                 ▼                            ▼
+  ┌───────────────┐                ┌─────────────────┐          ┌───────────────┐
+  │ Forward pass  │   t→1          │ [M] [M] [M] [M] │  t→0     │ Reverse pass  │
+  │ (masking)     │ ──────────────►│ [M]             │ ────────►│ (denoising)   │
+  └───────────────┘                └─────────────────┘          └───────────────┘
+```
+
+The model follows the **LLaDA** paradigm - a discrete text diffusion model:
+1. **Forward**: progressively masks tokens (clean → fully masked)
+2. **Reverse**: iteratively predicts and unmasks tokens based on confidence (masked → clean)
+
+### Model Configurations
+
+| Config | vocab | embed_dim | heads | layers | seq_len |
+|--------|-------|-----------|-------|--------|---------|
+| small | 1000 | 64 | 2 | 2 | 64 |
+| default | 32000 | 256 | 4 | 6 | 512 |
+| base | 32000 | 512 | 8 | 12 | 512 |
+| large | 32000 | 1024 | 16 | 24 | 1024 |
+| **production** | 32000 | 768 | 12 | 12 | 1024 |
+
+### Core Innovation
+
+The **OssammaBlock** combines:
+- **Global-Spectral**: Linear attention gated by oscillatory SSM (captures long-range patterns)
+- **Local-Sharp**: Sliding window softmax attention (captures local precision)
+- **Adaptive mixing**: Learns when to use global vs local based on content and diffusion timestep `t`
+
+---
+
 ## Current Architecture
 
 ### SWAttention (Sliding Window Attention)
