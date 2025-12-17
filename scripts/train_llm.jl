@@ -19,6 +19,7 @@ using Optimisers
 using Statistics: mean
 using Serialization
 using NNlib: logsoftmax
+using Printf
 
 include(joinpath(dirname(@__DIR__), "src", "Ossamma.jl"))
 using .Ossamma
@@ -27,6 +28,83 @@ include(joinpath(dirname(@__DIR__), "src", "DataLoader.jl"))
 using .DataLoader
 
 println("Packages loaded!"); flush(stdout)
+
+# ============================================================================
+# Progress Bar
+# ============================================================================
+
+mutable struct ProgressBar
+    total::Int
+    current::Int
+    width::Int
+    start_time::Float64
+    desc::String
+    last_print_time::Float64
+end
+
+function ProgressBar(total::Int; width::Int=40, desc::String="Progress")
+    ProgressBar(total, 0, width, time(), desc, 0.0)
+end
+
+function update!(pb::ProgressBar, current::Int; loss::Float32=0.0f0, lr::Float32=0.0f0)
+    pb.current = current
+    now = time()
+
+    # Only update display every 0.5 seconds to reduce flicker
+    if now - pb.last_print_time < 0.5 && current < pb.total
+        return
+    end
+    pb.last_print_time = now
+
+    # Calculate progress
+    progress = current / pb.total
+    filled = Int(round(progress * pb.width))
+    empty = pb.width - filled
+
+    # Calculate ETA
+    elapsed = now - pb.start_time
+    if current > 0
+        eta = elapsed / current * (pb.total - current)
+        eta_str = format_time(eta)
+    else
+        eta_str = "--:--"
+    end
+    elapsed_str = format_time(elapsed)
+
+    # Build progress bar
+    bar = "█" ^ filled * "░" ^ empty
+    pct = @sprintf("%5.1f%%", progress * 100)
+
+    # Build status line
+    status = @sprintf("\r%s |%s| %s [%s<%s] Loss: %.4f LR: %.2e",
+                      pb.desc, bar, pct, elapsed_str, eta_str, loss, lr)
+
+    print(status)
+    flush(stdout)
+
+    if current >= pb.total
+        println()  # New line when complete
+        flush(stdout)
+    end
+end
+
+function format_time(seconds::Float64)
+    if seconds < 60
+        return @sprintf("%02d:%02d", 0, Int(floor(seconds)))
+    elseif seconds < 3600
+        mins = Int(floor(seconds / 60))
+        secs = Int(floor(seconds % 60))
+        return @sprintf("%02d:%02d", mins, secs)
+    else
+        hours = Int(floor(seconds / 3600))
+        mins = Int(floor((seconds % 3600) / 60))
+        return @sprintf("%dh%02dm", hours, mins)
+    end
+end
+
+function finish!(pb::ProgressBar)
+    update!(pb, pb.total)
+end
 
 # Higher complexity configuration
 const CONFIG = (
@@ -416,9 +494,15 @@ for epoch in 1:CONFIG.num_epochs
 
     epoch_loss = 0.0f0
     num_steps = 0
+    current_loss = 0.0f0
+    current_lr = 0.0f0
 
     # Shuffle training batches
     shuffled_batches = Random.shuffle(rng, copy(train_batches))
+    num_batches = length(shuffled_batches)
+
+    # Create progress bar for this epoch
+    pb = ProgressBar(num_batches; width=30, desc=@sprintf("Epoch %2d", epoch))
 
     for (batch_idx, batch) in enumerate(shuffled_batches)
         global_step += 1
@@ -431,6 +515,7 @@ for epoch in 1:CONFIG.num_epochs
             lr = Float32(CONFIG.min_lr + 0.5 * (CONFIG.learning_rate - CONFIG.min_lr) * (1 + cos(π * progress)))
         end
         Optimisers.adjust!(opt_state, lr)
+        current_lr = lr
 
         # Sample mask ratio from cosine schedule
         u = rand(rng)
@@ -445,7 +530,7 @@ for epoch in 1:CONFIG.num_epochs
 
         # Skip if loss is NaN
         if isnan(loss)
-            println("  Warning: NaN loss at step $global_step, skipping"); flush(stdout)
+            println("\n  Warning: NaN loss at step $global_step, skipping"); flush(stdout)
             continue
         end
 
@@ -463,29 +548,32 @@ for epoch in 1:CONFIG.num_epochs
 
         epoch_loss += loss
         num_steps += 1
+        current_loss = loss
 
-        if global_step % CONFIG.log_every == 0
-            elapsed = time() - start_time
-            steps_per_sec = global_step / elapsed
-            println("  Step $global_step | Loss: $(round(loss, digits=4)) | LR: $(round(lr, sigdigits=3)) | $(round(steps_per_sec, digits=2)) steps/s"); flush(stdout)
-        end
+        # Update progress bar
+        update!(pb, batch_idx; loss=current_loss, lr=current_lr)
     end
+
+    # Finish progress bar
+    finish!(pb)
 
     avg_loss = num_steps > 0 ? epoch_loss / num_steps : 0.0f0
     epoch_time = time() - epoch_start
     println("Epoch $epoch done | Avg Loss: $(round(avg_loss, digits=4)) | Time: $(round(epoch_time/60, digits=1)) min"); flush(stdout)
 
-    # Validation
-    println("Validating..."); flush(stdout)
+    # Validation with progress bar
     val_loss = 0.0f0
     val_steps = 0
-    for batch in val_batches
+    val_pb = ProgressBar(length(val_batches); width=30, desc="Validate ")
+    for (i, batch) in enumerate(val_batches)
         loss, _ = compute_loss_with_padding(model, ps, st, batch, tokenizer, 0.5f0)
         if !isnan(loss)
             val_loss += loss
             val_steps += 1
         end
+        update!(val_pb, i; loss=val_steps > 0 ? val_loss / val_steps : 0.0f0, lr=0.0f0)
     end
+    finish!(val_pb)
     avg_val_loss = val_steps > 0 ? val_loss / val_steps : Inf32
     println("  Val Loss: $(round(avg_val_loss, digits=4))"); flush(stdout)
 
