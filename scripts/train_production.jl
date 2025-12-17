@@ -70,17 +70,17 @@ const CONFIG = (
     num_val_samples = 500,
 
     # Training hyperparameters
-    batch_size = 16,           # Reduce if OOM
-    seq_length = 256,          # Sequence length (reduce if OOM)
+    batch_size = 32,           # Larger batch
+    seq_length = 128,          # Shorter for more batches
     learning_rate = 3e-4,
     min_lr = 1e-6,
-    warmup_steps = 500,
-    total_steps = 5000,        # Increase for longer training
+    warmup_steps = 300,
+    total_steps = 10000,       # ~20 epochs
 
     # Logging
     log_every = 50,
-    eval_every = 500,
-    save_every = 1000,
+    eval_every = 500,          # Validate every ~1 epoch
+    save_every = 500,          # Save checkpoint every epoch
 
     # Output
     output_dir = "checkpoints",
@@ -289,14 +289,29 @@ train_config = TrainingConfig(
 # Create output directory
 mkpath(CONFIG.output_dir)
 
-# Callbacks for saving
+# Save tokenizer for later use
+using Serialization
+serialize(joinpath(CONFIG.output_dir, "tokenizer.jls"), Dict(
+    :vocab => tokenizer.vocab,
+    :inverse_vocab => tokenizer.inverse_vocab,
+    :special_tokens => tokenizer.special_tokens,
+    :vocab_size => tokenizer.vocab_size,
+))
+println("[Save] Tokenizer saved to $(CONFIG.output_dir)/tokenizer.jls")
+
+# Callbacks for saving checkpoints
 callbacks = Dict{Symbol, Function}(
     :on_save => function(ts)
-        println("  [Checkpoint] Step $(ts.step)")
-        # Could add model saving here
+        checkpoint_path = joinpath(CONFIG.output_dir, "checkpoint_step_$(ts.step).jls")
+        serialize(checkpoint_path, Dict(:step => ts.step, :params => ts.params, :state => ts.state))
+        println("  [Checkpoint] Saved: $checkpoint_path")
+        flush(stdout)
     end,
     :on_best => function(ts)
-        println("  [Best] New best loss at step $(ts.step)!")
+        best_path = joinpath(CONFIG.output_dir, "checkpoint_best.jls")
+        serialize(best_path, Dict(:step => ts.step, :params => ts.params, :state => ts.state, :loss => ts.best_val_loss))
+        println("  [Best] New best at step $(ts.step)! Saved: $best_path")
+        flush(stdout)
     end,
 )
 

@@ -380,6 +380,7 @@ function train!(
     println("  Batch size: $(config.batch_size)")
     println("  Learning rate: $(config.learning_rate)")
     println()
+    flush(stdout)
 
     running_loss = 0.0f0
     loss_count = 0
@@ -412,6 +413,7 @@ function train!(
         if train_state.step % config.log_every == 0
             avg_loss = running_loss / loss_count
             println("Step $(train_state.step) | Loss: $(round(avg_loss, digits=4)) | LR: $(round(lr, sigdigits=3))")
+            flush(stdout)
             running_loss = 0.0f0
             loss_count = 0
 
