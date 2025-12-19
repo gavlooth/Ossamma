@@ -1,0 +1,65 @@
+# OssammaNER Minimal Configuration - Smoke Testing
+# ~1.5M Parameters - For quick validation and CI/CD pipelines
+
+# =============================================================================
+# Model Architecture (~1.5M Parameters)
+# =============================================================================
+[model]
+vocab_size = 1000               # Minimal vocabulary for testing
+max_sequence_length = 64        # Short sequences
+embedding_dimension = 64        # Minimal embedding
+number_of_heads = 2             # 32 dims per head
+number_of_layers = 2            # Shallow network
+num_labels = 19                 # 9 entity types × 2 (B/I) + O
+
+[model.dimensions]
+time_dimension = 32             # Minimal time conditioning
+state_dimension = 64            # Match embedding dim
+
+[model.attention]
+window_size = 8                 # Small attention window
+
+[model.oscillator]
+min_frequency = 0.1
+max_frequency = 10.0
+default_time_step = 0.1
+
+[model.regularization]
+dropout_rate = 0.1
+label_smoothing = 0.0
+use_crf = false                 # Skip CRF for faster smoke tests
+
+# =============================================================================
+# Training Hyperparameters (Quick validation)
+# =============================================================================
+[training]
+batch_size = 8
+gradient_accumulation_steps = 1
+learning_rate = 1e-3
+min_learning_rate = 1e-5
+warmup_steps = 10
+total_steps = 100               # Just a few steps for smoke test
+gradient_clip = 1.0
+weight_decay = 0.01
+
+[training.checkpoints]
+eval_every = 25
+log_every = 5
+save_every = 50
+push_every = 0                  # Don't push during smoke tests
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+[data]
+train_path = "data/ner/train_mini.jsonl"
+val_path = "data/ner/val_mini.jsonl"
+max_len = 64
+
+# =============================================================================
+# Hardware Settings
+# =============================================================================
+[hardware]
+device = "cpu"                  # CPU for CI/CD
+mixed_precision = false
+num_workers = 1

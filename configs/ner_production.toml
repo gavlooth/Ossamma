@@ -1,0 +1,83 @@
+# OssammaNER Production Configuration
+# ~150M Parameters - For production deployment
+
+# =============================================================================
+# Model Architecture (~150M Parameters)
+# =============================================================================
+[model]
+vocab_size = 50000              # Large vocabulary for diverse text
+max_sequence_length = 512       # Full context for NER
+embedding_dimension = 1024      # Large embedding space
+number_of_heads = 16            # 64 dims per head
+number_of_layers = 10           # Deep network
+num_labels = 19                 # 9 entity types × 2 (B/I) + O
+
+[model.dimensions]
+time_dimension = 256            # Rich time conditioning
+state_dimension = 1024          # Match embedding dim for full capacity
+
+[model.attention]
+window_size = 64                # Balanced local attention
+
+[model.oscillator]
+min_frequency = 0.01            # Very slow oscillations for document-level
+max_frequency = 5.0             # Fast for word-level patterns
+default_time_step = 0.05
+
+[model.regularization]
+dropout_rate = 0.1
+label_smoothing = 0.1
+use_crf = true
+
+# =============================================================================
+# Training Hyperparameters
+# =============================================================================
+[training]
+batch_size = 32
+gradient_accumulation_steps = 4 # Effective batch size = 128
+learning_rate = 2e-4
+min_learning_rate = 1e-7
+warmup_steps = 2000
+total_steps = 100000
+gradient_clip = 1.0
+weight_decay = 0.01
+
+[training.checkpoints]
+eval_every = 500
+log_every = 50
+save_every = 2000
+push_every = 5000
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+[data]
+train_path = "data/ner/train.jsonl"
+val_path = "data/ner/validation.jsonl"
+test_path = "data/ner/test.jsonl"
+max_len = 512
+
+# =============================================================================
+# Hardware Settings (Optimized for RTX 5090 / A100)
+# =============================================================================
+[hardware]
+device = "gpu"
+mixed_precision = true
+num_workers = 4
+compile_model = true            # Use Lux.jl compilation
+
+# =============================================================================
+# Git Push Settings
+# =============================================================================
+[git]
+remote = "origin"
+branch = "master"
+checkpoint_dir = "checkpoints/ner_production"
+
+# =============================================================================
+# Evaluation Settings
+# =============================================================================
+[evaluation]
+metrics = ["f1_micro", "f1_macro", "precision", "recall"]
+per_entity_metrics = true
+save_predictions = true

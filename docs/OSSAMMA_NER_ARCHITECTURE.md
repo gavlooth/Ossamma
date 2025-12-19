@@ -391,15 +391,129 @@ NER LABEL SCHEMA (19 Labels, BIO Encoding)
             High linking potential between documents
 
 ═══════════════════════════════════════════════════════════════════════════════════════════════════════
-MODEL CONFIGURATIONS
+MODEL CONFIGURATIONS (TOML-based)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════════
 
+    Configuration files are located in: configs/ner_*.toml
+
     ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
-    │  Size  │ emb_dim │ heads │ layers │ state_dim │ time_dim │ window │ Est. Params             │
-    │────────┼─────────┼───────┼────────┼───────────┼──────────┼────────┼─────────────────────────│
-    │  tiny  │    64   │   2   │   2    │     64    │    32    │   5    │    ~5M                  │
-    │ small  │   256   │   4   │   4    │    256    │    64    │   5    │   ~35M                  │
-    │  base  │   512   │   8   │   6    │    512    │   128    │   5    │  ~150M                  │
+    │  Profile    │ Config File          │ Use Case                    │ Est. Params             │
+    │─────────────┼──────────────────────┼─────────────────────────────┼─────────────────────────│
+    │  minimal    │ ner_minimal.toml     │ Smoke testing / CI/CD       │    ~1.5M                │
+    │  dev        │ ner_dev.toml         │ Local development           │    ~35M                 │
+    │  production │ ner_production.toml  │ Production deployment       │   ~150M                 │
+    └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+    DETAILED CONFIGURATIONS:
+    ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+    │                                                                                              │
+    │  MINIMAL (ner_minimal.toml) - Smoke Testing                                                  │
+    │  ────────────────────────────────────────────────────────────────────────────────────────── │
+    │    vocab_size:           1,000                                                               │
+    │    max_sequence_length:  64                                                                  │
+    │    embedding_dimension:  64                                                                  │
+    │    number_of_heads:      2                                                                   │
+    │    number_of_layers:     2                                                                   │
+    │    time_dimension:       32                                                                  │
+    │    state_dimension:      64                                                                  │
+    │    window_size:          8                                                                   │
+    │    use_crf:              false                                                               │
+    │    device:               cpu                                                                 │
+    │                                                                                              │
+    │  DEV (ner_dev.toml) - Development & Experimentation                                          │
+    │  ────────────────────────────────────────────────────────────────────────────────────────── │
+    │    vocab_size:           32,000                                                              │
+    │    max_sequence_length:  256                                                                 │
+    │    embedding_dimension:  256                                                                 │
+    │    number_of_heads:      4                                                                   │
+    │    number_of_layers:     6                                                                   │
+    │    time_dimension:       64                                                                  │
+    │    state_dimension:      256                                                                 │
+    │    window_size:          32                                                                  │
+    │    use_crf:              true                                                                │
+    │    device:               gpu                                                                 │
+    │                                                                                              │
+    │  PRODUCTION (ner_production.toml) - Full-Scale Deployment                                    │
+    │  ────────────────────────────────────────────────────────────────────────────────────────── │
+    │    vocab_size:           50,000                                                              │
+    │    max_sequence_length:  512                                                                 │
+    │    embedding_dimension:  1024                                                                │
+    │    number_of_heads:      16                                                                  │
+    │    number_of_layers:     10                                                                  │
+    │    time_dimension:       256                                                                 │
+    │    state_dimension:      1024                                                                │
+    │    window_size:          64                                                                  │
+    │    use_crf:              true                                                                │
+    │    device:               gpu (optimized for RTX 5090 / A100)                                 │
+    │                                                                                              │
+    └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+    USAGE:
+    ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+    │                                                                                              │
+    │  # Load model from TOML config                                                               │
+    │  model = OssammaNER("configs/ner_production.toml")                                          │
+    │                                                                                              │
+    │  # Or load config separately                                                                 │
+    │  config = load_ner_config("configs/ner_dev.toml")                                           │
+    │  print_config_summary(config)  # Shows config with estimated params                         │
+    │  model = OssammaNER(config)                                                                  │
+    │                                                                                              │
+    │  # Load training hyperparameters                                                             │
+    │  train_config = load_training_config("configs/ner_production.toml")                         │
+    │                                                                                              │
+    │  # Estimate parameters for custom config                                                     │
+    │  params = estimate_parameters(config)                                                        │
+    │                                                                                              │
+    └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+    TOML STRUCTURE:
+    ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+    │                                                                                              │
+    │  [model]                           # Core architecture                                       │
+    │  vocab_size = 50000                                                                          │
+    │  max_sequence_length = 512                                                                   │
+    │  embedding_dimension = 1024                                                                  │
+    │  number_of_heads = 16                                                                        │
+    │  number_of_layers = 10                                                                       │
+    │  num_labels = 19                                                                             │
+    │                                                                                              │
+    │  [model.dimensions]                # Internal dimensions                                     │
+    │  time_dimension = 256                                                                        │
+    │  state_dimension = 1024                                                                      │
+    │                                                                                              │
+    │  [model.attention]                 # Attention settings                                      │
+    │  window_size = 64                                                                            │
+    │                                                                                              │
+    │  [model.oscillator]                # DLinOSS physics parameters                              │
+    │  min_frequency = 0.01                                                                        │
+    │  max_frequency = 5.0                                                                         │
+    │  default_time_step = 0.05                                                                    │
+    │                                                                                              │
+    │  [model.regularization]            # Training regularization                                 │
+    │  dropout_rate = 0.1                                                                          │
+    │  label_smoothing = 0.1                                                                       │
+    │  use_crf = true                                                                              │
+    │                                                                                              │
+    │  [training]                        # Training hyperparameters                                │
+    │  batch_size = 32                                                                             │
+    │  gradient_accumulation_steps = 4                                                             │
+    │  learning_rate = 2e-4                                                                        │
+    │  warmup_steps = 2000                                                                         │
+    │  total_steps = 100000                                                                        │
+    │                                                                                              │
+    │  [training.checkpoints]            # Checkpoint settings                                     │
+    │  eval_every = 500                                                                            │
+    │  save_every = 2000                                                                           │
+    │                                                                                              │
+    │  [data]                            # Data paths                                              │
+    │  train_path = "data/ner/train.jsonl"                                                        │
+    │  val_path = "data/ner/validation.jsonl"                                                     │
+    │                                                                                              │
+    │  [hardware]                        # Device settings                                         │
+    │  device = "gpu"                                                                              │
+    │  mixed_precision = true                                                                      │
+    │                                                                                              │
     └──────────────────────────────────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1025,21 +1139,27 @@ FILE REFERENCE
 
     ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
     │                                                                                              │
-    │  src/NER.jl:115-217         OssammaNER struct and forward pass                              │
-    │  src/NER.jl:57-81           NERConfig with all hyperparameters                              │
-    │  src/NER.jl:29-51           Label schema definition                                         │
-    │  src/NER.jl:414-443         ner_cross_entropy loss function                                 │
-    │  src/NER.jl:454-523         predict_labels and extract_entities                             │
+    │  CONFIGURATION FILES:                                                                        │
+    │  configs/ner_minimal.toml      Smoke testing config (~1.5M params)                          │
+    │  configs/ner_dev.toml          Development config (~35M params)                             │
+    │  configs/ner_production.toml   Production config (~150M params)                             │
     │                                                                                              │
-    │  src/Ossamma.jl:319-573     OssammaNERBlock (dual gating)                                   │
-    │  src/Ossamma.jl:39-114      TimeConditionedLayerNorm                                        │
-    │  src/Ossamma.jl:119-296     OssammaBlock (original, no dual gating)                         │
+    │  SOURCE FILES:                                                                               │
+    │  src/NER.jl                    OssammaNER model, config loading, loss functions             │
+    │    - NERConfig struct          Configuration with all hyperparameters                       │
+    │    - load_ner_config()         Load config from TOML file                                   │
+    │    - load_training_config()    Load training hyperparameters from TOML                      │
+    │    - estimate_parameters()     Estimate model parameter count                               │
+    │    - print_config_summary()    Display config with param estimate                           │
     │                                                                                              │
-    │  src/Attention.jl:11-221    SWAttention (sliding window)                                    │
-    │  src/linearAttention.jl     LinearAttentionLayer                                            │
-    │  src/Dlinoss.jl             DLinOSS oscillator SSM                                          │
+    │  src/Ossamma.jl                OssammaNERBlock (dual gating architecture)                   │
+    │  src/Attention.jl              SWAttention (sliding window)                                 │
+    │  src/linearAttention.jl        LinearAttentionLayer                                         │
+    │  src/Dlinoss.jl                DLinOSS oscillator SSM                                       │
     │                                                                                              │
-    │  docs/NER_TRAINING_PLAN.md  Complete training pipeline specification                        │
+    │  DOCUMENTATION:                                                                              │
+    │  docs/NER_TRAINING_PLAN.md     Complete training pipeline specification                     │
+    │  docs/OSSAMMA_NER_ARCHITECTURE.md  This file                                                │
     │                                                                                              │
     └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```

@@ -1,0 +1,73 @@
+# OssammaNER Development Configuration
+# ~35M Parameters - For local development and experimentation
+
+# =============================================================================
+# Model Architecture (~35M Parameters)
+# =============================================================================
+[model]
+vocab_size = 32000              # Standard BPE vocabulary
+max_sequence_length = 256       # Moderate sequence length
+embedding_dimension = 256       # Balanced embedding size
+number_of_heads = 4             # 64 dims per head
+number_of_layers = 6            # Moderate depth
+num_labels = 19                 # 9 entity types × 2 (B/I) + O
+
+[model.dimensions]
+time_dimension = 64             # Moderate time conditioning
+state_dimension = 256           # Match embedding dim
+
+[model.attention]
+window_size = 32                # Local attention window
+
+[model.oscillator]
+min_frequency = 0.05
+max_frequency = 8.0
+default_time_step = 0.08
+
+[model.regularization]
+dropout_rate = 0.1
+label_smoothing = 0.05
+use_crf = true
+
+# =============================================================================
+# Training Hyperparameters
+# =============================================================================
+[training]
+batch_size = 16
+gradient_accumulation_steps = 2 # Effective batch size = 32
+learning_rate = 5e-4
+min_learning_rate = 1e-6
+warmup_steps = 500
+total_steps = 20000
+gradient_clip = 1.0
+weight_decay = 0.01
+
+[training.checkpoints]
+eval_every = 200
+log_every = 20
+save_every = 1000
+push_every = 5000
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+[data]
+train_path = "data/ner/train.jsonl"
+val_path = "data/ner/validation.jsonl"
+max_len = 256
+
+# =============================================================================
+# Hardware Settings
+# =============================================================================
+[hardware]
+device = "gpu"
+mixed_precision = true
+num_workers = 2
+
+# =============================================================================
+# Git Push Settings
+# =============================================================================
+[git]
+remote = "origin"
+branch = "dev"
+checkpoint_dir = "checkpoints/ner_dev"

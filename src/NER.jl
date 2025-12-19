@@ -15,6 +15,7 @@ using Lux
 using Random
 using NNlib
 using Statistics: mean
+using TOML
 
 # Import parent module components
 import ..OssammaNERBlock
@@ -80,6 +81,210 @@ Base.@kwdef struct NERConfig
     dropout_rate::Float32 = 0.1f0
     label_smoothing::Float32 = 0.0f0
     use_crf::Bool = true # New field: whether to use a CRF layer
+end
+
+# =============================================================================
+# TOML Configuration Loading
+# =============================================================================
+
+"""
+    load_ner_config(path::String) -> NERConfig
+
+Load NER configuration from a TOML file.
+
+# Example
+```julia
+config = load_ner_config("configs/ner_production.toml")
+model = OssammaNER(config)
+```
+"""
+function load_ner_config(path::String)::NERConfig
+    toml = TOML.parsefile(path)
+    model = get(toml, "model", Dict())
+    dims = get(model, "dimensions", Dict())
+    attn = get(model, "attention", Dict())
+    osc = get(model, "oscillator", Dict())
+    reg = get(model, "regularization", Dict())
+
+    return NERConfig(
+        # Architecture
+        vocab_size = get(model, "vocab_size", 32000),
+        max_sequence_length = get(model, "max_sequence_length", 512),
+        embedding_dimension = get(model, "embedding_dimension", 256),
+        number_of_heads = get(model, "number_of_heads", 4),
+        number_of_layers = get(model, "number_of_layers", 4),
+        num_labels = get(model, "num_labels", NUM_LABELS),
+
+        # Internal dimensions
+        time_dimension = get(dims, "time_dimension", 64),
+        state_dimension = get(dims, "state_dimension", -1),
+
+        # Attention
+        window_size = get(attn, "window_size", 5),
+
+        # Oscillator SSM
+        min_frequency = Float32(get(osc, "min_frequency", 0.1)),
+        max_frequency = Float32(get(osc, "max_frequency", 10.0)),
+        default_time_step = Float32(get(osc, "default_time_step", 0.1)),
+
+        # Training/Regularization
+        dropout_rate = Float32(get(reg, "dropout_rate", 0.1)),
+        label_smoothing = Float32(get(reg, "label_smoothing", 0.0)),
+        use_crf = get(reg, "use_crf", true),
+    )
+end
+
+"""
+    load_training_config(path::String) -> NamedTuple
+
+Load training hyperparameters from a TOML file.
+Returns a NamedTuple with training settings.
+"""
+function load_training_config(path::String)
+    toml = TOML.parsefile(path)
+    train = get(toml, "training", Dict())
+    checkpoints = get(train, "checkpoints", Dict())
+    data = get(toml, "data", Dict())
+    hardware = get(toml, "hardware", Dict())
+
+    return (
+        # Training hyperparameters
+        batch_size = get(train, "batch_size", 16),
+        gradient_accumulation_steps = get(train, "gradient_accumulation_steps", 1),
+        learning_rate = Float32(get(train, "learning_rate", 5e-4)),
+        min_learning_rate = Float32(get(train, "min_learning_rate", 1e-6)),
+        warmup_steps = get(train, "warmup_steps", 500),
+        total_steps = get(train, "total_steps", 20000),
+        gradient_clip = Float32(get(train, "gradient_clip", 1.0)),
+        weight_decay = Float32(get(train, "weight_decay", 0.01)),
+
+        # Checkpoints
+        eval_every = get(checkpoints, "eval_every", 200),
+        log_every = get(checkpoints, "log_every", 20),
+        save_every = get(checkpoints, "save_every", 1000),
+        push_every = get(checkpoints, "push_every", 0),
+
+        # Data paths
+        train_path = get(data, "train_path", ""),
+        val_path = get(data, "val_path", ""),
+        test_path = get(data, "test_path", ""),
+        max_len = get(data, "max_len", 512),
+
+        # Hardware
+        device = Symbol(get(hardware, "device", "gpu")),
+        mixed_precision = get(hardware, "mixed_precision", true),
+        num_workers = get(hardware, "num_workers", 2),
+    )
+end
+
+"""
+    OssammaNER(config_path::String)
+
+Create NER model from a TOML configuration file.
+
+# Example
+```julia
+model = OssammaNER("configs/ner_production.toml")
+```
+"""
+function OssammaNER(config_path::String)
+    config = load_ner_config(config_path)
+    return OssammaNER(config)
+end
+
+"""
+    estimate_parameters(config::NERConfig) -> Int
+
+Estimate the number of trainable parameters for a given configuration.
+"""
+function estimate_parameters(config::NERConfig)
+    d = config.embedding_dimension
+    h = config.number_of_heads
+    L = config.number_of_layers
+    V = config.vocab_size
+    S = config.max_sequence_length
+    d_t = config.time_dimension
+    d_s = config.state_dimension == -1 ? d : config.state_dimension
+    n_labels = config.num_labels
+
+    # Embeddings
+    token_emb = V * d
+    pos_emb = S * d
+    embeddings = token_emb + pos_emb
+
+    # Per OssammaNERBlock
+    time_cond_norm = d * 2 + d_t * d + d_t * d + d_t  # LayerNorm + Scale/Shift/AlphaBias proj
+    glu_proj = d * 2d + 2d  # GLU projection
+    glu_out_proj = d * d + d
+
+    # LinearAttention
+    lin_attn_qkvo = 4 * (d * d + d)
+    lin_attn_features = 2 * (d ÷ h * 2 * d ÷ h)  # Approximate
+    lin_attn_time = d_t * (d ÷ h) + d ÷ h
+    lin_attn = lin_attn_qkvo + lin_attn_features + lin_attn_time
+
+    # DLinOSS
+    dlinoss = 3 * d_s + d_s * d + d * d_s  # log params + projections
+
+    # Dual gates (no bias)
+    dual_gates = 2 * d * d
+
+    # SWAttention
+    sw_attn = 4 * (d * d + d)
+
+    # Alpha + output norm
+    alpha_norm = d + 1 + d * 2
+
+    per_block = time_cond_norm + glu_proj + glu_out_proj + lin_attn + dlinoss + dual_gates + sw_attn + alpha_norm
+
+    # Classification head
+    class_head = d * 2 + d * n_labels + n_labels  # LayerNorm + Dense
+
+    # Boundary head
+    boundary_head = d * 2 + d * 2 + 2
+
+    # CRF
+    crf = n_labels * n_labels + 2 * n_labels
+
+    total = embeddings + L * per_block + class_head + boundary_head + crf
+    return total
+end
+
+"""
+Print configuration summary with estimated parameters.
+"""
+function print_config_summary(config::NERConfig)
+    params = estimate_parameters(config)
+    params_m = params / 1_000_000
+
+    println("=" ^ 60)
+    println("OssammaNER Configuration Summary")
+    println("=" ^ 60)
+    println("Architecture:")
+    println("  vocab_size:           $(config.vocab_size)")
+    println("  max_sequence_length:  $(config.max_sequence_length)")
+    println("  embedding_dimension:  $(config.embedding_dimension)")
+    println("  number_of_heads:      $(config.number_of_heads)")
+    println("  number_of_layers:     $(config.number_of_layers)")
+    println("  num_labels:           $(config.num_labels)")
+    println()
+    println("Dimensions:")
+    println("  time_dimension:       $(config.time_dimension)")
+    println("  state_dimension:      $(config.state_dimension == -1 ? "$(config.embedding_dimension) (auto)" : config.state_dimension)")
+    println("  window_size:          $(config.window_size)")
+    println()
+    println("Oscillator:")
+    println("  min_frequency:        $(config.min_frequency)")
+    println("  max_frequency:        $(config.max_frequency)")
+    println("  default_time_step:    $(config.default_time_step)")
+    println()
+    println("Regularization:")
+    println("  dropout_rate:         $(config.dropout_rate)")
+    println("  label_smoothing:      $(config.label_smoothing)")
+    println("  use_crf:              $(config.use_crf)")
+    println()
+    println("Estimated Parameters:   ~$(round(params_m, digits=1))M")
+    println("=" ^ 60)
 end
 
 # =============================================================================
@@ -561,5 +766,6 @@ export OssammaNER, NERConfig
 export tiny_ner, small_ner, base_ner
 export ner_cross_entropy, predict_labels, extract_entities
 export RAG_LABELS, ENTITY_TYPES, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
+export load_ner_config, load_training_config, estimate_parameters, print_config_summary
 
 end # module
