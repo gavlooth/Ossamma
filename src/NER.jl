@@ -17,8 +17,9 @@ using NNlib
 using Statistics: mean
 
 # Import parent module components
-import ..OssammaBlock
+import ..OssammaNERBlock
 import ..TimeConditionedLayerNorm
+import ..LinearChainCRF
 
 const LuxLayer = Lux.AbstractLuxLayer
 
@@ -78,6 +79,7 @@ Base.@kwdef struct NERConfig
     # Training
     dropout_rate::Float32 = 0.1f0
     label_smoothing::Float32 = 0.0f0
+    use_crf::Bool = true # New field: whether to use a CRF layer
 end
 
 # =============================================================================
@@ -112,7 +114,7 @@ end
 # OssammaNER Model
 # =============================================================================
 
-struct OssammaNER{E, P, T, B, D, H} <: LuxLayer
+struct OssammaNER{E, P, T, B, D, H, C, BH} <: LuxLayer
     vocab_size::Int
     max_sequence_length::Int
     embedding_dimension::Int
@@ -134,6 +136,12 @@ struct OssammaNER{E, P, T, B, D, H} <: LuxLayer
 
     # Token classification head (per-token output)
     ClassificationHead::H
+
+    # Conditional Random Field layer
+    CRF::C
+
+    # Boundary prediction head for auxiliary loss
+    BoundaryHead::BH
 end
 
 """
@@ -153,7 +161,7 @@ function OssammaNER(config::NERConfig)
         num_labels = config.num_labels,
         time_dimension = config.time_dimension,
         state_dimension = state_dimension,
-        window_size = config.window_size,
+        window_size = config.window_size, # Pass window_size from config
         min_frequency = config.min_frequency,
         max_frequency = config.max_frequency,
         default_time_step = config.default_time_step,
@@ -170,15 +178,15 @@ function OssammaNER(;
     num_labels::Int = NUM_LABELS,
     time_dimension::Int = 64,
     state_dimension::Int = embedding_dimension,
-    window_size::Int = 5,
+    window_size::Int = 256, # Changed default window size to 256 as per docs/NER_TRAINING_PLAN.md
     min_frequency::Float32 = 0.1f0,
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
     dropout_rate::Float32 = 0.1f0,
 )
-    # Build stack of OssammaBlocks
+    # Build stack of OssammaNERBlocks (with dual gating)
     blocks = Tuple([
-        OssammaBlock(
+        OssammaNERBlock(
             embedding_dimension,
             max_sequence_length,
             number_of_heads,
@@ -188,6 +196,7 @@ function OssammaNER(;
             min_frequency = min_frequency,
             max_frequency = max_frequency,
             default_time_step = default_time_step,
+            dropout_rate = dropout_rate,
         )
         for _ in 1:number_of_layers
     ])
@@ -214,6 +223,13 @@ function OssammaNER(;
             Lux.Dropout(dropout_rate),
             Lux.Dense(embedding_dimension => num_labels),
         ),
+        # CRF Layer
+        LinearChainCRF(num_labels),
+        # Boundary prediction head
+        Lux.Chain(
+            Lux.LayerNorm((embedding_dimension,)),
+            Lux.Dense(embedding_dimension => 2), # 2 outputs: is_boundary or not
+        )
     )
 end
 
@@ -229,6 +245,8 @@ function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaNER)
         Blocks = block_params,
         Dropout = Lux.initialparameters(rng, model.Dropout),
         ClassificationHead = Lux.initialparameters(rng, model.ClassificationHead),
+        CRF = Lux.initialparameters(rng, model.CRF),
+        BoundaryHead = Lux.initialparameters(rng, model.BoundaryHead),
     )
 end
 
@@ -247,13 +265,15 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaNER)
         Blocks = block_states,
         Dropout = Lux.initialstates(rng, model.Dropout),
         ClassificationHead = Lux.initialstates(rng, model.ClassificationHead),
+        CRF = Lux.initialstates(rng, model.CRF),
+        BoundaryHead = Lux.initialstates(rng, model.BoundaryHead),
         position_indices = position_indices,
     )
 end
 
 function (model::OssammaNER)(token_ids::AbstractArray, params, state)
     # token_ids: (seq_len,) or (seq_len, batch)
-    # Output: (num_labels, seq_len) or (num_labels, seq_len, batch)
+    # Output: ((emissions, boundary_logits), new_state)
 
     is_batched = ndims(token_ids) == 2
     seq_len = size(token_ids, 1)
@@ -313,16 +333,25 @@ function (model::OssammaNER)(token_ids::AbstractArray, params, state)
     # =========================================================================
     # 7. Per-token Classification
     # =========================================================================
-    logits_flat, head_state = model.ClassificationHead(hidden_flat, params.ClassificationHead, state.ClassificationHead)
-    # logits_flat: (num_labels, seq_len * batch)
+    emissions_flat, head_state = model.ClassificationHead(hidden_flat, params.ClassificationHead, state.ClassificationHead)
+    # emissions_flat: (num_labels, seq_len * batch)
 
-    logits = reshape(logits_flat, model.num_labels, seq_len, batch_size)
-
-    # Remove batch dim if input wasn't batched
-    final_logits = is_batched ? logits : dropdims(logits, dims=3)
+    emissions = reshape(emissions_flat, model.num_labels, seq_len, batch_size)
 
     # =========================================================================
-    # 8. Update State
+    # 8. Boundary Prediction Head (for auxiliary loss)
+    # =========================================================================
+    boundary_logits_flat, boundary_head_state = model.BoundaryHead(hidden_flat, params.BoundaryHead, state.BoundaryHead)
+    # boundary_logits_flat: (2, seq_len * batch)
+
+    boundary_logits = reshape(boundary_logits_flat, 2, seq_len, batch_size)
+
+    # Remove batch dim if input wasn't batched
+    final_emissions = is_batched ? emissions : dropdims(emissions, dims=3)
+    final_boundary_logits = is_batched ? boundary_logits : dropdims(boundary_logits, dims=3)
+
+    # =========================================================================
+    # 9. Update State
     # =========================================================================
     new_block_states = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         block_states
@@ -335,10 +364,12 @@ function (model::OssammaNER)(token_ids::AbstractArray, params, state)
         Blocks = new_block_states,
         Dropout = dropout_state,
         ClassificationHead = head_state,
+        CRF = state.CRF,
+        BoundaryHead = boundary_head_state,
         position_indices = state.position_indices,
     )
 
-    return final_logits, new_state
+    return (final_emissions, final_boundary_logits), new_state
 end
 
 # =============================================================================

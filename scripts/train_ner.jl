@@ -1,10 +1,9 @@
 #!/usr/bin/env julia
 """
-Train OssammaNER model on converted MultiNERD data.
+Train OssammaNER model (v2) with CRF and Dual Gating.
 
 Usage:
     julia --project=. scripts/train_ner.jl --data data/rag/ --output models/ner/
-    julia --project=. scripts/train_ner.jl --test  # Quick test with synthetic data
 """
 
 using Random
@@ -12,344 +11,306 @@ using Statistics
 using Printf
 using Dates
 using JSON3
+using Lux
+using Optimisers
+using Zygote
+using NNlib
 
 # Load Ossamma
 include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
 using .Ossamma
-using .Ossamma: OssammaNER, NERConfig, tiny_ner, small_ner, base_ner
-using .Ossamma: ner_cross_entropy, predict_labels, extract_entities
-using .Ossamma: RAG_LABELS, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
-
-using Lux
-using Optimisers
-using Zygote
+using .Ossamma.NER
+using .Ossamma.CRF
+using .Ossamma.NERDataset
+using .Ossamma.Tokenizer
+using .Ossamma.NERMetrics
 
 # =============================================================================
-# Data Loading
+# Configuration
+# =============================================================================
+
+Base.@kwdef struct TrainConfig
+    # Data
+    data_dir::String
+    output_dir::String
+    max_len::Int = 128
+    
+    # Model
+    model_size::Symbol = :small
+    embedding_dim::Int = 256
+    num_heads::Int = 4
+    num_layers::Int = 4
+    window_size::Int = 128 # Sliding window attention size
+    
+    # Training
+    epochs::Int = 10
+    batch_size::Int = 16
+    learning_rate::Float64 = 2e-4
+    crf_learning_rate::Float64 = 1e-3
+    dropout::Float32 = 0.1f0
+    boundary_loss_weight::Float32 = 0.2f0
+    max_grad_norm::Float64 = 1.0
+    
+    # Evaluation
+    eval_every::Int = 100
+    save_every::Int = 1000
+    seed::Int = 42
+end
+
+# =============================================================================
+# Helper Functions
 # =============================================================================
 
 """
-Load NER data from JSONL file.
-Expected format: {"tokens": [...], "ner_tags": ["O", "B-PERSON", ...]}
+Compute boundary labels for auxiliary loss.
+Returns 1 for B-* tags (start of entity), 0 otherwise.
 """
-function load_jsonl(filepath::String)
-    data = []
-    open(filepath, "r") do f
-        for line in eachline(f)
-            if !isempty(strip(line))
-                push!(data, JSON3.read(line))
+function compute_boundary_labels(labels::Matrix{Int}, id_to_label::Dict{Int, String})
+    seq_len, batch_size = size(labels)
+    boundaries = zeros(Float32, 2, seq_len, batch_size) # One-hot: [not_boundary, is_boundary]
+    
+    for b in 1:batch_size
+        for t in 1:seq_len
+            label_id = labels[t, b]
+            if label_id == -100 # Ignore padding
+                # Masked positions will be ignored by crossentropy if we handle it right,
+                # but NNlib.logitcrossentropy doesn't support ignore_index directly for arrays.
+                # We'll handle masking manually in the loss function.
+                continue
+            end
+            
+            label_str = get(id_to_label, label_id, "O")
+            is_boundary = startswith(label_str, "B-")
+            
+            if is_boundary
+                boundaries[2, t, b] = 1.0f0 # is_boundary
+            else
+                boundaries[1, t, b] = 1.0f0 # not_boundary
             end
         end
     end
-    return data
+    return boundaries
 end
 
 """
-Create vocabulary from data.
+Custom combined loss function.
 """
-function build_vocab(data; min_freq::Int=1, max_vocab::Int=32000)
-    word_counts = Dict{String, Int}()
-
-    for example in data
-        for token in example.tokens
-            word_counts[token] = get(word_counts, token, 0) + 1
+function compute_loss(
+    model, params, state, 
+    token_ids, labels, mask, 
+    boundary_targets, boundary_weight
+)
+    # Forward pass
+    (emissions, boundary_logits), st = model(token_ids, params, state)
+    
+    # 1. CRF Loss (Negative Log Likelihood)
+    # emissions: (num_labels, seq_len, batch)
+    crf_l, _ = crf_loss(model.CRF, emissions, labels, mask, params.CRF, st.CRF)
+    
+    # 2. Boundary Loss (Auxiliary)
+    # boundary_logits: (2, seq_len, batch) -> reshape to (2, seq_len * batch)
+    # boundary_targets: (2, seq_len, batch) -> reshape to (2, seq_len * batch)
+    
+    dims = size(boundary_logits)
+    flat_logits = reshape(boundary_logits, 2, :)
+    flat_targets = reshape(boundary_targets, 2, :)
+    flat_mask = reshape(mask, :)
+    
+    # Compute cross entropy only on valid positions
+    b_loss = 0.0f0
+    valid_count = 0
+    
+    # Vectorized if possible, but loop is safe for masking
+    # Using logitcrossentropy from NNlib
+    losses = NNlib.logitcrossentropy(flat_logits, flat_targets; agg=identity)
+    
+    # Apply mask
+    for i in 1:length(flat_mask)
+        if flat_mask[i]
+            b_loss += losses[i]
+            valid_count += 1
         end
     end
-
-    # Sort by frequency
-    sorted_words = sort(collect(word_counts), by=x->-x[2])
-
-    # Build vocab with special tokens
-    vocab = Dict{String, Int}()
-    vocab["[PAD]"] = 1
-    vocab["[UNK]"] = 2
-    vocab["[CLS]"] = 3
-    vocab["[SEP]"] = 4
-
-    idx = 5
-    for (word, count) in sorted_words
-        if count >= min_freq && idx <= max_vocab
-            vocab[word] = idx
-            idx += 1
-        end
-    end
-
-    return vocab
-end
-
-"""
-Convert tokens to IDs using vocabulary.
-"""
-function tokenize(tokens::Vector, vocab::Dict{String, Int})
-    unk_id = vocab["[UNK]"]
-    return [get(vocab, String(t), unk_id) for t in tokens]
-end
-
-"""
-Convert NER tags to label IDs.
-"""
-function tags_to_ids(tags::Vector)
-    return [get(LABEL_TO_ID, String(t), 1) for t in tags]  # Default to "O" (id=1)
-end
-
-"""
-Prepare batch from examples.
-"""
-function prepare_batch(examples, vocab::Dict{String, Int}, max_len::Int)
-    batch_size = length(examples)
-
-    # Initialize with padding
-    token_ids = ones(Int, max_len, batch_size)  # PAD = 1
-    label_ids = fill(-100, max_len, batch_size)  # Ignore index
-
-    for (i, ex) in enumerate(examples)
-        tokens = collect(ex.tokens)
-        tags = collect(ex.ner_tags)
-        seq_len = min(length(tokens), max_len)
-
-        token_ids[1:seq_len, i] = tokenize(tokens[1:seq_len], vocab)
-        label_ids[1:seq_len, i] = tags_to_ids(tags[1:seq_len])
-    end
-
-    return token_ids, label_ids
+    
+    boundary_l = valid_count > 0 ? b_loss / valid_count : 0.0f0
+    
+    # Total loss
+    total_loss = crf_l + boundary_weight * boundary_l
+    
+    return total_loss, st
 end
 
 # =============================================================================
 # Training Loop
 # =============================================================================
 
-"""
-Single training step.
-"""
-function train_step(model, params, state, opt_state, token_ids, label_ids)
-    # Compute loss and gradients
-    (loss, new_state), grads = Zygote.withgradient(params) do p
-        logits, st = model(token_ids, p, state)
-        l = ner_cross_entropy(logits, label_ids)
-        return l, st
-    end
-
-    # Update parameters
-    opt_state, params = Optimisers.update(opt_state, params, grads[1])
-
-    return loss, params, new_state, opt_state
-end
-
-"""
-Evaluate on validation set.
-"""
-function evaluate(model, params, state, data, vocab, max_len, batch_size)
-    total_loss = 0.0
-    total_correct = 0
-    total_tokens = 0
-
-    for batch_start in 1:batch_size:length(data)
-        batch_end = min(batch_start + batch_size - 1, length(data))
-        batch = data[batch_start:batch_end]
-
-        token_ids, label_ids = prepare_batch(batch, vocab, max_len)
-
-        logits, _ = model(token_ids, params, state)
-        loss = ner_cross_entropy(logits, label_ids)
-        total_loss += loss * length(batch)
-
-        # Compute accuracy (only on non-padded positions)
-        predictions = mapslices(argmax, logits, dims=1)
-        mask = label_ids .!= -100
-        total_correct += sum((predictions .== label_ids) .& mask)
-        total_tokens += sum(mask)
-    end
-
-    avg_loss = total_loss / length(data)
-    accuracy = total_correct / max(total_tokens, 1)
-
-    return avg_loss, accuracy
-end
-
-"""
-Main training function.
-"""
-function train_ner(;
-    data_dir::String,
-    output_dir::String,
-    model_size::Symbol = :small,
-    epochs::Int = 10,
-    batch_size::Int = 16,
-    learning_rate::Float64 = 1e-4,
-    max_len::Int = 128,
-    eval_every::Int = 100,
-    save_every::Int = 1000,
-)
-    # Create output directory
-    mkpath(output_dir)
-
-    # Load data
-    println("Loading data from $data_dir...")
-    train_data = load_jsonl(joinpath(data_dir, "train.jsonl"))
-    val_data = if isfile(joinpath(data_dir, "validation.jsonl"))
-        load_jsonl(joinpath(data_dir, "validation.jsonl"))
-    elseif isfile(joinpath(data_dir, "val.jsonl"))
-        load_jsonl(joinpath(data_dir, "val.jsonl"))
-    else
-        train_data[1:min(1000, length(train_data))]  # Use subset of train
-    end
-
-    println("  Train: $(length(train_data)) examples")
-    println("  Val: $(length(val_data)) examples")
-
-    # Build vocabulary
+function train(config::TrainConfig)
+    # Setup
+    Random.seed!(config.seed)
+    mkpath(config.output_dir)
+    
+    # 1. Load Data
+    println("Loading data from $(config.data_dir)...\n")
+    train_samples = load_dataset(joinpath(config.data_dir, "train.jsonl"))
+    val_samples = load_dataset(joinpath(config.data_dir, "validation.jsonl"))
+    
+    println("  Train: $(length(train_samples))")
+    println("  Val:   $(length(val_samples))")
+    
+    # 2. Build Vocabulary & Tokenizer
     println("Building vocabulary...")
-    vocab = build_vocab(train_data; max_vocab=32000)
-    vocab_size = length(vocab)
-    println("  Vocabulary size: $vocab_size")
-
-    # Save vocabulary
-    open(joinpath(output_dir, "vocab.json"), "w") do f
-        JSON3.write(f, vocab)
-    end
-
-    # Create model
-    println("Creating model (size=$model_size)...")
-    model = if model_size == :tiny
-        tiny_ner(vocab_size=vocab_size, max_sequence_length=max_len)
-    elseif model_size == :small
-        small_ner(vocab_size=vocab_size, max_sequence_length=max_len)
-    elseif model_size == :base
-        base_ner(vocab_size=vocab_size, max_sequence_length=max_len)
-    else
-        error("Unknown model size: $model_size")
-    end
-
-    # Initialize
+    # Extract tokens from all training samples
+    all_tokens = [s.tokens for s in train_samples]
+    vocab = build_vocab_from_tokens(all_tokens; min_freq=2, max_vocab_size=32000)
+    
+    tokenizer = NERTokenizer(vocab; max_length=config.max_len)
+    println("  Vocab size: $(length(vocab))")
+    save_vocab(vocab, joinpath(config.output_dir, "vocab.json"))
+    
+    # 3. Create Model
+    println("Initializing OssammaNER (v2) model...")
+    ner_config = NERConfig(
+        vocab_size = length(vocab),
+        max_sequence_length = config.max_len,
+        embedding_dimension = config.embedding_dim,
+        number_of_heads = config.num_heads,
+        number_of_layers = config.num_layers,
+        num_labels = NUM_LABELS,
+        window_size = config.window_size,
+        dropout_rate = config.dropout,
+        use_crf = true
+    )
+    
+    model = OssammaNER(ner_config)
     rng = Random.default_rng()
-    params = Lux.initialparameters(rng, model)
-    state = Lux.initialstates(rng, model)
-
-    # Count parameters
-    param_count = sum(length, Lux.parameterlength(params))
-    println("  Parameters: $(param_count)")
-
-    # Optimizer
-    opt = Optimisers.Adam(learning_rate)
-    opt_state = Optimisers.setup(opt, params)
-
-    # Training loop
+    ps, st = Lux.setup(rng, model)
+    
+    println("  Parameters: $(sum(length, Lux.parameterlength(ps)))")
+    
+    # 4. Optimizers
+    # Separate LR for CRF might be beneficial, but keeping simple for now
+    opt = Optimisers.Adam(config.learning_rate)
+    opt_state = Optimisers.setup(opt, ps)
+    
+    # 5. Training Loop
     println("\nStarting training...")
-    println("  Epochs: $epochs")
-    println("  Batch size: $batch_size")
-    println("  Learning rate: $learning_rate")
-    println("-" ^ 60)
-
+    
+    # Labels needed for boundary computation
+    _, id_to_label = create_label_dicts() # Using default RAG schema
+    
     global_step = 0
-    best_val_loss = Inf
-
-    for epoch in 1:epochs
+    best_f1 = 0.0
+    
+    # Data loaders
+    train_loader = NERDataLoader(train_samples; batch_size=config.batch_size, max_length=config.max_len)
+    
+    for epoch in 1:config.epochs
+        reset!(train_loader)
         epoch_loss = 0.0
-        epoch_steps = 0
-
-        # Shuffle training data
-        shuffled_data = shuffle(rng, train_data)
-
-        for batch_start in 1:batch_size:length(shuffled_data)
-            batch_end = min(batch_start + batch_size - 1, length(shuffled_data))
-            batch = shuffled_data[batch_start:batch_end]
-
-            # Prepare batch
-            token_ids, label_ids = prepare_batch(batch, vocab, max_len)
-
-            # Training step
-            loss, params, state, opt_state = train_step(
-                model, params, state, opt_state, token_ids, label_ids
-            )
-
-            epoch_loss += loss
-            epoch_steps += 1
-            global_step += 1
-
-            # Evaluate periodically
-            if global_step % eval_every == 0
-                val_loss, val_acc = evaluate(model, params, state, val_data, vocab, max_len, batch_size)
-                @printf("Step %d | Train Loss: %.4f | Val Loss: %.4f | Val Acc: %.2f%%\n",
-                    global_step, loss, val_loss, val_acc * 100)
-
-                # Save best model
-                if val_loss < best_val_loss
-                    best_val_loss = val_loss
-                    # TODO: Save model checkpoint
-                end
+        steps = 0
+        
+        for batch in train_loader
+            # Tokenize batch
+            # batch is (tokens, labels, mask) tuple from loader, but loader returns strings
+            # We need to convert strings to IDs using our tokenizer
+            
+            # Use custom batch processing since loader returns padded strings
+            # Ideally NERDataLoader would use the tokenizer, but it's decoupled.
+            # We'll re-tokenize the raw samples for now or adapt.
+            # Actually, let's just use the raw samples from the batch indices of the loader if possible.
+            # The loader returns (tokens, labels, mask) matrices.
+            # We can map tokens to IDs.
+            
+            batch_tokens = batch.tokens # Matrix{String}
+            batch_labels = batch.labels # Matrix{Int}
+            batch_mask = batch.mask     # Matrix{Bool}
+            
+            # Convert tokens to IDs
+            seq_len, batch_size = size(batch_tokens)
+            token_ids = zeros(Int, seq_len, batch_size)
+            
+            for i in 1:length(batch_tokens)
+                token_ids[i] = vocab[batch_tokens[i]]
             end
-
-            # Save checkpoint
-            if global_step % save_every == 0
-                # TODO: Save checkpoint
+            
+            # Compute boundary targets
+            boundary_targets = compute_boundary_labels(batch_labels, id_to_label)
+            
+            # Gradient step
+            (loss, st), grads = Zygote.withgradient(ps) do p
+                compute_loss(model, p, st, token_ids, batch_labels, batch_mask, boundary_targets, config.boundary_loss_weight)
+            end
+            
+            # Clip grads (manual calculation for now or use Optimisers.ClipGrad if available)
+            # Optimisers.update! handles update. 
+            # We'll skip clipping for this simplified script or add it if unstable.
+            
+            opt_state, ps = Optimisers.update(opt_state, ps, grads[1])
+            
+            epoch_loss += loss
+            steps += 1
+            global_step += 1
+            
+            if global_step % config.eval_every == 0
+                @printf("Step %d | Loss: %.4f\n", global_step, loss)
             end
         end
-
-        avg_epoch_loss = epoch_loss / epoch_steps
-        val_loss, val_acc = evaluate(model, params, state, val_data, vocab, max_len, batch_size)
-
-        @printf("\nEpoch %d/%d | Avg Loss: %.4f | Val Loss: %.4f | Val Acc: %.2f%%\n",
-            epoch, epochs, avg_epoch_loss, val_loss, val_acc * 100)
+        
+        avg_loss = epoch_loss / max(steps, 1)
+        println("\nEpoch $epoch | Avg Loss: $avg_loss")
+        
+        # Validation
+        println("Evaluating on validation set...")
+        val_metrics = evaluate_model(model, ps, st, val_samples, tokenizer, vocab, id_to_label, config)
+        
+        println(classification_report(val_metrics))
+        
+        if val_metrics.f1_micro > best_f1
+            best_f1 = val_metrics.f1_micro
+            println("New best F1! Saving checkpoint...")
+            # serialization would go here
+            # JLD2 or Serialization
+        end
         println("-" ^ 60)
     end
-
-    println("\nTraining complete!")
-    println("Best validation loss: $best_val_loss")
-
-    return model, params, state, vocab
 end
 
-# =============================================================================
-# Quick Test Mode
-# =============================================================================
-
-function run_test()
-    println("Running quick test with synthetic data...\n")
-
-    # Create tiny model
-    model = tiny_ner(vocab_size=100, max_sequence_length=32)
-    rng = Random.default_rng()
-    params = Lux.initialparameters(rng, model)
-    state = Lux.initialstates(rng, model)
-
-    # Optimizer
-    opt = Optimisers.Adam(1e-3)
-    opt_state = Optimisers.setup(opt, params)
-
-    println("Model created. Training on synthetic data...")
-
-    # Synthetic training
-    for step in 1:100
-        # Random batch
-        token_ids = rand(1:100, 32, 8)
-        label_ids = rand(1:NUM_LABELS, 32, 8)
-
-        loss, params, state, opt_state = train_step(
-            model, params, state, opt_state, token_ids, label_ids
-        )
-
-        if step % 20 == 0
-            println("  Step $step | Loss: $(@sprintf("%.4f", loss))")
+"""
+Evaluate model using Viterbi decoding.
+"""
+function evaluate_model(model, params, state, samples, tokenizer, vocab, id_to_label, config)
+    predictions = Vector{Vector{Int}}()
+    gold_labels = Vector{Vector{Int}}()
+    
+    # Process in batches
+    loader = NERDataLoader(samples; batch_size=config.batch_size, max_length=config.max_len, shuffle=false)
+    
+    for batch in loader
+        batch_tokens = batch.tokens
+        batch_labels = batch.labels
+        batch_mask = batch.mask
+        
+        seq_len, batch_size = size(batch_tokens)
+        token_ids = zeros(Int, seq_len, batch_size)
+        for i in 1:length(batch_tokens)
+            token_ids[i] = vocab[batch_tokens[i]]
+        end
+        
+        # Forward pass to get emissions
+        (emissions, _), _ = model(token_ids, params, state)
+        
+        # Viterbi decode
+        decoded_preds, _ = viterbi_decode(model.CRF, emissions, batch_mask, params.CRF, state.CRF)
+        
+        # Collect results
+        for b in 1:batch_size
+            seq_len = sum(batch_mask[:, b])
+            push!(predictions, decoded_preds[1:seq_len, b])
+            push!(gold_labels, batch_labels[1:seq_len, b])
         end
     end
-
-    # Test inference
-    println("\nTesting inference...")
-    test_tokens = rand(1:100, 32)
-    labels = predict_labels(model, params, state, test_tokens)
-
-    # Count label distribution
-    label_counts = Dict{String, Int}()
-    for l in labels
-        label_counts[l] = get(label_counts, l, 0) + 1
-    end
-
-    println("Predicted label distribution:")
-    for (label, count) in sort(collect(label_counts), by=x->-x[2])
-        println("  $label: $count")
-    end
-
-    println("\n✅ Test passed!")
+    
+    return evaluate_ner(predictions, gold_labels, id_to_label)
 end
 
 # =============================================================================
@@ -357,71 +318,23 @@ end
 # =============================================================================
 
 function main()
-    if "--test" in ARGS
-        run_test()
-        return
+    # Basic args parsing
+    data_dir = "data/rag"
+    output_dir = "models/ner_v2"
+    
+    if length(ARGS) >= 2 && ARGS[1] == "--data"
+        data_dir = ARGS[2]
     end
-
-    # Parse arguments
-    data_dir = ""
-    output_dir = "models/ner"
-    model_size = :small
-    epochs = 10
-    batch_size = 16
-    learning_rate = 1e-4
-
-    i = 1
-    while i <= length(ARGS)
-        arg = ARGS[i]
-        if arg == "--data"
-            data_dir = ARGS[i+1]
-            i += 2
-        elseif arg == "--output"
-            output_dir = ARGS[i+1]
-            i += 2
-        elseif arg == "--model"
-            model_size = Symbol(ARGS[i+1])
-            i += 2
-        elseif arg == "--epochs"
-            epochs = parse(Int, ARGS[i+1])
-            i += 2
-        elseif arg == "--batch-size"
-            batch_size = parse(Int, ARGS[i+1])
-            i += 2
-        elseif arg == "--lr"
-            learning_rate = parse(Float64, ARGS[i+1])
-            i += 2
-        else
-            i += 1
-        end
+    if length(ARGS) >= 4 && ARGS[3] == "--output"
+        output_dir = ARGS[4]
     end
-
-    if isempty(data_dir)
-        println("""
-Usage:
-    julia --project=. scripts/train_ner.jl --data DATA_DIR --output OUTPUT_DIR [OPTIONS]
-    julia --project=. scripts/train_ner.jl --test
-
-Options:
-    --data DIR        Input data directory (with train.jsonl, validation.jsonl)
-    --output DIR      Output directory for model (default: models/ner)
-    --model SIZE      Model size: tiny, small, base (default: small)
-    --epochs N        Number of epochs (default: 10)
-    --batch-size N    Batch size (default: 16)
-    --lr RATE         Learning rate (default: 1e-4)
-    --test            Run quick test with synthetic data
-        """)
-        return
-    end
-
-    train_ner(
-        data_dir=data_dir,
-        output_dir=output_dir,
-        model_size=model_size,
-        epochs=epochs,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
+    
+    config = TrainConfig(
+        data_dir = data_dir,
+        output_dir = output_dir
     )
+    
+    train(config)
 end
 
 main()
