@@ -23,6 +23,10 @@ using JSON3
 using TOML
 using Serialization
 using ProgressMeter
+using LinearAlgebra
+
+# Enable multi-threaded BLAS for CPU acceleration
+BLAS.set_num_threads(min(64, Threads.nthreads() > 1 ? Threads.nthreads() : 64))
 
 # Load Ossamma modules
 include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
@@ -37,9 +41,8 @@ using CUDA
 using Optimisers
 using Zygote
 
-# Temporarily use CPU to avoid CUDA SubArray issues
-# TODO: Fix all SubArray views for proper GPU support
-const USE_CPU = true
+# Use GPU (RTX 5090)
+const USE_CPU = false
 
 # =============================================================================
 # Configuration
@@ -57,9 +60,9 @@ Base.@kwdef mutable struct TrainingConfig
     window_size::Int = 32
     dropout_rate::Float32 = 0.1f0
 
-    # Training (defaults for CPU - smaller values)
-    batch_size::Int = 4
-    gradient_accumulation_steps::Int = 2
+    # Training (defaults for GPU - optimized for 32GB VRAM)
+    batch_size::Int = 8
+    gradient_accumulation_steps::Int = 4
     learning_rate::Float64 = 2e-4
     min_learning_rate::Float64 = 1e-6
     warmup_steps::Int = 500
@@ -284,8 +287,8 @@ end
 function train_step(model, params, state, opt_state, token_ids, label_ids, config)
     # Compute loss and gradients
     (loss, new_state), grads = Zygote.withgradient(params) do p
-        logits, st = model(token_ids, p, state)
-        l = ner_cross_entropy(logits, label_ids)
+        (emissions, boundary_logits), st = model(token_ids, p, state)
+        l = ner_cross_entropy(emissions, label_ids)
         return l, st
     end
 
@@ -315,12 +318,12 @@ function evaluate(model, params, state, data, vocab, config, device)
 
         token_ids, label_ids = prepare_batch(batch, vocab, config.max_sequence_length, device)
 
-        logits, _ = model(token_ids, params, state)
-        loss = ner_cross_entropy(logits, label_ids)
+        (emissions, _), _ = model(token_ids, params, state)
+        loss = ner_cross_entropy(emissions, label_ids)
         total_loss += loss
         n_batches += 1
 
-        predictions = dropdims(argmax(logits, dims=1), dims=1)
+        predictions = dropdims(argmax(emissions, dims=1), dims=1)
         mask = label_ids .!= -100
         total_correct += sum((predictions .== label_ids) .& mask)
         total_tokens += sum(mask)
@@ -344,9 +347,10 @@ function save_checkpoint(path::String; params, state, opt_state, step, epoch, lo
     end
 
     # Convert GPU arrays to CPU for serialization
-    cpu_params = Lux.cpu(params)
-    cpu_state = Lux.cpu(state)
-    cpu_opt_state = Lux.cpu(opt_state)
+    cpu_dev = cpu_device()
+    cpu_params = cpu_dev(params)
+    cpu_state = cpu_dev(state)
+    cpu_opt_state = cpu_dev(opt_state)
 
     data = Dict{Symbol,Any}(
         :params => cpu_params,

@@ -102,7 +102,8 @@ function (layer::DLinOSS)(token_sequence::AbstractArray, parameters, state)
         number_of_timesteps,
         number_of_batches,
     )
-    input_sequence_iterator = eachslice(projected_input_tensor, dims = 2)
+    # Convert slices to contiguous arrays to avoid GPU scalar indexing issues
+    input_sequence_iterator = [copy(projected_input_tensor[:, t, :]) for t in 1:number_of_timesteps]
 
     # ---------------------------------------------------------
     # E. Execution (Stacked Matrix Scan)
@@ -113,9 +114,9 @@ function (layer::DLinOSS)(token_sequence::AbstractArray, parameters, state)
     evolve_state =
         (current_stacked_state, current_input_matrix) -> begin
 
-            # Slicing is Zygote-safe
-            previous_velocity = current_stacked_state[1:layer.state_dimension, :]
-            previous_position = current_stacked_state[(layer.state_dimension+1):end, :]
+            # Use copy to avoid GPU scalar indexing with SubArray views
+            previous_velocity = copy(current_stacked_state[1:layer.state_dimension, :])
+            previous_position = copy(current_stacked_state[(layer.state_dimension+1):end, :])
 
             # Physics Update
             next_velocity =
@@ -130,11 +131,12 @@ function (layer::DLinOSS)(token_sequence::AbstractArray, parameters, state)
         end
 
     # Initialize Batch State (Stacked)
-    initial_velocity_view = @view state.oscillator_state[1, :]
-    initial_position_view = @view state.oscillator_state[2, :]
+    # Use copy instead of @view to avoid GPU scalar indexing
+    initial_velocity = copy(state.oscillator_state[1, :])
+    initial_position = copy(state.oscillator_state[2, :])
 
     # Vertically stack initial vectors -> (2*N, )
-    initial_stacked_vector = vcat(initial_velocity_view, initial_position_view)
+    initial_stacked_vector = vcat(initial_velocity, initial_position)
 
     # Repeat across batch -> (2*N, Batch)
     initial_stacked_batch = repeat(initial_stacked_vector, 1, number_of_batches)
@@ -151,8 +153,8 @@ function (layer::DLinOSS)(token_sequence::AbstractArray, parameters, state)
     flattened_history = reduce(hcat, state_history)
 
     # 2. Extract ONLY Positions (Bottom Half)
-    # We slice rows [N+1 : 2N, :]
-    flattened_positions = flattened_history[(layer.state_dimension+1):end, :]
+    # We slice rows [N+1 : 2N, :] - use copy for GPU compatibility
+    flattened_positions = copy(flattened_history[(layer.state_dimension+1):end, :])
 
     # 3. Project Output: (Out, State) * (State, Batch * Time) -> (Out, Batch * Time)
     output_flattened = output_projection * flattened_positions
@@ -175,14 +177,15 @@ function (layer::DLinOSS)(token_sequence::AbstractArray, parameters, state)
     # ---------------------------------------------------------
     last_stacked_state = state_history[end] # (2N, Batch)
 
-    # Extract first batch item -> (2N,)
-    last_stacked_vector = last_stacked_state[:, 1]
+    # Extract first batch item -> (2N,) - use copy for GPU compatibility
+    last_stacked_vector = copy(last_stacked_state[:, 1])
 
     # Reshape back to (2, N) to match Lux state format
     # Row 1: Velocity (1:N), Row 2: Position (N+1:end)
     # We construct it manually to avoid reshape mutation issues in Zygote
-    next_velocity_row = transpose(last_stacked_vector[1:layer.state_dimension])
-    next_position_row = transpose(last_stacked_vector[(layer.state_dimension+1):end])
+    # Use copy to avoid GPU scalar indexing
+    next_velocity_row = transpose(copy(last_stacked_vector[1:layer.state_dimension]))
+    next_position_row = transpose(copy(last_stacked_vector[(layer.state_dimension+1):end]))
 
     next_state_matrix = vcat(next_velocity_row, next_position_row)
 

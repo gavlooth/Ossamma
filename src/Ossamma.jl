@@ -216,10 +216,10 @@ function (block::OssammaBlock)(inputs::Tuple, params, state)
         normalized, params.GluProjection, state.GluProjection
     )
 
-    # Split into content and gate halves
+    # Split into content and gate halves (use copy to avoid GPU scalar indexing)
     dim = block.embedding_dimension
-    content_half = selectdim(glu_projected, 1, 1:dim)
-    gate_half = selectdim(glu_projected, 1, (dim+1):size(glu_projected, 1))
+    content_half = copy(selectdim(glu_projected, 1, 1:dim))
+    gate_half = copy(selectdim(glu_projected, 1, (dim+1):size(glu_projected, 1)))
 
     # Content → Linear Attention
     content_output, lin_attn_state = block.LinearAttention(
@@ -458,9 +458,10 @@ function (block::OssammaNERBlock)(inputs::Tuple, params, state)
     )
 
     # Split into path_a (LinearAttention) and path_b (Oscillator)
+    # Use copy to avoid GPU scalar indexing issues with SubArray views
     dim = block.embedding_dimension
-    path_a = selectdim(glu_projected, 1, 1:dim)
-    path_b = selectdim(glu_projected, 1, (dim+1):size(glu_projected, 1))
+    path_a = copy(selectdim(glu_projected, 1, 1:dim))
+    path_b = copy(selectdim(glu_projected, 1, (dim+1):size(glu_projected, 1)))
 
     # path_a → Linear Attention
     attn_out, lin_attn_state = block.LinearAttention(

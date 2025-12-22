@@ -2,22 +2,22 @@
 # Optimized for RTX 5090 (32GB VRAM)
 
 # =============================================================================
-# Model Architecture (~110M Parameters)
+# Model Architecture (~30M Parameters - fits in 32GB VRAM)
 # =============================================================================
 [model]
 vocab_size = 32000              # Standard BPE vocabulary
-max_sequence_length = 512       # Good for NER tasks
-embedding_dimension = 768       # BERT-base sized
-number_of_heads = 12            # 64 dims per head
-number_of_layers = 12           # Deep for complex patterns
+max_sequence_length = 256       # Reduced for memory
+embedding_dimension = 384       # Smaller but still capable
+number_of_heads = 6             # 64 dims per head
+number_of_layers = 6            # Moderate depth
 num_labels = 19                 # 9 entity types × 2 (B/I) + O
 
 [model.dimensions]
-time_dimension = 256            # Rich time conditioning
-state_dimension = 768           # Match embedding dim
+time_dimension = 128            # Reduced time conditioning
+state_dimension = 384           # Match embedding dim
 
 [model.attention]
-window_size = 64                # Local attention window
+window_size = 32                # Smaller window for memory
 
 [model.oscillator]
 min_frequency = 0.01            # Slow oscillations for long-range
@@ -32,8 +32,8 @@ label_smoothing = 0.1
 # Training Hyperparameters
 # =============================================================================
 [training]
-batch_size = 48                 # Aggressive for RTX 5090 32GB VRAM
-gradient_accumulation_steps = 2 # Effective batch size = 96
+batch_size = 8                  # Conservative for 32GB VRAM with 114M params
+gradient_accumulation_steps = 8 # Effective batch size = 64
 learning_rate = 3e-4            # Higher LR for faster convergence
 min_learning_rate = 1e-6
 warmup_steps = 1000             # Faster warmup

@@ -16,6 +16,7 @@ using Random
 using NNlib
 using Statistics: mean
 using TOML
+import CUDA
 
 # Import parent module components
 import ..OssammaNERBlock
@@ -498,7 +499,8 @@ function (model::OssammaNER)(token_ids::AbstractArray, params, state)
     # =========================================================================
     # 2. Position Embedding (using cached indices)
     # =========================================================================
-    position_indices = @view state.position_indices[1:seq_len]
+    # Use copy instead of @view to avoid GPU scalar indexing issues
+    position_indices = copy(state.position_indices[1:seq_len])
     pos_emb_raw, pos_state = model.PositionEmbedding(position_indices, params.PositionEmbedding, state.PositionEmbedding)
     pos_emb = reshape(pos_emb_raw, model.embedding_dimension, seq_len, 1)
 
@@ -643,6 +645,7 @@ end
     ner_cross_entropy(logits, labels; ignore_index=-100)
 
 Cross-entropy loss for NER, ignoring padding tokens.
+GPU-compatible using NNlib.scatter for one-hot creation.
 
 - logits: (num_labels, seq_len, batch)
 - labels: (seq_len, batch) integer labels
@@ -653,29 +656,41 @@ function ner_cross_entropy(logits, labels; ignore_index::Int = -100)
     # Flatten
     logits_flat = reshape(logits, num_labels, :)  # (num_labels, seq_len * batch)
     labels_flat = vec(labels)  # (seq_len * batch,)
+    n_positions = length(labels_flat)
 
     # Create mask for valid positions
-    mask = labels_flat .!= ignore_index
-    valid_count = sum(mask)
+    valid_mask = labels_flat .!= ignore_index
+    mask_float = Float32.(valid_mask)
+    valid_count = sum(mask_float)
 
-    if valid_count == 0
-        return 0.0f0
+    if valid_count < 1
+        return sum(logits_flat) * 0.0f0  # Differentiable zero
     end
 
-    # Compute softmax cross entropy
+    # Create safe labels on same device (replace ignore_index with 1)
+    safe_labels = ifelse.(valid_mask, labels_flat, 1)
+
+    # Compute log softmax
     log_probs = NNlib.logsoftmax(logits_flat, dims=1)
 
-    # Gather log probs at label positions
-    # Only compute for valid positions
-    total_loss = 0.0f0
-    for i in 1:length(labels_flat)
-        if mask[i]
-            label = labels_flat[i]
-            total_loss -= log_probs[label, i]
-        end
-    end
+    # Create one-hot using NNlib.scatter (GPU-compatible)
+    # scatter(op, src, idx) with idx as tuple of (row_idx, col_idx)
+    # Creates dst where dst[row_idx[i], col_idx[i]] = src[i]
+    is_gpu = logits_flat isa CUDA.CuArray
 
-    return total_loss / valid_count
+    src_ones = is_gpu ? CUDA.ones(Float32, n_positions) : ones(Float32, n_positions)
+    col_indices = is_gpu ? CUDA.cu(collect(Int64, 1:n_positions)) : collect(Int64, 1:n_positions)
+
+    # Create one-hot: one_hot[safe_labels[i], i] = 1.0
+    one_hot = NNlib.scatter(+, src_ones, (safe_labels, col_indices); dstsize=(num_labels, n_positions))
+
+    # Compute per-position cross entropy: -sum(one_hot .* log_probs, dims=1)
+    per_pos_ce = -sum(one_hot .* log_probs, dims=1)  # (1, n_positions)
+
+    # Apply mask and compute mean
+    masked_ce = vec(per_pos_ce) .* mask_float
+
+    return sum(masked_ce) / valid_count
 end
 
 # =============================================================================

@@ -14,7 +14,10 @@
       "Bash(cat:*)",
       "Bash(julia --project=. scripts/test_ner_training.jl:*)",
       "Bash(lspci:*)",
-      "Bash(jj git init:*)"
+      "Bash(jj git init:*)",
+      "Bash(julia --project=. scripts/train_ner_production.jl:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(git rebase:*)"
     ],
     "deny": [],
     "ask": []
