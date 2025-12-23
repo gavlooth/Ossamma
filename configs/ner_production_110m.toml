@@ -28,6 +28,11 @@ default_time_step = 0.05
 dropout_rate = 0.1
 label_smoothing = 0.1
 
+[model.ablation]
+use_output_gate = false           # Output gate removed (redundant with α-mixing)
+use_ffn = true                    # SwiGLU FFN after α-mixing (Option E)
+ffn_expansion = 1.333333          # 4/3 expansion factor (power-of-2 split dim)
+
 # =============================================================================
 # Training Hyperparameters
 # =============================================================================

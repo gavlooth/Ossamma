@@ -296,6 +296,80 @@ function (block::OssammaBlock)(inputs::Tuple, params, state)
 end
 
 # ============================================================================
+# SwiGLU Feed-Forward Network
+# ============================================================================
+
+"""
+    SwiGLU - Swish-Gated Linear Unit FFN layer.
+
+Implements the SwiGLU variant from "GLU Variants Improve Transformer" (Shazeer, 2020).
+
+Structure: Dense(d → 2h) → split → SiLU(a) ⊙ b → Dense(h → d)
+
+Where h = expansion_factor × d (default 4/3, giving power-of-2 split dimension).
+
+# Arguments
+- `dim::Int`: Input/output dimension
+- `expansion_factor::Float32`: Hidden dimension multiplier (default 4/3)
+
+# Example
+```julia
+ffn = SwiGLU(384)  # Creates FFN with hidden_dim = 512, split_dim = 256
+```
+"""
+struct SwiGLU <: LuxLayer
+    in_dim::Int
+    hidden_dim::Int
+    Expand::Lux.Dense
+    Contract::Lux.Dense
+end
+
+function SwiGLU(dim::Int; expansion_factor::Float32 = 4f0 / 3f0)
+    hidden = round(Int, dim * expansion_factor)
+    # Ensure hidden is even for clean split
+    hidden = hidden + (hidden % 2)
+
+    SwiGLU(
+        dim,
+        hidden,
+        Lux.Dense(dim => hidden),           # d → 4d/3 (e.g., 384 → 512)
+        Lux.Dense(hidden ÷ 2 => dim)        # 2d/3 → d (e.g., 256 → 384)
+    )
+end
+
+function Lux.initialparameters(rng::Random.AbstractRNG, ffn::SwiGLU)
+    return (
+        Expand = Lux.initialparameters(rng, ffn.Expand),
+        Contract = Lux.initialparameters(rng, ffn.Contract),
+    )
+end
+
+function Lux.initialstates(rng::Random.AbstractRNG, ffn::SwiGLU)
+    return (
+        Expand = Lux.initialstates(rng, ffn.Expand),
+        Contract = Lux.initialstates(rng, ffn.Contract),
+    )
+end
+
+function (ffn::SwiGLU)(x, ps, st)
+    # Expand: d → 2h
+    expanded, st_expand = ffn.Expand(x, ps.Expand, st.Expand)
+
+    # Split into two halves
+    half = ffn.hidden_dim ÷ 2
+    a = selectdim(expanded, 1, 1:half)
+    b = selectdim(expanded, 1, (half+1):ffn.hidden_dim)
+
+    # SwiGLU: Swish(a) ⊙ b  (swish = x * sigmoid(x) = SiLU)
+    gated = NNlib.swish.(a) .* b
+
+    # Contract: h → d
+    output, st_contract = ffn.Contract(gated, ps.Contract, st.Contract)
+
+    return output, (Expand = st_expand, Contract = st_contract)
+end
+
+# ============================================================================
 # OssammaNERBlock (with dual gating from GLU to Local branch)
 # ============================================================================
 
@@ -323,6 +397,8 @@ struct OssammaNERBlock <: LuxLayer
     time_dimension::Int
     state_dimension::Int
     dropout_rate::Float32
+    use_output_gate::Bool              # Ablation flag: disable output gate
+    use_ffn::Bool                      # Enable SwiGLU FFN after mixing
 
     # Time-conditioned normalization
     InputNorm::TimeConditionedLayerNorm
@@ -338,13 +414,16 @@ struct OssammaNERBlock <: LuxLayer
 
     # DUAL GATING: GLU guides Local branch
     InputGate::Lux.Dense               # dim → dim (no bias recommended)
-    OutputGate::Lux.Dense              # dim → dim (no bias recommended)
+    OutputGate::Union{Lux.Dense, Nothing}  # dim → dim (optional, for ablation)
 
     # Mixing: α projection from input + time bias
     AlphaProjection::Lux.Dense         # dim → 1
 
     # Dropout
     AttentionDropout::Lux.Dropout
+
+    # SwiGLU FFN after mixing (Option E)
+    FFN::Union{SwiGLU, Nothing}        # SwiGLU FFN (optional)
 
     # Output LayerNorm
     OutputNorm::Lux.LayerNorm
@@ -361,6 +440,9 @@ function OssammaNERBlock(
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
     dropout_rate::Float32 = 0.1f0,
+    use_output_gate::Bool = false,     # Default: false (ablated - output gate removed)
+    use_ffn::Bool = true,              # Default: true (SwiGLU FFN after mixing)
+    ffn_expansion::Float32 = 4f0 / 3f0,  # FFN expansion factor (4/3 gives power-of-2 split)
 )
     return OssammaNERBlock(
         embedding_dimension,
@@ -369,6 +451,8 @@ function OssammaNERBlock(
         time_dimension,
         state_dimension,
         dropout_rate,
+        use_output_gate,
+        use_ffn,
         # Time-conditioned LayerNorm
         TimeConditionedLayerNorm(embedding_dimension, time_dimension),
         # GLU branch
@@ -380,11 +464,13 @@ function OssammaNERBlock(
         SWAttention(sequence_length, embedding_dimension, number_of_heads; window_size = window_size),
         # Dual gating projections (no bias for cleaner gradients)
         Lux.Dense(embedding_dimension => embedding_dimension; use_bias = false),
-        Lux.Dense(embedding_dimension => embedding_dimension; use_bias = false),
+        use_output_gate ? Lux.Dense(embedding_dimension => embedding_dimension; use_bias = false) : nothing,
         # Alpha mixing projection
         Lux.Dense(embedding_dimension => 1),
         # Dropout
         Lux.Dropout(dropout_rate),
+        # SwiGLU FFN after mixing
+        use_ffn ? SwiGLU(embedding_dimension; expansion_factor = ffn_expansion) : nothing,
         # Output LayerNorm
         Lux.LayerNorm((embedding_dimension,)),
     )
@@ -393,14 +479,29 @@ end
 function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaNERBlock)
     # Initialize gate weights with small values (std=0.02) for gates starting near 0.5
     input_gate_params = Lux.initialparameters(rng, block.InputGate)
-    output_gate_params = Lux.initialparameters(rng, block.OutputGate)
 
-    # Scale down gate weights for softer initialization
+    # Scale down input gate weights for softer initialization
     if haskey(input_gate_params, :weight)
         input_gate_params = (weight = input_gate_params.weight .* 0.02f0,)
     end
-    if haskey(output_gate_params, :weight)
-        output_gate_params = (weight = output_gate_params.weight .* 0.02f0,)
+
+    # Conditionally initialize output gate
+    output_gate_params = if block.use_output_gate && block.OutputGate !== nothing
+        ogp = Lux.initialparameters(rng, block.OutputGate)
+        if haskey(ogp, :weight)
+            (weight = ogp.weight .* 0.02f0,)
+        else
+            ogp
+        end
+    else
+        NamedTuple()
+    end
+
+    # Conditionally initialize FFN
+    ffn_params = if block.use_ffn && block.FFN !== nothing
+        Lux.initialparameters(rng, block.FFN)
+    else
+        NamedTuple()
     end
 
     return (
@@ -414,11 +515,26 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaNERBlock)
         OutputGate = output_gate_params,
         AlphaProjection = Lux.initialparameters(rng, block.AlphaProjection),
         AttentionDropout = Lux.initialparameters(rng, block.AttentionDropout),
+        FFN = ffn_params,
         OutputNorm = Lux.initialparameters(rng, block.OutputNorm),
     )
 end
 
 function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaNERBlock)
+    # Conditionally initialize output gate state
+    output_gate_state = if block.use_output_gate && block.OutputGate !== nothing
+        Lux.initialstates(rng, block.OutputGate)
+    else
+        NamedTuple()
+    end
+
+    # Conditionally initialize FFN state
+    ffn_state = if block.use_ffn && block.FFN !== nothing
+        Lux.initialstates(rng, block.FFN)
+    else
+        NamedTuple()
+    end
+
     return (
         InputNorm = Lux.initialstates(rng, block.InputNorm),
         GluProjection = Lux.initialstates(rng, block.GluProjection),
@@ -427,9 +543,10 @@ function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaNERBlock)
         GluOutputProjection = Lux.initialstates(rng, block.GluOutputProjection),
         SlidingWindowAttention = Lux.initialstates(rng, block.SlidingWindowAttention),
         InputGate = Lux.initialstates(rng, block.InputGate),
-        OutputGate = Lux.initialstates(rng, block.OutputGate),
+        OutputGate = output_gate_state,
         AlphaProjection = Lux.initialstates(rng, block.AlphaProjection),
         AttentionDropout = Lux.initialstates(rng, block.AttentionDropout),
+        FFN = ffn_state,
         OutputNorm = Lux.initialstates(rng, block.OutputNorm),
     )
 end
@@ -501,15 +618,20 @@ function (block::OssammaNERBlock)(inputs::Tuple, params, state)
     )
 
     # Step 3c: Output Gate - GLU injects global context where Local needs help
-    # output_gate = sigmoid(W_output_gate @ GLU_out)
-    output_gate_logits, output_gate_state = block.OutputGate(
-        glu_out, params.OutputGate, state.OutputGate
-    )
-    output_gate = NNlib.sigmoid.(output_gate_logits)
-
-    # Local_final = local_out + output_gate * GLU_out
-    # (adds global information at positions where it's needed)
-    local_final = local_out .+ (output_gate .* glu_out)
+    # (Conditionally disabled for ablation study)
+    local_final, output_gate_state = if block.use_output_gate && block.OutputGate !== nothing
+        # output_gate = sigmoid(W_output_gate @ GLU_out)
+        output_gate_logits, og_state = block.OutputGate(
+            glu_out, params.OutputGate, state.OutputGate
+        )
+        output_gate = NNlib.sigmoid.(output_gate_logits)
+        # Local_final = local_out + output_gate * GLU_out
+        # (adds global information at positions where it's needed)
+        local_out .+ (output_gate .* glu_out), og_state
+    else
+        # Ablation: skip output gate, local_final = local_out directly
+        local_out, NamedTuple()
+    end
 
     # =========================================================================
     # 4. Adaptive Mixing: α·GLU_out + (1-α)·Local_final
@@ -544,6 +666,15 @@ function (block::OssammaNERBlock)(inputs::Tuple, params, state)
     )
 
     # =========================================================================
+    # 5b. SwiGLU FFN (Option E - transform nonlinearity after mixing)
+    # =========================================================================
+    mixed_output, ffn_state = if block.use_ffn && block.FFN !== nothing
+        block.FFN(mixed_output, params.FFN, state.FFN)
+    else
+        mixed_output, NamedTuple()
+    end
+
+    # =========================================================================
     # 6. Residual + Output LayerNorm
     # =========================================================================
     output_pre_norm = residual .+ mixed_output
@@ -567,6 +698,7 @@ function (block::OssammaNERBlock)(inputs::Tuple, params, state)
         OutputGate = output_gate_state,
         AlphaProjection = alpha_state,
         AttentionDropout = attn_dropout_state,
+        FFN = ffn_state,
         OutputNorm = output_norm_state,
     )
 

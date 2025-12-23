@@ -83,6 +83,13 @@ Base.@kwdef struct NERConfig
     dropout_rate::Float32 = 0.1f0
     label_smoothing::Float32 = 0.0f0
     use_crf::Bool = true # New field: whether to use a CRF layer
+
+    # Ablation flags
+    use_output_gate::Bool = false  # Default: false (output gate removed)
+
+    # FFN configuration (Option E)
+    use_ffn::Bool = true           # Default: true (SwiGLU FFN after mixing)
+    ffn_expansion::Float32 = 4f0 / 3f0  # FFN expansion factor (4/3 gives power-of-2 split)
 end
 
 # =============================================================================
@@ -107,6 +114,7 @@ function load_ner_config(path::String)::NERConfig
     attn = get(model, "attention", Dict())
     osc = get(model, "oscillator", Dict())
     reg = get(model, "regularization", Dict())
+    ablation = get(model, "ablation", Dict())
 
     return NERConfig(
         # Architecture
@@ -133,6 +141,13 @@ function load_ner_config(path::String)::NERConfig
         dropout_rate = Float32(get(reg, "dropout_rate", 0.1)),
         label_smoothing = Float32(get(reg, "label_smoothing", 0.0)),
         use_crf = get(reg, "use_crf", true),
+
+        # Ablation flags
+        use_output_gate = get(ablation, "use_output_gate", false),
+
+        # FFN configuration
+        use_ffn = get(ablation, "use_ffn", true),
+        ffn_expansion = Float32(get(ablation, "ffn_expansion", 4.0 / 3.0)),
     )
 end
 
@@ -373,6 +388,9 @@ function OssammaNER(config::NERConfig)
         max_frequency = config.max_frequency,
         default_time_step = config.default_time_step,
         dropout_rate = config.dropout_rate,
+        use_output_gate = config.use_output_gate,  # Ablation flag
+        use_ffn = config.use_ffn,                  # FFN configuration
+        ffn_expansion = config.ffn_expansion,
     )
 end
 
@@ -390,6 +408,9 @@ function OssammaNER(;
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
     dropout_rate::Float32 = 0.1f0,
+    use_output_gate::Bool = false,  # Default: false (output gate removed)
+    use_ffn::Bool = true,           # Default: true (SwiGLU FFN after mixing)
+    ffn_expansion::Float32 = 4f0 / 3f0,  # FFN expansion factor
 )
     # Build stack of OssammaNERBlocks (with dual gating)
     blocks = Tuple([
@@ -404,6 +425,9 @@ function OssammaNER(;
             max_frequency = max_frequency,
             default_time_step = default_time_step,
             dropout_rate = dropout_rate,
+            use_output_gate = use_output_gate,
+            use_ffn = use_ffn,
+            ffn_expansion = ffn_expansion,
         )
         for _ in 1:number_of_layers
     ])

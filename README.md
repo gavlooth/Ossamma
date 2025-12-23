@@ -33,18 +33,22 @@
     │  │  GLU Branch   │        │  Local Branch  │                  │
     │  │   (Global)    │        │   (Precise)    │                  │
     │  │               │        │                │                  │
-    │  │ LinearAttn ⊙  │───────►│  Input Gate    │                  │
-    │  │   DLinOSS     │        │       ↓        │                  │
-    │  │               │        │  SWAttention   │                  │
-    │  │               │───────►│       ↓        │                  │
-    │  │               │        │  Output Gate   │                  │
+    │  │ LinearAttn ⊙  │───────►│  Input Gate    │ σ(W·glu) gates   │
+    │  │   DLinOSS     │        │       ↓        │ input features   │
+    │  │       ↓       │        │  SWAttention   │                  │
+    │  │   glu_out     │        │                │                  │
     │  └───────┬───────┘        └───────┬────────┘                  │
     │          │                        │                           │
     │          └──────────┬─────────────┘                           │
     │                     ▼                                         │
     │           ┌─────────────────┐                                 │
     │           │  Adaptive Mix   │  α·GLU + (1-α)·Local            │
-    │           │  + Residual     │  where α = σ(learned)           │
+    │           │  (α-mixing)     │  where α = σ(learned + t_bias)  │
+    │           └────────┬────────┘                                 │
+    │                    ▼                                          │
+    │           ┌─────────────────┐                                 │
+    │           │   SwiGLU FFN    │  d → 4d/3 → split → swish⊙ → d  │
+    │           │   + Residual    │  (transform nonlinearity)       │
     │           └─────────────────┘                                 │
     └───────────────────────────────────────────────────────────────┘
                     │
@@ -102,6 +106,18 @@ Use:         φ(Q)(φ(K)^T V)    → O(n)
 ```
 
 Provides global context efficiently, complementing local SWAttention.
+
+### SwiGLU FFN
+
+Swish-Gated Linear Unit feed-forward network from "GLU Variants Improve Transformer" (Shazeer, 2020):
+
+```
+FFN(x) = Dense(Swish(a) ⊙ b) where [a, b] = split(Dense(x))
+
+Expansion: d → 4d/3 → split → swish(half) ⊙ other → d
+```
+
+Provides transform-type nonlinearity after the α-mixing step. The 4/3 expansion factor yields a power-of-2 split dimension (e.g., 384 → 512 → 256 split → 384).
 
 ## NER Label Schema
 

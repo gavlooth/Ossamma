@@ -1,0 +1,79 @@
+# OssammaNER Ablation Study - No Output Gate
+# Tests whether output gate provides value vs. just having input gate + adaptive mix
+# Based on ner_production_110m.toml with use_output_gate = false
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+[model]
+vocab_size = 32000
+max_sequence_length = 256
+embedding_dimension = 384
+number_of_heads = 6
+number_of_layers = 6
+num_labels = 19
+
+[model.dimensions]
+time_dimension = 128
+state_dimension = 384
+
+[model.attention]
+window_size = 32
+
+[model.oscillator]
+min_frequency = 0.01
+max_frequency = 5.0
+default_time_step = 0.05
+
+[model.regularization]
+dropout_rate = 0.1
+label_smoothing = 0.1
+
+# =============================================================================
+# Ablation: Disable Output Gate
+# =============================================================================
+[model.ablation]
+use_output_gate = false  # ABLATION: Remove output gate from GLU -> Local branch
+
+# =============================================================================
+# Training Hyperparameters (same as production for fair comparison)
+# =============================================================================
+[training]
+batch_size = 32
+gradient_accumulation_steps = 2
+learning_rate = 3e-4
+min_learning_rate = 1e-6
+warmup_steps = 1000
+total_steps = 50000
+gradient_clip = 1.0
+weight_decay = 0.01
+
+[training.checkpoints]
+eval_every = 250
+log_every = 25
+save_every = 1000
+push_every = 2000
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+[data]
+train_path = "data/ner/train.jsonl"
+val_path = "data/ner/validation.jsonl"
+max_len = 512
+
+# =============================================================================
+# Hardware Settings
+# =============================================================================
+[hardware]
+device = "gpu"
+mixed_precision = true
+num_workers = 4
+
+# =============================================================================
+# Git Push Settings
+# =============================================================================
+[git]
+remote = "origin"
+branch = "master"
+checkpoint_dir = "checkpoints/ner_ablation_no_output_gate"
