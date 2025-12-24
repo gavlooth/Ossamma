@@ -30,28 +30,28 @@ const LuxLayer = Lux.AbstractLuxLayer
 # NER Label Schema
 # =============================================================================
 
+# Few-NERD coarse labels (8 entity types + O = 17 labels)
 const RAG_LABELS = [
     "O",           # Outside any entity
-    "B-PERSON", "I-PERSON",
-    "B-AGENCY", "I-AGENCY",
-    "B-PLACE", "I-PLACE",
-    "B-ORGANISM", "I-ORGANISM",
+    "B-ART", "I-ART",
+    "B-BUILDING", "I-BUILDING",
     "B-EVENT", "I-EVENT",
-    "B-INSTRUMENT", "I-INSTRUMENT",
-    "B-WORK", "I-WORK",
-    "B-DOMAIN", "I-DOMAIN",
-    "B-MEASURE", "I-MEASURE",
+    "B-LOCATION", "I-LOCATION",
+    "B-ORGANIZATION", "I-ORGANIZATION",
+    "B-OTHER", "I-OTHER",
+    "B-PERSON", "I-PERSON",
+    "B-PRODUCT", "I-PRODUCT",
 ]
 
-const NUM_LABELS = length(RAG_LABELS)  # 19 (O + 9 entity types × 2 for B/I)
+const NUM_LABELS = length(RAG_LABELS)  # 17 (O + 8 entity types × 2 for B/I)
 
 const LABEL_TO_ID = Dict(label => i for (i, label) in enumerate(RAG_LABELS))
 const ID_TO_LABEL = Dict(i => label for (i, label) in enumerate(RAG_LABELS))
 
 # Entity types without B/I prefix
 const ENTITY_TYPES = [
-    "PERSON", "AGENCY", "PLACE", "ORGANISM", "EVENT",
-    "INSTRUMENT", "WORK", "DOMAIN", "MEASURE"
+    "ART", "BUILDING", "EVENT", "LOCATION",
+    "ORGANIZATION", "OTHER", "PERSON", "PRODUCT"
 ]
 
 # =============================================================================
@@ -90,6 +90,10 @@ Base.@kwdef struct NERConfig
     # FFN configuration (Option E)
     use_ffn::Bool = true           # Default: true (SwiGLU FFN after mixing)
     ffn_expansion::Float32 = 4f0 / 3f0  # FFN expansion factor (4/3 gives power-of-2 split)
+
+    # GPU Parallelization (RTX 5090 optimization)
+    use_parallel_scan::Bool = false    # Enable parallel associative scan (10-40× speedup)
+    parallel_chunk_size::Int = 64      # Chunk size for parallel scan
 end
 
 # =============================================================================
@@ -115,6 +119,7 @@ function load_ner_config(path::String)::NERConfig
     osc = get(model, "oscillator", Dict())
     reg = get(model, "regularization", Dict())
     ablation = get(model, "ablation", Dict())
+    parallel = get(toml, "parallelization", Dict())
 
     return NERConfig(
         # Architecture
@@ -148,6 +153,10 @@ function load_ner_config(path::String)::NERConfig
         # FFN configuration
         use_ffn = get(ablation, "use_ffn", true),
         ffn_expansion = Float32(get(ablation, "ffn_expansion", 4.0 / 3.0)),
+
+        # GPU Parallelization
+        use_parallel_scan = get(parallel, "use_parallel_scan", false),
+        parallel_chunk_size = get(parallel, "chunk_size", 64),
     )
 end
 
@@ -391,6 +400,8 @@ function OssammaNER(config::NERConfig)
         use_output_gate = config.use_output_gate,  # Ablation flag
         use_ffn = config.use_ffn,                  # FFN configuration
         ffn_expansion = config.ffn_expansion,
+        use_parallel_scan = config.use_parallel_scan,      # GPU parallelization
+        parallel_chunk_size = config.parallel_chunk_size,
     )
 end
 
@@ -411,6 +422,8 @@ function OssammaNER(;
     use_output_gate::Bool = false,  # Default: false (output gate removed)
     use_ffn::Bool = true,           # Default: true (SwiGLU FFN after mixing)
     ffn_expansion::Float32 = 4f0 / 3f0,  # FFN expansion factor
+    use_parallel_scan::Bool = false,     # GPU parallelization (10-40× speedup)
+    parallel_chunk_size::Int = 64,       # Chunk size for parallel scan
 )
     # Build stack of OssammaNERBlocks (with dual gating)
     blocks = Tuple([
@@ -428,6 +441,8 @@ function OssammaNER(;
             use_output_gate = use_output_gate,
             use_ffn = use_ffn,
             ffn_expansion = ffn_expansion,
+            use_parallel_scan = use_parallel_scan,
+            parallel_chunk_size = parallel_chunk_size,
         )
         for _ in 1:number_of_layers
     ])

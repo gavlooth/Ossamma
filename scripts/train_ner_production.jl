@@ -186,6 +186,12 @@ function load_config(path::String)
         config.git_branch = get(g, "branch", config.git_branch)
     end
 
+    # Data settings
+    if haskey(data, "data")
+        d = data["data"]
+        config.data_dir = get(d, "data_dir", config.data_dir)
+    end
+
     return config
 end
 
@@ -250,7 +256,7 @@ function prepare_batch(examples, vocab::Dict{String, Int}, max_len::Int, device)
 
     for (i, ex) in enumerate(examples)
         tokens = collect(ex.tokens)
-        tags = collect(ex.ner_tags)
+        tags = collect(ex.labels)
         seq_len = min(length(tokens), max_len)
 
         token_ids[1:seq_len, i] = tokenize(tokens[1:seq_len], vocab)
@@ -289,7 +295,7 @@ function generate_synthetic_data(n_samples::Int, vocab_size::Int, max_len::Int)
             end
         end
 
-        push!(data, (tokens = tokens, ner_tags = tags))
+        push!(data, (tokens = tokens, labels = tags))
     end
     return data
 end

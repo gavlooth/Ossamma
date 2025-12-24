@@ -1,0 +1,109 @@
+# OssammaNER GPU-Optimized Configuration
+# Maximizes RTX 5090 (32GB VRAM, Compute 12.0) utilization
+# Uses parallel scan for DLinOSS and larger batch sizes
+
+# =============================================================================
+# Model Architecture (~75M Parameters)
+# =============================================================================
+[model]
+vocab_size = 32000              # Standard BPE vocabulary
+max_sequence_length = 256       # Context length
+embedding_dimension = 640       # Production size
+number_of_heads = 10            # 64 dims per head
+number_of_layers = 10           # 10 Ossamma blocks
+num_labels = 17                 # 8 entity types × 2 (B/I) + O
+
+[model.dimensions]
+time_dimension = 192            # Time conditioning dimension
+state_dimension = 640           # Match embedding dim
+
+[model.attention]
+window_size = 32                # Sliding window size
+
+[model.oscillator]
+min_frequency = 0.01            # Slow oscillations for long-range
+max_frequency = 5.0             # Fast for word-level patterns
+default_time_step = 0.05
+
+[model.regularization]
+dropout_rate = 0.1
+label_smoothing = 0.1
+use_crf = true
+
+[model.ablation]
+use_output_gate = false         # Output gate ablated
+use_ffn = true                  # SwiGLU FFN enabled
+ffn_expansion = 1.333333        # 4/3 expansion
+
+# =============================================================================
+# GPU-Optimized Training (RTX 5090 32GB)
+# =============================================================================
+[training]
+# Maximize GPU utilization with larger batches
+batch_size = 32                 # 4x larger batch (32GB VRAM can handle it)
+gradient_accumulation_steps = 4 # Effective batch = 128
+learning_rate = 3e-4            # Slightly higher LR for larger batch
+min_learning_rate = 1e-6
+warmup_steps = 500              # Faster warmup with larger batch
+total_steps = 25000             # Fewer steps needed with larger batch
+gradient_clip = 1.0
+weight_decay = 0.01
+
+[training.checkpoints]
+eval_every = 200
+log_every = 20
+save_every = 1000
+push_every = 2000
+
+# =============================================================================
+# Parallelization Settings
+# =============================================================================
+[parallelization]
+# DLinOSS parallel scan configuration
+use_parallel_scan = true        # Enable parallel associative scan
+chunk_size = 64                 # Chunk size for scan (power of 2)
+use_cuda_graphs = true          # CUDA graph capture for reduced kernel launch overhead
+
+# Memory optimization
+gradient_checkpointing = false  # Trade compute for memory (enable if OOM)
+pin_memory = true               # Faster CPU→GPU transfer
+
+# Multi-stream execution
+num_cuda_streams = 4            # Parallel CUDA streams
+
+# Tensor core optimization (RTX 5090 has FP8/FP16 tensor cores)
+tensor_core_precision = "tf32"  # Options: tf32, fp16, bf16
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+[data]
+train_path = "data/ner/train.jsonl"
+val_path = "data/ner/validation.jsonl"
+test_path = "data/ner/test.jsonl"
+max_len = 256
+data_dir = "data/ner"
+
+# Data loading optimization
+prefetch_factor = 4             # Prefetch batches
+num_workers = 8                 # Parallel data loading
+
+# =============================================================================
+# Hardware Settings
+# =============================================================================
+[hardware]
+device = "gpu"
+mixed_precision = true          # FP16 forward pass
+compile_mode = "reduce-overhead" # Julia compilation mode
+
+# Memory settings for 32GB VRAM
+max_memory_gb = 28              # Reserve 4GB for system
+allow_growth = true             # Dynamic memory allocation
+
+# =============================================================================
+# Git Settings
+# =============================================================================
+[git]
+remote = "origin"
+branch = "master"
+checkpoint_dir = "checkpoints/ner_gpu_optimized"

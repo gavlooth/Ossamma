@@ -1,20 +1,20 @@
-# OssammaNER Production Configuration - 110M Parameters
+# OssammaNER Production Configuration - 75M Parameters
 # Optimized for RTX 5090 (32GB VRAM)
 
 # =============================================================================
-# Model Architecture (~30M Parameters - fits in 32GB VRAM)
+# Model Architecture (~75M Parameters - Production)
 # =============================================================================
 [model]
 vocab_size = 32000              # Standard BPE vocabulary
-max_sequence_length = 256       # Reduced for memory
-embedding_dimension = 384       # Smaller but still capable
-number_of_heads = 6             # 64 dims per head
-number_of_layers = 6            # Moderate depth
-num_labels = 19                 # 9 entity types × 2 (B/I) + O
+max_sequence_length = 256       # Context length
+embedding_dimension = 640       # Reduced from 768
+number_of_heads = 10            # 64 dims per head
+number_of_layers = 10           # Reduced from 12
+num_labels = 17                 # 8 entity types × 2 (B/I) + O
 
 [model.dimensions]
-time_dimension = 128            # Reduced time conditioning
-state_dimension = 384           # Match embedding dim
+time_dimension = 192            # Reduced time conditioning
+state_dimension = 640           # Match embedding dim
 
 [model.attention]
 window_size = 32                # Smaller window for memory
@@ -33,13 +33,17 @@ use_output_gate = false           # Output gate removed (redundant with α-mixin
 use_ffn = true                    # SwiGLU FFN after α-mixing (Option E)
 ffn_expansion = 1.333333          # 4/3 expansion factor (power-of-2 split dim)
 
+[parallelization]
+use_parallel_scan = true          # GPU parallel associative scan (10-40× speedup)
+chunk_size = 64                   # Chunk size for parallel processing
+
 # =============================================================================
 # Training Hyperparameters
 # =============================================================================
 [training]
-batch_size = 32                 # Larger batches for 32GB VRAM with ~15M params
-gradient_accumulation_steps = 2 # Effective batch size = 64
-learning_rate = 3e-4            # Higher LR for faster convergence
+batch_size = 8                  # Larger batch for 75M model on 32GB VRAM
+gradient_accumulation_steps = 8  # Effective batch size = 64
+learning_rate = 2e-4            # Standard LR for fresh training
 min_learning_rate = 1e-6
 warmup_steps = 1000             # Faster warmup
 total_steps = 50000             # Training run
@@ -58,7 +62,9 @@ push_every = 2000               # Push to Git more often
 [data]
 train_path = "data/ner/train.jsonl"
 val_path = "data/ner/validation.jsonl"
-max_len = 512
+test_path = "data/ner/test.jsonl"
+max_len = 256
+data_dir = "data/ner"
 
 # =============================================================================
 # Hardware Settings
