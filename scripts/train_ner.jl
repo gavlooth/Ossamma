@@ -62,34 +62,36 @@ end
 # =============================================================================
 
 """
-Compute boundary labels for auxiliary loss.
-Returns 1 for B-* tags (start of entity), 0 otherwise.
+Evaluate model using Viterbi decoding.
 """
-function compute_boundary_labels(labels::Matrix{Int}, id_to_label::Dict{Int, String})
-    seq_len, batch_size = size(labels)
-    boundaries = zeros(Float32, 2, seq_len, batch_size) # One-hot: [not_boundary, is_boundary]
+function evaluate_model(model, params, state, samples, tokenizer, vocab, id_to_label, config)
+    predictions = Vector{Vector{Int}}()
+    gold_labels = Vector{Vector{Int}}()
     
-    for b in 1:batch_size
-        for t in 1:seq_len
-            label_id = labels[t, b]
-            if label_id == -100 # Ignore padding
-                # Masked positions will be ignored by crossentropy if we handle it right,
-                # but NNlib.logitcrossentropy doesn't support ignore_index directly for arrays.
-                # We'll handle masking manually in the loss function.
-                continue
-            end
-            
-            label_str = get(id_to_label, label_id, "O")
-            is_boundary = startswith(label_str, "B-")
-            
-            if is_boundary
-                boundaries[2, t, b] = 1.0f0 # is_boundary
-            else
-                boundaries[1, t, b] = 1.0f0 # not_boundary
-            end
+    # Process in batches
+    loader = NERDataLoader(samples; batch_size=config.batch_size, max_length=config.max_len, shuffle=false)
+    
+    for batch in loader
+        token_ids = batch.token_ids
+        batch_labels = batch.labels
+        batch_mask = batch.mask
+        
+        # Forward pass to get emissions
+        (emissions, _), _ = model(token_ids, params, state)
+        
+        # Viterbi decode
+        decoded_preds, _ = viterbi_decode(model.CRF, emissions, batch_mask, params.CRF, state.CRF)
+        
+        # Collect results
+        batch_size = size(token_ids, 2)
+        for b in 1:batch_size
+            seq_len = sum(batch_mask[:, b])
+            push!(predictions, decoded_preds[1:seq_len, b])
+            push!(gold_labels, batch_labels[1:seq_len, b])
         end
     end
-    return boundaries
+    
+    return evaluate_ner(predictions, gold_labels, id_to_label)
 end
 
 """
@@ -166,6 +168,11 @@ function train(config::TrainConfig)
     tokenizer = NERTokenizer(vocab; max_length=config.max_len)
     println("  Vocab size: $(length(vocab))")
     save_vocab(vocab, joinpath(config.output_dir, "vocab.json"))
+
+    # Pre-tokenize datasets
+    println("Pre-tokenizing datasets...")
+    tokenize_dataset!(train_samples, tokenizer)
+    tokenize_dataset!(val_samples, tokenizer)
     
     # 3. Create Model
     println("Initializing OssammaNER (v2) model...")
@@ -198,11 +205,20 @@ function train(config::TrainConfig)
     # Labels needed for boundary computation
     _, id_to_label = create_label_dicts() # Using default RAG schema
     
+    # Pre-compute boundary status map for vectorized computation
+    # boundary_status[label_id] = 1 if B-*, else 0
+    boundary_status = Float32[startswith(get(id_to_label, i, "O"), "B-") ? 1.0f0 : 0.0f0 for i in 1:NUM_LABELS]
+    
     global_step = 0
     best_f1 = 0.0
     
     # Data loaders
     train_loader = NERDataLoader(train_samples; batch_size=config.batch_size, max_length=config.max_len)
+    
+    # Gradient accumulation
+    accum_steps = 4 # Accumulate over 4 batches
+    accum_counter = 0
+    accum_grads = nothing
     
     for epoch in 1:config.epochs
         reset!(train_loader)
@@ -210,49 +226,73 @@ function train(config::TrainConfig)
         steps = 0
         
         for batch in train_loader
-            # Tokenize batch
-            # batch is (tokens, labels, mask) tuple from loader, but loader returns strings
-            # We need to convert strings to IDs using our tokenizer
+            # Use pre-tokenized IDs from batch
+            token_ids = batch.token_ids
+            batch_labels = batch.labels
+            batch_mask = batch.mask
             
-            # Use custom batch processing since loader returns padded strings
-            # Ideally NERDataLoader would use the tokenizer, but it's decoupled.
-            # We'll re-tokenize the raw samples for now or adapt.
-            # Actually, let's just use the raw samples from the batch indices of the loader if possible.
-            # The loader returns (tokens, labels, mask) matrices.
-            # We can map tokens to IDs.
+            # Vectorized boundary targets computation
+            # We handle ignore_index (-100) by mapping it to a safe index for lookup then masking
+            safe_labels = ifelse.(batch_labels .== -100, 1, batch_labels)
+            is_b = boundary_status[safe_labels]
             
-            batch_tokens = batch.tokens # Matrix{String}
-            batch_labels = batch.labels # Matrix{Int}
-            batch_mask = batch.mask     # Matrix{Bool}
-            
-            # Convert tokens to IDs
-            seq_len, batch_size = size(batch_tokens)
-            token_ids = zeros(Int, seq_len, batch_size)
-            
-            for i in 1:length(batch_tokens)
-                token_ids[i] = vocab[batch_tokens[i]]
-            end
-            
-            # Compute boundary targets
-            boundary_targets = compute_boundary_labels(batch_labels, id_to_label)
+            # Create one-hot boundary targets: (2, seq_len, batch)
+            boundary_targets = zeros(Float32, 2, size(is_b)...)
+            boundary_targets[1, :, :] .= 1.0f0 .- is_b
+            boundary_targets[2, :, :] .= is_b
             
             # Gradient step
             (loss, st), grads = Zygote.withgradient(ps) do p
-                compute_loss(model, p, st, token_ids, batch_labels, batch_mask, boundary_targets, config.boundary_loss_weight)
+                # Scale loss by accumulation steps
+                l, s = compute_loss(model, p, st, token_ids, batch_labels, batch_mask, boundary_targets, config.boundary_loss_weight)
+                return l / accum_steps, s
             end
             
-            # Clip grads (manual calculation for now or use Optimisers.ClipGrad if available)
-            # Optimisers.update! handles update. 
-            # We'll skip clipping for this simplified script or add it if unstable.
+            # Accumulate gradients
+            if accum_grads === nothing
+                accum_grads = grads[1]
+            else
+                # Helper to add gradients recursively
+                # Simplification: assuming structure matches
+                # In real Zygote, might need a more robust recursive addition
+                # For now, relying on Optimisers.update! to handle structure
+                # But we need to SUM them. 
+                # Let's use a simple loop or map if structure is complex.
+                # Actually, Zygote gradients are usually NamedTuples matching params.
+                # We can use map over the structure.
+                
+                # Recursive addition for nested NamedTuples
+                function add_grads(g1, g2)
+                    if g1 isa NamedTuple
+                        return NamedTuple{keys(g1)}(map(add_grads, values(g1), values(g2)))
+                    elseif g1 === nothing
+                        return g2
+                    elseif g2 === nothing
+                        return g1
+                    else
+                        return g1 .+ g2
+                    end
+                end
+                
+                accum_grads = add_grads(accum_grads, grads[1])
+            end
             
-            opt_state, ps = Optimisers.update(opt_state, ps, grads[1])
+            accum_counter += 1
             
-            epoch_loss += loss
+            # Update weights if accumulation is complete
+            if accum_counter >= accum_steps
+                opt_state, ps = Optimisers.update(opt_state, ps, accum_grads)
+                accum_grads = nothing
+                accum_counter = 0
+            end
+            
+            # Track full loss for reporting
+            epoch_loss += loss * accum_steps # Recover actual loss value
             steps += 1
             global_step += 1
             
             if global_step % config.eval_every == 0
-                @printf("Step %d | Loss: %.4f\n", global_step, loss)
+                @printf("Step %d | Loss: %.4f\n", global_step, loss * accum_steps)
             end
         end
         
@@ -274,44 +314,9 @@ function train(config::TrainConfig)
         println("-" ^ 60)
     end
 end
-
-"""
-Evaluate model using Viterbi decoding.
-"""
-function evaluate_model(model, params, state, samples, tokenizer, vocab, id_to_label, config)
-    predictions = Vector{Vector{Int}}()
-    gold_labels = Vector{Vector{Int}}()
-    
-    # Process in batches
-    loader = NERDataLoader(samples; batch_size=config.batch_size, max_length=config.max_len, shuffle=false)
-    
-    for batch in loader
-        batch_tokens = batch.tokens
-        batch_labels = batch.labels
-        batch_mask = batch.mask
-        
-        seq_len, batch_size = size(batch_tokens)
-        token_ids = zeros(Int, seq_len, batch_size)
-        for i in 1:length(batch_tokens)
-            token_ids[i] = vocab[batch_tokens[i]]
-        end
-        
-        # Forward pass to get emissions
-        (emissions, _), _ = model(token_ids, params, state)
-        
-        # Viterbi decode
-        decoded_preds, _ = viterbi_decode(model.CRF, emissions, batch_mask, params.CRF, state.CRF)
-        
-        # Collect results
-        for b in 1:batch_size
-            seq_len = sum(batch_mask[:, b])
-            push!(predictions, decoded_preds[1:seq_len, b])
-            push!(gold_labels, batch_labels[1:seq_len, b])
-        end
-    end
-    
     return evaluate_ner(predictions, gold_labels, id_to_label)
 end
+
 
 # =============================================================================
 # Main

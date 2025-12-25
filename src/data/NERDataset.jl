@@ -167,11 +167,18 @@ Fields:
 - tokens: Vector of word strings
 - labels: Vector of label IDs (integers)
 - original_labels: Vector of original label strings (before mapping)
+- token_ids: Vector of token IDs (integers, populated after tokenization)
 """
-struct NERSample
+mutable struct NERSample
     tokens::Vector{String}
     labels::Vector{Int}
     original_labels::Vector{String}
+    token_ids::Vector{Int}
+end
+
+# Constructor for backward compatibility
+function NERSample(tokens, labels, original_labels)
+    return NERSample(tokens, labels, original_labels, Int[])
 end
 
 function Base.length(sample::NERSample)
@@ -180,6 +187,28 @@ end
 
 function Base.show(io::IO, sample::NERSample)
     print(io, "NERSample($(length(sample.tokens)) tokens)")
+end
+
+"""
+    tokenize!(sample::NERSample, vocab::Dict{String, Int}; unk_token="[UNK]")
+
+Tokenize the sample using the provided vocabulary and store in `token_ids`.
+"""
+function tokenize!(sample::NERSample, vocab::Dict{String, Int}; unk_token="[UNK]")
+    unk_id = get(vocab, unk_token, 0)
+    sample.token_ids = [get(vocab, t, unk_id) for t in sample.tokens]
+    return sample
+end
+
+"""
+    tokenize_dataset!(samples::Vector{NERSample}, vocab::Dict{String, Int}; kwargs...)
+
+Tokenize all samples in the dataset.
+"""
+function tokenize_dataset!(samples::Vector{NERSample}, vocab::Dict{String, Int}; kwargs...)
+    for sample in samples
+        tokenize!(sample, vocab; kwargs...)
+    end
 end
 
 # =============================================================================
@@ -449,7 +478,7 @@ function reset!(loader::NERDataLoader)
 end
 
 """
-    get_batch(loader::NERDataLoader) -> (tokens, labels, mask) or nothing
+    get_batch(loader::NERDataLoader) -> NamedTuple
 
 Get the next batch. Returns nothing when epoch is complete.
 
@@ -457,6 +486,7 @@ Returns:
 - tokens: (seq_len, batch_size) - padded token strings
 - labels: (seq_len, batch_size) - padded label IDs
 - mask: (seq_len, batch_size) - attention mask (true = valid)
+- token_ids: (seq_len, batch_size) - padded token IDs (if available in samples)
 """
 function get_batch(loader::NERDataLoader)
     if loader.current_idx > length(loader.samples)
@@ -482,6 +512,10 @@ function get_batch(loader::NERDataLoader)
     tokens = fill("", batch_max_len, actual_batch_size)
     labels = fill(loader.ignore_label_id, batch_max_len, actual_batch_size)
     mask = fill(false, batch_max_len, actual_batch_size)
+    
+    # Check if first sample has token_ids
+    has_token_ids = !isempty(batch_samples[1].token_ids)
+    token_ids = has_token_ids ? fill(loader.pad_token_id, batch_max_len, actual_batch_size) : Int[]
 
     for (b, sample) in enumerate(batch_samples)
         seq_len = min(length(sample), loader.max_length)
@@ -490,10 +524,13 @@ function get_batch(loader::NERDataLoader)
             tokens[t, b] = sample.tokens[t]
             labels[t, b] = sample.labels[t]
             mask[t, b] = true
+            if has_token_ids
+                token_ids[t, b] = sample.token_ids[t]
+            end
         end
     end
 
-    return (tokens = tokens, labels = labels, mask = mask)
+    return (tokens = tokens, labels = labels, mask = mask, token_ids = token_ids)
 end
 
 # Iteration interface

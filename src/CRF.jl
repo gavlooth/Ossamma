@@ -162,6 +162,7 @@ end
     forward_algorithm(emissions, mask, params) -> log_partition
 
 Compute log partition function Z(x) using forward algorithm.
+Vectorized implementation for better GPU performance.
 
 Arguments:
 - emissions: (num_labels, seq_len, batch) - emission scores from encoder
@@ -179,41 +180,58 @@ function forward_algorithm(
     num_labels, seq_len, batch_size = size(emissions)
 
     # Get masked transitions (valid transitions + learned scores)
+    # (num_labels, num_labels)
     trans = params.transitions .+ TRANSITION_MASK
 
     # Initialize with start transitions + first emissions
-    # alpha[j, b] = log score of all paths ending in label j at position 1
-    alpha = params.start_transitions .+ emissions[:, 1, :]  # (num_labels, batch)
+    # alpha: (num_labels, batch)
+    alpha = params.start_transitions .+ emissions[:, 1, :]
 
-    # Forward pass
+    # Iterate over sequence length
     for t in 2:seq_len
-        # Expand alpha for broadcasting: (num_labels, 1, batch)
-        alpha_expanded = reshape(alpha, num_labels, 1, batch_size)
-
-        # Transition scores: (num_labels, num_labels)
-        # trans[i, j] = score of transitioning from label i to label j
-
-        # For each target label j:
-        # new_alpha[j] = logsumexp_i(alpha[i] + trans[i, j] + emission[j])
-
-        # Compute all pairwise scores: (from_label, to_label, batch)
-        # alpha[i, b] + trans[i, j] for all i, j
-        scores = alpha_expanded .+ reshape(trans, num_labels, num_labels, 1)
-
-        # Sum over source labels: (to_label, batch)
-        new_alpha = dropdims(log_sum_exp(scores, dims=1), dims=1)
-
-        # Add emission scores: (num_labels, batch)
+        # Broadcast alpha: (num_labels, 1, batch)
+        # trans: (num_labels, num_labels, 1)
+        # Sum: (source_label, target_label, batch)
+        
+        # log_sum_exp over source labels (dim 1)
+        # This computes: log(sum(exp(alpha[i] + trans[i, j]))) for each j
+        
+        # We need to do this carefully to avoid huge allocations
+        # shape: (num_labels, batch)
+        # Using a custom reduction or NNlib if possible
+        
+        # Expand for broadcasting
+        alpha_exp = reshape(alpha, num_labels, 1, batch_size)
+        trans_exp = reshape(trans, num_labels, num_labels, 1)
+        
+        # (num_labels, num_labels, batch)
+        scores = alpha_exp .+ trans_exp
+        
+        # LogSumExp over source labels (dim 1) -> (1, num_labels, batch)
+        # Result is log prob of reaching each target label
+        new_alpha = log_sum_exp(scores, dims=1)
+        
+        # Reshape back to (num_labels, batch)
+        new_alpha = reshape(new_alpha, num_labels, batch_size)
+        
+        # Add emissions: (num_labels, batch)
         new_alpha = new_alpha .+ emissions[:, t, :]
-
-        # Apply mask: keep old alpha for padded positions
+        
+        # Masking: if mask[t, b] is false, keep old alpha
+        # mask[t, :]: (batch,)
         mask_t = reshape(mask[t, :], 1, batch_size)
+        
+        # If masked, we just carry forward the previous alpha (effectively ignoring this step)
+        # But wait, if it's padding, we shouldn't have updated it at all.
+        # The standard way is: alpha = mask * new_alpha + (1-mask) * alpha
         alpha = ifelse.(mask_t, new_alpha, alpha)
     end
 
-    # Add end transitions and sum over labels
+    # Add end transitions: (num_labels, batch)
     alpha = alpha .+ params.end_transitions
-    log_partition = dropdims(log_sum_exp(alpha, dims=1), dims=1)  # (batch,)
+
+    # Final log sum exp: (batch,)
+    log_partition = dropdims(log_sum_exp(alpha, dims=1), dims=1)
 
     return log_partition
 end
@@ -243,42 +261,66 @@ function compute_gold_score(
     params
 ) where T
     num_labels, seq_len, batch_size = size(emissions)
-
-    # Start with start transitions for first labels
-    score = zeros(T, batch_size)
-
-    for b in 1:batch_size
-        first_label = labels[1, b]
-        score[b] = params.start_transitions[first_label] + emissions[first_label, 1, b]
-    end
+    
+    # transitions: (num_labels, num_labels)
+    # Get indices for start transitions
+    # labels[1, :]: (batch_size,)
+    start_scores = params.start_transitions[labels[1, :]] # (batch_size,)
+    
+    # First emission scores
+    # emissions: (num_labels, seq_len, batch)
+    # We need emissions[labels[1, b], 1, b] for each b
+    # Use linear indexing or a clever slice
+    
+    # emissions_1: (num_labels, batch)
+    emissions_1 = emissions[:, 1, :]
+    # Get scores for the first label in each batch
+    # emission_scores[b] = emissions_1[labels[1, b], b]
+    # In Julia, we can use a loop for this specific indexing or sub2ind-style indexing
+    # For Zygote compatibility, a simple map/broadcast is often best
+    first_emission_scores = [emissions_1[labels[1, b], b] for b in 1:batch_size]
+    
+    score = start_scores .+ first_emission_scores
 
     # Accumulate emission and transition scores
     for t in 2:seq_len
-        for b in 1:batch_size
-            if mask[t, b]
-                prev_label = labels[t-1, b]
-                curr_label = labels[t, b]
-
-                # Transition score
-                score[b] += params.transitions[prev_label, curr_label]
-
-                # Emission score
-                score[b] += emissions[curr_label, t, b]
-            end
-        end
+        # mask[t, :]: (batch_size,)
+        mask_t = mask[t, :]
+        
+        # prev_labels: (batch_size,)
+        prev_labels = labels[t-1, :]
+        # curr_labels: (batch_size,)
+        curr_labels = labels[t, :]
+        
+        # Transition scores: params.transitions[prev, curr]
+        # t_scores[b] = params.transitions[prev_labels[b], curr_labels[b]]
+        t_scores = [params.transitions[prev_labels[b], curr_labels[b]] for b in 1:batch_size]
+        
+        # Emission scores: emissions[curr_label, t, batch]
+        # e_scores[b] = emissions[curr_labels[b], t, b]
+        emissions_t = emissions[:, t, :]
+        e_scores = [emissions_t[curr_labels[b], b] for b in 1:batch_size]
+        
+        # Update score only where mask is true
+        step_score = t_scores .+ e_scores
+        score = score .+ (mask_t .* step_score)
     end
 
     # Add end transitions
-    for b in 1:batch_size
-        # Find last valid position
-        last_pos = findlast(mask[:, b])
-        if last_pos !== nothing
-            last_label = labels[last_pos, b]
-            score[b] += params.end_transitions[last_label]
-        end
-    end
+    # We need to find the last valid label for each sequence
+    # end_labels[b] = labels[last_pos[b], b]
+    last_positions = [findlast(mask[:, b]) for b in 1:batch_size]
+    # If no valid position, default to 1 (though should not happen with valid mask)
+    end_labels = [labels[something(pos, 1), b] for (b, pos) in enumerate(last_positions)]
+    
+    end_scores = params.end_transitions[end_labels]
+    score = score .+ end_scores
 
     return score
+end
+
+function something(x, default)
+    return x === nothing ? default : x
 end
 
 # =============================================================================
@@ -351,11 +393,12 @@ function viterbi_decode(
 ) where T
     num_labels, seq_len, batch_size = size(emissions)
 
-    # Get masked transitions
+    # Get masked transitions: (num_labels, num_labels)
     trans = params.transitions .+ TRANSITION_MASK
 
-    # Viterbi scores and backpointers
+    # Viterbi scores: (num_labels, seq_len, batch)
     viterbi = zeros(T, num_labels, seq_len, batch_size)
+    # Backpointers: (num_labels, seq_len, batch)
     backpointers = zeros(Int, num_labels, seq_len, batch_size)
 
     # Initialize with start transitions + first emissions
@@ -363,28 +406,37 @@ function viterbi_decode(
 
     # Forward pass (find best paths)
     for t in 2:seq_len
-        for b in 1:batch_size
-            if !mask[t, b]
-                # Copy previous scores for padded positions
-                viterbi[:, t, b] = viterbi[:, t-1, b]
-                continue
-            end
-
-            for j in 1:num_labels
-                # Score of reaching label j at position t from each previous label
-                scores = viterbi[:, t-1, b] .+ trans[:, j]
-
-                # Best previous label
-                best_i = argmax(scores)
-                best_score = scores[best_i]
-
-                viterbi[j, t, b] = best_score + emissions[j, t, b]
-                backpointers[j, t, b] = best_i
-            end
-        end
+        # mask[t, :]: (batch_size,)
+        mask_t = mask[t, :]
+        
+        # Broadcast viterbi: (from_label, 1, batch)
+        v_prev = reshape(viterbi[:, t-1, :], num_labels, 1, batch_size)
+        # trans: (from_label, to_label, 1)
+        t_exp = reshape(trans, num_labels, num_labels, 1)
+        
+        # scores: (from_label, to_label, batch)
+        scores = v_prev .+ t_exp
+        
+        # Find best source label for each target label
+        # best_prev_scores: (1, to_label, batch)
+        best_prev_scores = maximum(scores, dims=1)
+        # best_prev_idx: (1, to_label, batch)
+        best_prev_idx = mapslices(argmax, scores, dims=1)
+        
+        # Update viterbi scores and backpointers
+        # emissions_t: (to_label, batch)
+        emissions_t = emissions[:, t, :]
+        
+        new_v = reshape(best_prev_scores, num_labels, batch_size) .+ emissions_t
+        new_bp = reshape(best_prev_idx, num_labels, batch_size)
+        
+        # Apply mask: if !mask_t[b], keep previous values
+        mask_exp = reshape(mask_t, 1, batch_size)
+        viterbi[:, t, :] = ifelse.(mask_exp, new_v, viterbi[:, t-1, :])
+        backpointers[:, t, :] = new_bp # Masking backpointers is less critical but good for clarity
     end
 
-    # Add end transitions and find best final label
+    # Backtracking (remains sequential per batch, but we can iterate over batches)
     predictions = zeros(Int, seq_len, batch_size)
 
     for b in 1:batch_size
@@ -405,8 +457,8 @@ function viterbi_decode(
         end
 
         # Fill padding with O (label 1)
-        for t in (last_pos+1):seq_len
-            predictions[t, b] = 1
+        if last_pos < seq_len
+            predictions[(last_pos+1):seq_len, b] .= 1
         end
     end
 

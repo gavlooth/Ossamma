@@ -84,9 +84,6 @@ Base.@kwdef struct NERConfig
     label_smoothing::Float32 = 0.0f0
     use_crf::Bool = true # New field: whether to use a CRF layer
 
-    # Ablation flags
-    use_output_gate::Bool = false  # Default: false (output gate removed)
-
     # FFN configuration (Option E)
     use_ffn::Bool = true           # Default: true (SwiGLU FFN after mixing)
     ffn_expansion::Float32 = 4f0 / 3f0  # FFN expansion factor (4/3 gives power-of-2 split)
@@ -146,9 +143,6 @@ function load_ner_config(path::String)::NERConfig
         dropout_rate = Float32(get(reg, "dropout_rate", 0.1)),
         label_smoothing = Float32(get(reg, "label_smoothing", 0.0)),
         use_crf = get(reg, "use_crf", true),
-
-        # Ablation flags
-        use_output_gate = get(ablation, "use_output_gate", false),
 
         # FFN configuration
         use_ffn = get(ablation, "use_ffn", true),
@@ -252,8 +246,8 @@ function estimate_parameters(config::NERConfig)
     # DLinOSS
     dlinoss = 3 * d_s + d_s * d + d * d_s  # log params + projections
 
-    # Dual gates (no bias)
-    dual_gates = 2 * d * d
+    # Input gate (no bias)
+    input_gate = d * d
 
     # SWAttention
     sw_attn = 4 * (d * d + d)
@@ -261,7 +255,7 @@ function estimate_parameters(config::NERConfig)
     # Alpha + output norm
     alpha_norm = d + 1 + d * 2
 
-    per_block = time_cond_norm + glu_proj + glu_out_proj + lin_attn + dlinoss + dual_gates + sw_attn + alpha_norm
+    per_block = time_cond_norm + glu_proj + glu_out_proj + lin_attn + dlinoss + input_gate + sw_attn + alpha_norm
 
     # Classification head
     class_head = d * 2 + d * n_labels + n_labels  # LayerNorm + Dense
@@ -397,7 +391,6 @@ function OssammaNER(config::NERConfig)
         max_frequency = config.max_frequency,
         default_time_step = config.default_time_step,
         dropout_rate = config.dropout_rate,
-        use_output_gate = config.use_output_gate,  # Ablation flag
         use_ffn = config.use_ffn,                  # FFN configuration
         ffn_expansion = config.ffn_expansion,
         use_parallel_scan = config.use_parallel_scan,      # GPU parallelization
@@ -419,7 +412,6 @@ function OssammaNER(;
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
     dropout_rate::Float32 = 0.1f0,
-    use_output_gate::Bool = false,  # Default: false (output gate removed)
     use_ffn::Bool = true,           # Default: true (SwiGLU FFN after mixing)
     ffn_expansion::Float32 = 4f0 / 3f0,  # FFN expansion factor
     use_parallel_scan::Bool = false,     # GPU parallelization (10-40× speedup)
@@ -438,7 +430,6 @@ function OssammaNER(;
             max_frequency = max_frequency,
             default_time_step = default_time_step,
             dropout_rate = dropout_rate,
-            use_output_gate = use_output_gate,
             use_ffn = use_ffn,
             ffn_expansion = ffn_expansion,
             use_parallel_scan = use_parallel_scan,

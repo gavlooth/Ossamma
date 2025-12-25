@@ -326,7 +326,7 @@ struct SwiGLU <: LuxLayer
     Contract::Lux.Dense
 end
 
-function SwiGLU(dim::Int; expansion_factor::Float32 = 4f0 / 3f0)
+function SwiGLU(dim::Int; expansion_factor::Float32 = 3f0 / 2f0)
     hidden = round(Int, dim * expansion_factor)
     # Ensure hidden is even for clean split
     hidden = hidden + (hidden % 2)
@@ -403,7 +403,6 @@ struct OssammaNERBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
     time_dimension::Int
     state_dimension::Int
     dropout_rate::Float32
-    use_output_gate::Bool              # Ablation flag: disable output gate
     use_ffn::Bool                      # Enable SwiGLU FFN after mixing
     use_parallel_scan::Bool            # GPU optimization: parallel associative scan
 
@@ -421,7 +420,6 @@ struct OssammaNERBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
 
     # DUAL GATING: GLU guides Local branch
     InputGate::Lux.Dense               # dim → dim (no bias recommended)
-    OutputGate::Union{Lux.Dense, Nothing}  # dim → dim (optional, for ablation)
 
     # Mixing: α projection from input + time bias
     AlphaProjection::Lux.Dense         # dim → 1
@@ -447,9 +445,8 @@ function OssammaNERBlock(
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
     dropout_rate::Float32 = 0.1f0,
-    use_output_gate::Bool = false,     # Default: false (ablated - output gate removed)
     use_ffn::Bool = true,              # Default: true (SwiGLU FFN after mixing)
-    ffn_expansion::Float32 = 4f0 / 3f0,  # FFN expansion factor (4/3 gives power-of-2 split)
+    ffn_expansion::Float32 = 3f0 / 2f0,  # FFN expansion factor (1.5 gives 3/2 ratio)
     use_parallel_scan::Bool = false,   # GPU optimization: parallel associative scan
     parallel_chunk_size::Int = 64,     # Chunk size for parallel scan
 )
@@ -472,7 +469,6 @@ function OssammaNERBlock(
         time_dimension,
         state_dimension,
         dropout_rate,
-        use_output_gate,
         use_ffn,
         use_parallel_scan,
         # Time-conditioned LayerNorm
@@ -486,7 +482,6 @@ function OssammaNERBlock(
         SWAttention(sequence_length, embedding_dimension, number_of_heads; window_size = window_size),
         # Dual gating projections (no bias for cleaner gradients)
         Lux.Dense(embedding_dimension => embedding_dimension; use_bias = false),
-        use_output_gate ? Lux.Dense(embedding_dimension => embedding_dimension; use_bias = false) : nothing,
         # Alpha mixing projection
         Lux.Dense(embedding_dimension => 1),
         # Dropout
@@ -507,18 +502,6 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaNERBlock)
         input_gate_params = (weight = input_gate_params.weight .* 0.02f0,)
     end
 
-    # Conditionally initialize output gate
-    output_gate_params = if block.use_output_gate && block.OutputGate !== nothing
-        ogp = Lux.initialparameters(rng, block.OutputGate)
-        if haskey(ogp, :weight)
-            (weight = ogp.weight .* 0.02f0,)
-        else
-            ogp
-        end
-    else
-        NamedTuple()
-    end
-
     # Conditionally initialize FFN
     ffn_params = if block.use_ffn && block.FFN !== nothing
         Lux.initialparameters(rng, block.FFN)
@@ -534,7 +517,6 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaNERBlock)
         GluOutputProjection = Lux.initialparameters(rng, block.GluOutputProjection),
         SlidingWindowAttention = Lux.initialparameters(rng, block.SlidingWindowAttention),
         InputGate = input_gate_params,
-        OutputGate = output_gate_params,
         AlphaProjection = Lux.initialparameters(rng, block.AlphaProjection),
         AttentionDropout = Lux.initialparameters(rng, block.AttentionDropout),
         FFN = ffn_params,
@@ -543,13 +525,6 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaNERBlock)
 end
 
 function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaNERBlock)
-    # Conditionally initialize output gate state
-    output_gate_state = if block.use_output_gate && block.OutputGate !== nothing
-        Lux.initialstates(rng, block.OutputGate)
-    else
-        NamedTuple()
-    end
-
     # Conditionally initialize FFN state
     ffn_state = if block.use_ffn && block.FFN !== nothing
         Lux.initialstates(rng, block.FFN)
@@ -565,7 +540,6 @@ function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaNERBlock)
         GluOutputProjection = Lux.initialstates(rng, block.GluOutputProjection),
         SlidingWindowAttention = Lux.initialstates(rng, block.SlidingWindowAttention),
         InputGate = Lux.initialstates(rng, block.InputGate),
-        OutputGate = output_gate_state,
         AlphaProjection = Lux.initialstates(rng, block.AlphaProjection),
         AttentionDropout = Lux.initialstates(rng, block.AttentionDropout),
         FFN = ffn_state,
@@ -639,21 +613,8 @@ function (block::OssammaNERBlock)(inputs::Tuple, params, state)
         gated_x, params.SlidingWindowAttention, state.SlidingWindowAttention
     )
 
-    # Step 3c: Output Gate - GLU injects global context where Local needs help
-    # (Conditionally disabled for ablation study)
-    local_final, output_gate_state = if block.use_output_gate && block.OutputGate !== nothing
-        # output_gate = sigmoid(W_output_gate @ GLU_out)
-        output_gate_logits, og_state = block.OutputGate(
-            glu_out, params.OutputGate, state.OutputGate
-        )
-        output_gate = NNlib.sigmoid.(output_gate_logits)
-        # Local_final = local_out + output_gate * GLU_out
-        # (adds global information at positions where it's needed)
-        local_out .+ (output_gate .* glu_out), og_state
-    else
-        # Ablation: skip output gate, local_final = local_out directly
-        local_out, NamedTuple()
-    end
+    # Step 3c: Output Gate removed (ablation made permanent)
+    local_final = local_out
 
     # =========================================================================
     # 4. Adaptive Mixing: α·GLU_out + (1-α)·Local_final
@@ -717,7 +678,6 @@ function (block::OssammaNERBlock)(inputs::Tuple, params, state)
         GluOutputProjection = glu_out_state,
         SlidingWindowAttention = sw_attn_state,
         InputGate = input_gate_state,
-        OutputGate = output_gate_state,
         AlphaProjection = alpha_state,
         AttentionDropout = attn_dropout_state,
         FFN = ffn_state,

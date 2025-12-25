@@ -29,6 +29,10 @@ dropout_rate = 0.1
 label_smoothing = 0.1
 use_crf = true
 
+[model.ablation]
+use_ffn = true
+ffn_expansion = 1.5             # 3/2 expansion ratio
+
 # =============================================================================
 # Training Hyperparameters
 # =============================================================================
@@ -52,9 +56,9 @@ push_every = 5000
 # Data Configuration
 # =============================================================================
 [data]
-train_path = "data/ner/train.jsonl"
-val_path = "data/ner/validation.jsonl"
-test_path = "data/ner/test.jsonl"
+train_path = "data/rag/final_train.jsonl"
+val_path = "data/rag/validation.jsonl"
+test_path = "data/rag/test.jsonl"
 max_len = 512
 
 # =============================================================================
