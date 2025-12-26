@@ -1,0 +1,44 @@
+# =============================================================================
+# OssammaDrafter Configuration for Granite 4.0
+# =============================================================================
+# This config sets up the drafter to use IBM Granite 4.0 as the AR verifier.
+# Granite 4.0 Micro (3B) is recommended for verification.
+#
+# Usage:
+#   config = load_drafter_config("configs/drafter_granite.toml")
+#   drafter = OssammaDrafter(config)
+
+# AR Model Selection
+# Options: "granite", "qwen3", "llama3"
+ar_model = "granite"
+
+# vocab_size and mask_token_id are auto-determined from ar_model
+# Uncomment to override:
+# vocab_size = 100352
+# mask_token_id = 100256
+
+# =============================================================================
+# Architecture
+# =============================================================================
+max_sequence_length = 2048
+embedding_dimension = 512
+number_of_heads = 8
+number_of_layers = 6
+time_dimension = 64
+
+# =============================================================================
+# Regularization
+# =============================================================================
+dropout_rate = 0.1
+
+# =============================================================================
+# Feed-Forward Network
+# =============================================================================
+use_ffn = true
+ffn_expansion = 1.5    # 3d/2 expansion
+
+# =============================================================================
+# Optimization
+# =============================================================================
+# Use parallel scan for DLinOSS (faster on GPU, slightly less accurate)
+use_parallel_scan = false
