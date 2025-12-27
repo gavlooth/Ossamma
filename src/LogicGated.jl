@@ -17,6 +17,7 @@ export fuse_experts_gated_sum, gather_spans, scatter_spans
 export ExpertCache, init_cache, update_cache, apply_cache
 export active_experts_schedule, apply_expert_mask
 export expert_confusion_matrix, collapse_alert, router_metrics, misroute_rate
+export router_loss, logic_mask_from_tokens, logic_mask_from_labels
 export EXPERT_LOGIC, EXPERT_LANGUAGE, EXPERT_MATH, EXPERT_MEMORY, EXPERT_NAMES
 
 const EXPERT_LOGIC = 1
@@ -509,6 +510,24 @@ function router_metrics(
 end
 
 """
+    router_loss(gates, labels; λ_balance=0.01, λ_entropy=0.01, hard=false)
+
+Combined router loss: supervision + load balance + entropy regularization.
+"""
+function router_loss(
+    gates::AbstractArray,
+    labels::AbstractArray;
+    λ_balance::Float32 = 0.01f0,
+    λ_entropy::Float32 = 0.01f0,
+    hard::Bool = false
+)
+    sup = router_supervision_loss(gates, labels)
+    bal = load_balance_loss(gates; hard = hard)
+    ent = gate_entropy(gates)
+    return sup + λ_balance * bal - λ_entropy * ent
+end
+
+"""
     misroute_rate(gates, labels; ignore_index=0)
 
 Return 1 - routing accuracy.
@@ -725,6 +744,13 @@ function heuristic_labels(tokens::AbstractVector{<:AbstractString})
         end
     end
     return labels
+end
+
+logic_mask_from_labels(labels::AbstractArray) = labels .== EXPERT_LOGIC
+
+function logic_mask_from_tokens(tokens::AbstractVector{<:AbstractString})
+    labels = heuristic_labels(tokens)
+    return logic_mask_from_labels(labels)
 end
 
 """

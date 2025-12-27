@@ -83,6 +83,13 @@ end
     preds = top1_expert(gates)
     cm = expert_confusion_matrix(preds, labels)
     @test size(cm) == (4, 4)
+
+    loss = router_loss(gates, labels)
+    @test loss > 0
+
+    tokens = ["forall", "x", "->", "y"]
+    logic_mask = logic_mask_from_tokens(tokens)
+    @test any(logic_mask)
 end
 
 @testset "GatedExperts Wrapper" begin
