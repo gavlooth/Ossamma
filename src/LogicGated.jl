@@ -18,6 +18,7 @@ export ExpertCache, init_cache, update_cache, apply_cache
 export active_experts_schedule, apply_expert_mask
 export expert_confusion_matrix, collapse_alert, router_metrics, misroute_rate
 export router_loss, logic_mask_from_tokens, logic_mask_from_labels
+export force_experts, reroute_on_failure
 export EXPERT_LOGIC, EXPERT_LANGUAGE, EXPERT_MATH, EXPERT_MEMORY, EXPERT_NAMES
 
 const EXPERT_LOGIC = 1
@@ -399,6 +400,53 @@ function apply_expert_mask(gates::AbstractArray, active::AbstractVector{Bool})
     end
     norm = sum(g, dims = 1)
     return g ./ (norm .+ 1f-10)
+end
+
+"""
+    force_experts(gates; experts, mask=nothing, floor=0.1)
+
+Force specified experts to have at least `floor` mass on masked tokens.
+"""
+function force_experts(
+    gates::AbstractArray;
+    experts::AbstractVector{<:Integer},
+    mask::Union{Nothing, AbstractArray} = nothing,
+    floor::Float32 = 0.1f0
+)
+    g = copy(gates)
+    if ndims(g) == 2
+        for t in 1:size(g, 2)
+            if mask === nothing || mask[t]
+                for e in experts
+                    g[e, t] = max(g[e, t], floor)
+                end
+            end
+        end
+    else
+        for b in 1:size(g, 3), t in 1:size(g, 2)
+            if mask === nothing || mask[t, b]
+                for e in experts
+                    g[e, t, b] = max(g[e, t, b], floor)
+                end
+            end
+        end
+    end
+    norm = sum(g, dims = 1)
+    return g ./ (norm .+ 1f-10)
+end
+
+"""
+    reroute_on_failure(gates, failure_mask; forced=(EXPERT_LOGIC, EXPERT_LANGUAGE))
+
+Simple reroute fallback: boost logic + language for tokens flagged by verifier.
+"""
+function reroute_on_failure(
+    gates::AbstractArray,
+    failure_mask::AbstractArray;
+    forced::Tuple{Int,Int} = (EXPERT_LOGIC, EXPERT_LANGUAGE),
+    floor::Float32 = 0.2f0
+)
+    return force_experts(gates; experts = collect(forced), mask = failure_mask, floor = floor)
 end
 
 """

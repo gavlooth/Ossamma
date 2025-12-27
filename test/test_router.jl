@@ -90,6 +90,12 @@ end
     tokens = ["forall", "x", "->", "y"]
     logic_mask = logic_mask_from_tokens(tokens)
     @test any(logic_mask)
+
+    forced = force_experts(gates; experts = [EXPERT_LOGIC], mask = logic_mask, floor = 0.2f0)
+    @test all(forced[EXPERT_LOGIC, logic_mask] .>= 0.2f0)
+
+    rerouted = reroute_on_failure(gates, logic_mask)
+    @test size(rerouted) == size(gates)
 end
 
 @testset "GatedExperts Wrapper" begin
