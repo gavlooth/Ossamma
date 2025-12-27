@@ -29,6 +29,7 @@ using Printf
 using Random
 using Statistics
 using PyCall
+using TOML
 
 include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
 include(joinpath(@__DIR__, "..", "src", "DataLoader.jl"))
@@ -51,6 +52,10 @@ function parse_commandline()
     s = ArgParseSettings(description = "Production training for OssammaDrafter")
 
     @add_arg_table! s begin
+        "--train-config"
+            help = "Optional training config TOML (overrides defaults)"
+            arg_type = String
+            default = ""
         "--config"
             help = "Path to drafter config TOML file"
             arg_type = String
@@ -197,6 +202,113 @@ end
 # =============================================================================
 # Utilities
 # =============================================================================
+
+const DEFAULT_ARGS = Dict(
+    "config" => "configs/drafter_granite.toml",
+    "data" => "",
+    "val-data" => "",
+    "dataset" => "",
+    "dataset-config" => "default",
+    "text-column" => "text",
+    "num-train-rows" => 20000,
+    "num-val-rows" => 1000,
+    "batch-size" => 16,
+    "gradient-accumulation-steps" => 2,
+    "gradient-clip" => 1.0,
+    "max-steps" => 100000,
+    "lr" => 1e-4,
+    "weight-decay" => 0.01,
+    "warmup-steps" => 1000,
+    "save-every" => 1000,
+    "eval-every" => 500,
+    "log-every" => 100,
+    "checkpoint-dir" => "checkpoints/drafter_production",
+    "resume" => "",
+    "seed" => 42,
+    "mask-ratio" => 0.15,
+    "mask-strategy" => "mixed",
+    "draft-length" => 8,
+    "suffix-prob" => 0.5,
+    "alpha" => 1.0,
+    "temperature" => 1.0,
+    "tokenizer-model" => "ibm-granite/granite-4.0-micro",
+    "download-verifier" => false,
+    "verifier-model" => "",
+    "hf-cache-dir" => "",
+    "use-teacher" => false,
+    "teacher-model" => "",
+    "teacher-device" => "cpu",
+    "teacher-dtype" => "float16",
+)
+
+function load_train_config(path::String)
+    data = TOML.parsefile(path)
+    overrides = Dict{String,Any}()
+
+    if haskey(data, "model")
+        m = data["model"]
+        overrides["config"] = get(m, "config_path", get(m, "config", DEFAULT_ARGS["config"]))
+        overrides["tokenizer-model"] = get(m, "tokenizer_model", DEFAULT_ARGS["tokenizer-model"])
+        overrides["verifier-model"] = get(m, "verifier_model", DEFAULT_ARGS["verifier-model"])
+        overrides["download-verifier"] = get(m, "download_verifier", DEFAULT_ARGS["download-verifier"])
+        overrides["hf-cache-dir"] = get(m, "hf_cache_dir", DEFAULT_ARGS["hf-cache-dir"])
+    end
+
+    if haskey(data, "data")
+        d = data["data"]
+        overrides["data"] = get(d, "train_jsonl", DEFAULT_ARGS["data"])
+        overrides["val-data"] = get(d, "val_jsonl", DEFAULT_ARGS["val-data"])
+        overrides["dataset"] = get(d, "dataset", DEFAULT_ARGS["dataset"])
+        overrides["dataset-config"] = get(d, "dataset_config", DEFAULT_ARGS["dataset-config"])
+        overrides["text-column"] = get(d, "text_column", DEFAULT_ARGS["text-column"])
+        overrides["num-train-rows"] = get(d, "num_train_rows", DEFAULT_ARGS["num-train-rows"])
+        overrides["num-val-rows"] = get(d, "num_val_rows", DEFAULT_ARGS["num-val-rows"])
+    end
+
+    if haskey(data, "training")
+        t = data["training"]
+        overrides["batch-size"] = get(t, "batch_size", DEFAULT_ARGS["batch-size"])
+        overrides["gradient-accumulation-steps"] = get(t, "gradient_accumulation_steps", DEFAULT_ARGS["gradient-accumulation-steps"])
+        overrides["gradient-clip"] = get(t, "gradient_clip", DEFAULT_ARGS["gradient-clip"])
+        overrides["max-steps"] = get(t, "max_steps", DEFAULT_ARGS["max-steps"])
+        overrides["lr"] = get(t, "learning_rate", DEFAULT_ARGS["lr"])
+        overrides["weight-decay"] = get(t, "weight_decay", DEFAULT_ARGS["weight-decay"])
+        overrides["warmup-steps"] = get(t, "warmup_steps", DEFAULT_ARGS["warmup-steps"])
+        overrides["mask-ratio"] = get(t, "mask_ratio", DEFAULT_ARGS["mask-ratio"])
+        overrides["mask-strategy"] = get(t, "mask_strategy", DEFAULT_ARGS["mask-strategy"])
+        overrides["draft-length"] = get(t, "draft_length", DEFAULT_ARGS["draft-length"])
+        overrides["suffix-prob"] = get(t, "suffix_prob", DEFAULT_ARGS["suffix-prob"])
+        overrides["alpha"] = get(t, "alpha", DEFAULT_ARGS["alpha"])
+        overrides["temperature"] = get(t, "temperature", DEFAULT_ARGS["temperature"])
+
+        if haskey(t, "checkpoints")
+            c = t["checkpoints"]
+            overrides["checkpoint-dir"] = get(c, "checkpoint_dir", DEFAULT_ARGS["checkpoint-dir"])
+            overrides["save-every"] = get(c, "save_every", DEFAULT_ARGS["save-every"])
+            overrides["eval-every"] = get(c, "eval_every", DEFAULT_ARGS["eval-every"])
+            overrides["log-every"] = get(c, "log_every", DEFAULT_ARGS["log-every"])
+            overrides["resume"] = get(c, "resume", DEFAULT_ARGS["resume"])
+        end
+    end
+
+    if haskey(data, "teacher")
+        t = data["teacher"]
+        overrides["use-teacher"] = get(t, "use_teacher", DEFAULT_ARGS["use-teacher"])
+        overrides["teacher-model"] = get(t, "teacher_model", DEFAULT_ARGS["teacher-model"])
+        overrides["teacher-device"] = get(t, "teacher_device", DEFAULT_ARGS["teacher-device"])
+        overrides["teacher-dtype"] = get(t, "teacher_dtype", DEFAULT_ARGS["teacher-dtype"])
+    end
+
+    return overrides
+end
+
+function apply_config_overrides!(args::Dict{String,Any}, overrides::Dict{String,Any})
+    for (key, value) in overrides
+        if haskey(DEFAULT_ARGS, key) && args[key] == DEFAULT_ARGS[key]
+            args[key] = value
+        end
+    end
+end
 
 function load_jsonl_texts(path::String)
     texts = String[]
@@ -451,6 +563,10 @@ end
 
 function main()
     args = parse_commandline()
+    if !isempty(args["train-config"])
+        overrides = load_train_config(args["train-config"])
+        apply_config_overrides!(args, overrides)
+    end
     Random.seed!(args["seed"])
     rng = Random.default_rng()
 

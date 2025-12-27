@@ -1,0 +1,63 @@
+# =============================================================================
+# OssammaDrafter Production Training Configuration
+# =============================================================================
+# Use with:
+#   julia --project=. scripts/train_drafter_production.jl --train-config configs/drafter_production.toml
+#
+# Model config (architecture) lives in a separate file referenced below.
+# Training settings and data sources are defined here.
+
+[model]
+# Path to drafter architecture config
+config_path = "configs/drafter_granite.toml"
+
+# HF tokenizer / verifier
+tokenizer_model = "ibm-granite/granite-4.0-micro"
+verifier_model = "ibm-granite/granite-4.0-micro"
+
+# Auto-download verifier weights via huggingface_hub
+download_verifier = true
+hf_cache_dir = ""
+
+[data]
+# Optional JSONL data paths (use these if set)
+train_jsonl = ""
+val_jsonl = ""
+
+# Optional HF dataset (used if JSONL not provided)
+dataset = "roneneldan/TinyStories"
+dataset_config = "default"
+text_column = "text"
+num_train_rows = 20000
+num_val_rows = 1000
+
+[training]
+# Optimization
+batch_size = 16
+gradient_accumulation_steps = 2
+gradient_clip = 1.0
+learning_rate = 1e-4
+weight_decay = 0.01
+warmup_steps = 1000
+max_steps = 100000
+
+# Loss
+alpha = 1.0
+temperature = 1.0
+mask_ratio = 0.15
+mask_strategy = "mixed"  # random | suffix | mixed
+draft_length = 8
+suffix_prob = 0.5
+
+[training.checkpoints]
+checkpoint_dir = "checkpoints/drafter_production"
+save_every = 1000
+eval_every = 500
+log_every = 100
+resume = ""
+
+[teacher]
+use_teacher = false
+teacher_model = "ibm-granite/granite-4.0-micro"
+teacher_device = "cpu"
+teacher_dtype = "float16"
