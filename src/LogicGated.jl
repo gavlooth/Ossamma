@@ -7,7 +7,7 @@ using Random
 using Zygote: @ignore
 using Statistics: mean
 
-export TokenRouter, top1_expert, build_spans
+export TokenRouter, GatedExperts, top1_expert, build_spans
 export heuristic_labels, heuristic_labels_batch
 export router_supervision_loss, router_accuracy
 export anneal_temperature, topk_gates, ste_gates, apply_logic_floor
@@ -89,6 +89,94 @@ function (router::TokenRouter)(x, params, state; temperature::Float32 = router.t
         gates = dropdims(gates, dims = 3)
     end
     return gates, new_state
+end
+
+"""
+    GatedExperts(router, experts; top_k=2, use_ste=false, logic_floor=DEFAULT_LOGIC_FLOOR)
+
+Minimal MoE wrapper that runs all experts and fuses outputs with gates.
+"""
+struct GatedExperts{R,E} <: LuxCore.AbstractLuxLayer
+    Router::R
+    Experts::Vector{E}
+    num_experts::Int
+    top_k::Int
+    use_ste::Bool
+    logic_floor::Float32
+end
+
+function GatedExperts(
+    router::TokenRouter,
+    experts::Vector;
+    top_k::Int = 2,
+    use_ste::Bool = false,
+    logic_floor::Float32 = DEFAULT_LOGIC_FLOOR
+)
+    return GatedExperts(router, experts, length(experts), top_k, use_ste, logic_floor)
+end
+
+function Lux.initialparameters(rng::Random.AbstractRNG, layer::GatedExperts)
+    return (
+        Router = Lux.initialparameters(rng, layer.Router),
+        Experts = [Lux.initialparameters(rng, ex) for ex in layer.Experts],
+    )
+end
+
+function Lux.initialstates(rng::Random.AbstractRNG, layer::GatedExperts)
+    return (
+        Router = Lux.initialstates(rng, layer.Router),
+        Experts = [Lux.initialstates(rng, ex) for ex in layer.Experts],
+    )
+end
+
+"""
+    (layer::GatedExperts)(inputs, params, state; logic_mask=nothing, temperature=1.0)
+
+Routes inputs through all experts and fuses outputs with gates.
+"""
+function (layer::GatedExperts)(inputs, params, state; logic_mask=nothing, temperature::Float32 = 1.0f0)
+    x = inputs isa Tuple ? inputs[1] : inputs
+
+    gates, router_state = layer.Router(x, params.Router, state.Router; temperature = temperature)
+    if logic_mask !== nothing
+        gates = apply_logic_floor(gates, logic_mask; floor = layer.logic_floor)
+    end
+    if layer.top_k > 0
+        gates, _ = topk_gates(gates; k = layer.top_k, temperature = 1.0f0, ste = layer.use_ste)
+    end
+
+    # Run all experts (dense, safe baseline)
+    outputs = Vector{Any}(undef, layer.num_experts)
+    new_states = Vector{Any}(undef, layer.num_experts)
+    for i in 1:layer.num_experts
+        out, st = layer.Experts[i](inputs, params.Experts[i], state.Experts[i])
+        outputs[i] = out
+        new_states[i] = st
+    end
+
+    # Stack expert outputs for fusion
+    first_out = outputs[1]
+    expert_outputs = if ndims(first_out) == 2
+        E = layer.num_experts
+        d, seq = size(first_out)
+        buf = zeros(Float32, E, d, seq)
+        for e in 1:E
+            buf[e, :, :] .= outputs[e]
+        end
+        buf
+    else
+        E = layer.num_experts
+        d, seq, batch = size(first_out)
+        buf = zeros(Float32, E, d, seq, batch)
+        for e in 1:E
+            buf[e, :, :, :] .= outputs[e]
+        end
+        buf
+    end
+
+    fused = fuse_experts_gated_sum(expert_outputs, gates)
+    new_state = (Router = router_state, Experts = new_states)
+    return fused, new_state
 end
 
 """

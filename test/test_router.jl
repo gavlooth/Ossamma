@@ -84,3 +84,18 @@ end
     cm = expert_confusion_matrix(preds, labels)
     @test size(cm) == (4, 4)
 end
+
+@testset "GatedExperts Wrapper" begin
+    d = 8
+    seq = 6
+    batch = 2
+    router = TokenRouter(d, 2; hidden_dim = 4)
+    experts = [Lux.Dense(d => d), Lux.Dense(d => d)]
+    layer = GatedExperts(router, experts; top_k = 1, use_ste = false)
+    rng = Random.default_rng()
+    ps, st = Lux.setup(rng, layer)
+
+    x = randn(Float32, d, seq, batch)
+    y, _ = layer(x, ps, st)
+    @test size(y) == size(x)
+end
