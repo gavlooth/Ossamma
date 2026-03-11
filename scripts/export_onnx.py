@@ -29,6 +29,14 @@ import torch.nn.functional as F
 import numpy as np
 
 # =============================================================================
+# Helpers
+# =============================================================================
+
+def clamped_position_indices(length: int, max_positions: int, device: torch.device) -> torch.Tensor:
+    """Return position indices with the tail clamped to the last embedding row."""
+    return torch.arange(length, device=device).clamp(max=max_positions - 1)
+
+# =============================================================================
 # Julia Checkpoint Loader
 # =============================================================================
 
@@ -300,7 +308,7 @@ class LinearAttentionLayer(nn.Module):
         k_feat = self.key_feature(k)
 
         # Position embeddings
-        pos_idx = torch.arange(T, device=x.device)
+        pos_idx = clamped_position_indices(T, self.seq_len, x.device)
         pos_cos = self.pos_embed_cos(pos_idx)  # (T, head_dim)
         pos_sin = self.pos_embed_sin(pos_idx)
 
@@ -361,19 +369,72 @@ class SWAttention(nn.Module):
         self.value_proj = nn.Linear(embedding_dim, embedding_dim)
         self.output_proj = nn.Linear(embedding_dim, embedding_dim)
 
-        # Pre-compute mask
-        self.register_buffer('window_mask', self._build_mask(seq_len))
-
-    def _build_mask(self, seq_len: int) -> torch.Tensor:
-        """Build sliding window mask"""
-        idx = torch.arange(seq_len)
-        distance = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))
-        return distance > self.window_size
-
     def _sigsoftmax(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         """SigSoftmax: softmax(x + logsigmoid(x))"""
         transformed = x + F.logsigmoid(x)
         return F.softmax(transformed, dim=dim)
+
+    def _valid_band_range(self, sequence_length: int, offset: int) -> Optional[Tuple[slice, slice]]:
+        """Return aligned query/key slices for a band offset."""
+        if offset >= 0:
+            length = sequence_length - offset
+            if length <= 0:
+                return None
+            return slice(0, length), slice(offset, sequence_length)
+
+        length = sequence_length + offset
+        if length <= 0:
+            return None
+        return slice(-offset, sequence_length), slice(0, length)
+
+    def _banded_attention_weights(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        """
+        Compute sliding-window attention weights without materializing (T, T).
+
+        Args:
+            q, k: (B, H, T, head_dim)
+        Returns:
+            weights: (B, H, T, 2 * window_size + 1)
+        """
+        B, H, T, _ = q.shape
+        band_size = 2 * self.window_size + 1
+        scale = math.sqrt(self.head_dim)
+        scores = q.new_full((B, H, T, band_size), torch.finfo(q.dtype).min)
+
+        for offset in range(-self.window_size, self.window_size + 1):
+            ranges = self._valid_band_range(T, offset)
+            if ranges is None:
+                continue
+
+            target_slice, source_slice = ranges
+            score_slice = (q[:, :, target_slice, :] * k[:, :, source_slice, :]).sum(dim=-1) / scale
+            scores[:, :, target_slice, offset + self.window_size] = score_slice
+
+        return self._sigsoftmax(scores, dim=-1)
+
+    def _apply_banded_attention(self, v: torch.Tensor, attn_weights: torch.Tensor) -> torch.Tensor:
+        """
+        Apply sliding-window attention weights without materializing (T, T).
+
+        Args:
+            v: (B, H, T, head_dim)
+            attn_weights: (B, H, T, 2 * window_size + 1)
+        Returns:
+            out: (B, H, T, head_dim)
+        """
+        _, _, T, _ = v.shape
+        out = torch.zeros_like(v)
+
+        for offset in range(-self.window_size, self.window_size + 1):
+            ranges = self._valid_band_range(T, offset)
+            if ranges is None:
+                continue
+
+            target_slice, source_slice = ranges
+            weights = attn_weights[:, :, target_slice, offset + self.window_size].unsqueeze(-1)
+            out[:, :, target_slice, :] += v[:, :, source_slice, :] * weights
+
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -403,19 +464,9 @@ class SWAttention(nn.Module):
         k = k.view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v.view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Compute attention scores: (B, H, T, T)
-        scale = math.sqrt(self.head_dim)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / scale
-
-        # Apply sliding window mask
-        mask = self.window_mask[:T, :T]
-        scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-
-        # SigSoftmax
-        attn_weights = self._sigsoftmax(scores, dim=-1)
-
-        # Apply to values
-        out = torch.matmul(attn_weights, v)  # (B, H, T, head_dim)
+        # Compute and apply true banded attention in O(T * window_size)
+        attn_weights = self._banded_attention_weights(q, k)
+        out = self._apply_banded_attention(v, attn_weights)
 
         # Reshape back: (B, T, D)
         out = out.permute(0, 2, 1, 3).reshape(B, T, D)
@@ -498,15 +549,38 @@ class TimeConditionedLayerNorm(nn.Module):
         return out.permute(2, 1, 0), alpha_bias.permute(1, 0)
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm over the channel dimension to match the Julia block."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(torch.mean(x.square(), dim=0, keepdim=True) + self.eps)
+        return (x / rms) * self.scale.view(-1, *([1] * (x.dim() - 1)))
+
+
 class SwammaNERBlock(nn.Module):
     """Single SwammaNER block with dual gating"""
 
     def __init__(self, embedding_dim: int, seq_len: int, num_heads: int, time_dim: int,
                  state_dim: Optional[int] = None, window_size: int = 256,
                  dropout_rate: float = 0.1, use_ffn: bool = True,
-                 ffn_expansion: float = 1.5):
+                 ffn_expansion: float = 1.5,
+                 use_glu_output_projection: bool = False,
+                 use_vector_gains: bool = False,
+                 use_per_head_alpha: bool = False,
+                 use_branch_projections: bool = False):
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.head_dim = embedding_dim // num_heads
+        self.use_vector_gains = use_vector_gains
+        self.use_per_head_alpha = use_per_head_alpha
+        self.use_branch_projections = use_branch_projections
+        self.use_glu_output_projection = use_glu_output_projection
         state_dim = state_dim or embedding_dim
 
         # Time-conditioned LayerNorm
@@ -516,7 +590,9 @@ class SwammaNERBlock(nn.Module):
         self.glu_proj = nn.Linear(embedding_dim, 2 * embedding_dim)
         self.linear_attn = LinearAttentionLayer(embedding_dim, seq_len, num_heads, time_dim)
         self.wave_gate = WavePDELayer(embedding_dim, state_dim, embedding_dim)
-        self.glu_out_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.glu_out_proj = nn.Linear(embedding_dim, embedding_dim) if use_glu_output_projection else None
+        self.linear_attn_norm = RMSNorm(embedding_dim)
+        self.wave_gate_norm = RMSNorm(embedding_dim)
 
         # Local branch
         self.sw_attn = SWAttention(seq_len, embedding_dim, num_heads, window_size)
@@ -525,7 +601,12 @@ class SwammaNERBlock(nn.Module):
         self.input_gate = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
         # Alpha mixing
-        self.alpha_proj = nn.Linear(embedding_dim, 1)
+        alpha_out_dim = num_heads if use_per_head_alpha else 1
+        self.alpha_proj = nn.Linear(embedding_dim, alpha_out_dim)
+        self.global_proj = nn.Linear(embedding_dim, embedding_dim) if use_branch_projections else None
+        self.local_proj = nn.Linear(embedding_dim, embedding_dim) if use_branch_projections else None
+        self.global_gain = nn.Parameter(torch.ones(embedding_dim)) if use_vector_gains else None
+        self.local_gain = nn.Parameter(torch.ones(embedding_dim)) if use_vector_gains else None
 
         # Dropout
         self.dropout = nn.Dropout(dropout_rate)
@@ -561,17 +642,21 @@ class SwammaNERBlock(nn.Module):
         # Linear attention on content
         path_a = path_a.permute(2, 1, 0)  # (D, T, B)
         attn_out = self.linear_attn(path_a, time_emb)
+        attn_out = self.linear_attn_norm(attn_out)
 
         # Oscillator on gate
         path_b = path_b.permute(2, 1, 0)
         osc_out = self.wave_gate(path_b)
+        osc_out = self.wave_gate_norm(osc_out)
 
         # GLU gating
-        gated = attn_out * torch.sigmoid(osc_out)
+        glu_output = attn_out * torch.sigmoid(osc_out)
 
-        # Output projection
-        gated_t = gated.permute(2, 1, 0)
-        glu_out = self.glu_out_proj(gated_t).permute(2, 1, 0)
+        # Optional output projection
+        if self.glu_out_proj is not None:
+            glu_out = self.glu_out_proj(glu_output.permute(2, 1, 0)).permute(2, 1, 0)
+        else:
+            glu_out = glu_output
 
         # 3. Local branch with input gating
         glu_out_for_gate = glu_out.permute(2, 1, 0)
@@ -580,18 +665,33 @@ class SwammaNERBlock(nn.Module):
 
         local_out = self.sw_attn(gated_x)
 
-        # 4. Adaptive mixing
-        # Mean pool normalized for alpha
-        input_pooled = normalized.mean(dim=1)  # (D, B)
-        input_pooled_t = input_pooled.permute(1, 0)  # (B, D)
-        alpha_logits = self.alpha_proj(input_pooled_t)  # (B, 1)
-        alpha = torch.sigmoid(alpha_logits + alpha_bias.permute(1, 0))  # (B, 1)
-        alpha = alpha.permute(1, 0).unsqueeze(1)  # (1, 1, B)
+        # 4. Adaptive mixing with token-wise alpha
+        global_branch_t = glu_out.permute(2, 1, 0)   # (B, T, D)
+        local_branch_t = local_out.permute(2, 1, 0)  # (B, T, D)
 
-        mixed = alpha * glu_out + (1.0 - alpha) * local_out
+        if self.global_proj is not None:
+            global_branch_t = self.global_proj(global_branch_t)
+        if self.local_proj is not None:
+            local_branch_t = self.local_proj(local_branch_t)
+
+        if self.global_gain is not None and self.local_gain is not None:
+            global_branch_t = global_branch_t * self.global_gain.view(1, 1, -1)
+            local_branch_t = local_branch_t * self.local_gain.view(1, 1, -1)
+
+        normalized_t = normalized.permute(2, 1, 0)  # (B, T, D)
+        alpha_bias_t = alpha_bias.permute(1, 0).unsqueeze(1)  # (B, 1, 1)
+        alpha_logits = self.alpha_proj(normalized_t)
+
+        if self.use_per_head_alpha:
+            alpha = torch.sigmoid(alpha_logits + alpha_bias_t).unsqueeze(-1)  # (B, T, H, 1)
+            global_heads = global_branch_t.view(B, T, self.num_heads, self.head_dim)
+            local_heads = local_branch_t.view(B, T, self.num_heads, self.head_dim)
+            mixed_t = (alpha * global_heads + (1.0 - alpha) * local_heads).reshape(B, T, D)
+        else:
+            alpha = torch.sigmoid(alpha_logits + alpha_bias_t)  # (B, T, 1)
+            mixed_t = alpha * global_branch_t + (1.0 - alpha) * local_branch_t
 
         # 5. Dropout
-        mixed_t = mixed.permute(2, 1, 0)  # (B, T, D)
         mixed_t = self.dropout(mixed_t)
 
         # 6. FFN
@@ -642,6 +742,10 @@ class SwammaNER(nn.Module):
         self.dropout_rate = config.get('dropout_rate', 0.1)
         self.use_ffn = config.get('use_ffn', True)
         self.ffn_expansion = config.get('ffn_expansion', 1.5)
+        self.use_glu_output_projection = config.get('use_glu_output_projection', False)
+        self.use_vector_gains = config.get('use_vector_gains', False)
+        self.use_per_head_alpha = config.get('use_per_head_alpha', False)
+        self.use_branch_projections = config.get('use_branch_projections', False)
 
         # Embeddings
         self.token_embedding = nn.Embedding(self.vocab_size, self.embedding_dim)
@@ -653,7 +757,9 @@ class SwammaNER(nn.Module):
             SwammaNERBlock(
                 self.embedding_dim, self.max_seq_len, self.num_heads, self.time_dim,
                 self.state_dim, self.window_size, self.dropout_rate,
-                self.use_ffn, self.ffn_expansion
+                self.use_ffn, self.ffn_expansion,
+                self.use_glu_output_projection, self.use_vector_gains,
+                self.use_per_head_alpha, self.use_branch_projections
             )
             for _ in range(self.num_layers)
         ])
@@ -693,7 +799,7 @@ class SwammaNER(nn.Module):
         token_emb = token_emb.permute(2, 0, 1)  # (D, T, B)
 
         # Position embedding
-        pos_idx = torch.arange(T, device=token_ids.device)
+        pos_idx = clamped_position_indices(T, self.max_seq_len, token_ids.device)
         pos_emb = self.position_embedding(pos_idx)  # (T, D)
         pos_emb = pos_emb.permute(1, 0).unsqueeze(-1)  # (D, T, 1)
 
@@ -745,8 +851,10 @@ def load_weights_from_julia(model: SwammaNER, params: dict) -> None:
                 return params[alt_key]
         return None
 
-    def set_linear(module: nn.Linear, prefix: str):
+    def set_linear(module: Optional[nn.Linear], prefix: str):
         """Load weights for a Linear layer"""
+        if module is None:
+            return
         weight = get_param(f"{prefix}.weight")
         bias = get_param(f"{prefix}.bias")
         if weight is not None:
@@ -770,6 +878,12 @@ def load_weights_from_julia(model: SwammaNER, params: dict) -> None:
         if bias is not None:
             module.bias.data.copy_(torch.from_numpy(bias))
 
+    def set_rms_norm(module: RMSNorm, prefix: str):
+        """Load weights for an RMSNorm layer."""
+        scale = get_param(f"{prefix}.scale")
+        if scale is not None:
+            module.scale.data.copy_(torch.from_numpy(scale))
+
     # Load embeddings
     set_embedding(model.token_embedding, "TokenEmbedding")
     set_embedding(model.position_embedding, "PositionEmbedding")
@@ -792,6 +906,8 @@ def load_weights_from_julia(model: SwammaNER, params: dict) -> None:
         # GLU projection
         set_linear(block.glu_proj, f"{prefix}.GluProjection")
         set_linear(block.glu_out_proj, f"{prefix}.GluOutputProjection")
+        set_rms_norm(block.linear_attn_norm, f"{prefix}.LinearAttnNorm")
+        set_rms_norm(block.wave_gate_norm, f"{prefix}.WaveGateNorm")
 
         # Linear attention (complex nested structure)
         la_prefix = f"{prefix}.LinearAttention"
@@ -810,9 +926,9 @@ def load_weights_from_julia(model: SwammaNER, params: dict) -> None:
         log_damping = get_param(f"{osc_prefix}.log_damping")
 
         if log_wave_speed is not None:
-            block.oscillator.log_wave_speed.data.copy_(torch.from_numpy(log_wave_speed))
+            block.wave_gate.log_wave_speed.data.copy_(torch.from_numpy(log_wave_speed))
         if log_damping is not None:
-            block.oscillator.log_damping.data.copy_(torch.from_numpy(log_damping))
+            block.wave_gate.log_damping.data.copy_(torch.from_numpy(log_damping))
 
         # Sliding window attention
         sw_prefix = f"{prefix}.SlidingWindowAttention"
@@ -826,6 +942,15 @@ def load_weights_from_julia(model: SwammaNER, params: dict) -> None:
 
         # Alpha projection
         set_linear(block.alpha_proj, f"{prefix}.AlphaProjection")
+        set_linear(block.global_proj, f"{prefix}.GlobalProjection")
+        set_linear(block.local_proj, f"{prefix}.LocalProjection")
+
+        global_gain = get_param(f"{prefix}.GlobalGain")
+        local_gain = get_param(f"{prefix}.LocalGain")
+        if global_gain is not None and block.global_gain is not None:
+            block.global_gain.data.copy_(torch.from_numpy(global_gain))
+        if local_gain is not None and block.local_gain is not None:
+            block.local_gain.data.copy_(torch.from_numpy(local_gain))
 
         # FFN
         if block.use_ffn:
