@@ -1,9 +1,9 @@
 module Classification
 
 """
-Classification model using Ossamma architecture.
+Classification model using Swamma architecture.
 
-Adapts OssammaBlock for sequence classification tasks by:
+Adapts SwammaBlock for sequence classification tasks by:
 1. Using a fixed time embedding (no diffusion conditioning)
 2. Pooling sequence representations to a single vector
 3. Projecting to class logits
@@ -20,8 +20,8 @@ using Random
 using NNlib
 using Statistics: mean
 
-# Import parent module components (assumes we're included from Ossamma module)
-import ..OssammaBlock
+# Import parent module components (assumes we're included from Swamma module)
+import ..SwammaBlock
 import ..TimeConditionedLayerNorm
 
 const LuxLayer = Lux.AbstractLuxLayer
@@ -49,7 +49,7 @@ Base.@kwdef struct ClassifierConfig
     # Attention
     window_size::Int = 5
 
-    # Oscillator SSM
+    # Wave Gate (WavePDE)
     min_frequency::Float32 = 0.1f0
     max_frequency::Float32 = 10.0f0
     default_time_step::Float32 = 0.1f0
@@ -128,10 +128,10 @@ function (layer::FixedTimeEmbedding)(batch_size::Int, params, state)
 end
 
 # ============================================================================
-# Ossamma Classifier
+# Swamma Classifier
 # ============================================================================
 
-struct OssammaClassifier{E, P, T, B, PO, D, C} <: LuxLayer
+struct SwammaClassifier{E, P, T, B, PO, D, C} <: LuxLayer
     vocab_size::Int
     max_sequence_length::Int
     embedding_dimension::Int
@@ -157,14 +157,14 @@ struct OssammaClassifier{E, P, T, B, PO, D, C} <: LuxLayer
 end
 
 """
-    OssammaClassifier(config::ClassifierConfig)
+    SwammaClassifier(config::ClassifierConfig)
 
 Create a classifier from configuration.
 """
-function OssammaClassifier(config::ClassifierConfig)
+function SwammaClassifier(config::ClassifierConfig)
     state_dimension = config.state_dimension == -1 ? config.embedding_dimension : config.state_dimension
 
-    return OssammaClassifier(;
+    return SwammaClassifier(;
         vocab_size = config.vocab_size,
         max_sequence_length = config.max_sequence_length,
         embedding_dimension = config.embedding_dimension,
@@ -183,7 +183,7 @@ function OssammaClassifier(config::ClassifierConfig)
     )
 end
 
-function OssammaClassifier(;
+function SwammaClassifier(;
     vocab_size::Int,
     max_sequence_length::Int,
     embedding_dimension::Int,
@@ -203,9 +203,9 @@ function OssammaClassifier(;
     # Add CLS token to vocab if needed
     actual_vocab_size = use_cls_token ? vocab_size + 1 : vocab_size
 
-    # Build stack of OssammaBlocks
+    # Build stack of SwammaBlocks
     blocks = Tuple([
-        OssammaBlock(
+        SwammaBlock(
             embedding_dimension,
             max_sequence_length,
             number_of_heads,
@@ -219,7 +219,7 @@ function OssammaClassifier(;
         for _ in 1:number_of_layers
     ])
 
-    return OssammaClassifier(
+    return SwammaClassifier(
         actual_vocab_size,
         max_sequence_length,
         embedding_dimension,
@@ -247,7 +247,7 @@ function OssammaClassifier(;
     )
 end
 
-function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaClassifier)
+function Lux.initialparameters(rng::Random.AbstractRNG, model::SwammaClassifier)
     block_params = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         Tuple(Lux.initialparameters(rng, block) for block in model.Blocks)
     )
@@ -263,7 +263,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaClassifier
     )
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaClassifier)
+function Lux.initialstates(rng::Random.AbstractRNG, model::SwammaClassifier)
     block_states = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         Tuple(Lux.initialstates(rng, block) for block in model.Blocks)
     )
@@ -285,7 +285,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaClassifier)
     )
 end
 
-function (model::OssammaClassifier)(token_ids::AbstractArray, params, state)
+function (model::SwammaClassifier)(token_ids::AbstractArray, params, state)
     # token_ids: (seq_len,) or (seq_len, batch)
 
     is_batched = ndims(token_ids) == 2
@@ -332,7 +332,7 @@ function (model::OssammaClassifier)(token_ids::AbstractArray, params, state)
     time_emb, time_state = model.TimeEmbedding(batch_size, params.TimeEmbedding, state.TimeEmbedding)
 
     # =========================================================================
-    # 5. Process through OssammaBlocks
+    # 5. Process through SwammaBlocks
     # =========================================================================
     (hidden, block_states) = foldl(
         enumerate(model.Blocks);
@@ -412,7 +412,7 @@ function tiny_classifier(;
         time_dimension = 32,
         kwargs...
     )
-    return OssammaClassifier(config)
+    return SwammaClassifier(config)
 end
 
 """
@@ -436,7 +436,7 @@ function small_classifier(;
         time_dimension = 64,
         kwargs...
     )
-    return OssammaClassifier(config)
+    return SwammaClassifier(config)
 end
 
 """
@@ -460,7 +460,7 @@ function base_classifier(;
         time_dimension = 128,
         kwargs...
     )
-    return OssammaClassifier(config)
+    return SwammaClassifier(config)
 end
 
 
@@ -478,7 +478,7 @@ Load encoder weights from a LLaDA checkpoint into a classifier.
 Maps the following weights from LLaDA to classifier:
 - `TokenEmbedding` (handles vocab size mismatch by copying available tokens)
 - `PositionEmbedding` (handles sequence length mismatch)
-- `Blocks.Block_N.*` (copies matching components from OssammaBlock)
+- `Blocks.Block_N.*` (copies matching components from SwammaBlock)
 
 Does NOT load:
 - `TimeEmbedding` (LLaDA uses TimeMLPEmbedding, classifier uses FixedTimeEmbedding)
@@ -487,7 +487,7 @@ Does NOT load:
 - `Classifier` head (must be trained fresh for the classification task)
 
 # Arguments
-- `classifier`: An OssammaClassifier instance
+- `classifier`: An SwammaClassifier instance
 - `checkpoint_path`: Path to a LLaDA checkpoint (.jls file)
 - `rng`: Random number generator for initializing new parameters
 
@@ -501,7 +501,7 @@ params, state = load_pretrained_encoder(classifier, "checkpoints/llada_best.jls"
 ```
 """
 function load_pretrained_encoder(
-    classifier::OssammaClassifier,
+    classifier::SwammaClassifier,
     checkpoint_path::String;
     rng::Random.AbstractRNG = Random.default_rng(),
 )
@@ -630,7 +630,7 @@ end
 # Exports
 # ============================================================================
 
-export OssammaClassifier, ClassifierConfig
+export SwammaClassifier, ClassifierConfig
 export SequencePooling, FixedTimeEmbedding
 export tiny_classifier, small_classifier, base_classifier
 export load_pretrained_encoder

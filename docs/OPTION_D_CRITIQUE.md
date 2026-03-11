@@ -5,7 +5,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                                                                              │
-│                              OssammaNERBlock                                 │
+│                              SwammaNERBlock                                 │
 │                                                                              │
 │  INPUT                                                                       │
 │    │                                                                         │
@@ -22,7 +22,7 @@
 │  │ LinearAttn  │               │  ┌────────────────────────────────────┐  │  │
 │  │     ⊙       │               │  │  OPTION D: SwiGLU Gate             │  │  │
 │  │ sigmoid(    │               │  │                                    │  │  │
-│  │   DLinOSS)  │               │  │  glu_out → Dense(d→4d/3) → split   │  │  │
+│  │   WavePDE)  │               │  │  glu_out → Dense(d→4d/3) → split   │  │  │
 │  │     │       │               │  │              → SiLU(a) ⊙ b         │  │  │
 │  │     ▼       │               │  │              → Dense(2d/3→d)       │  │  │
 │  │  glu_out ───┼───────────────┼──│              → sigmoid             │  │  │
@@ -221,7 +221,7 @@ the gate already decided.
 ```
 The gate is computed from glu_out, which contains:
   - LinearAttention (global view)
-  - DLinOSS (temporal dynamics)
+  - WavePDE (temporal dynamics)
 
 So the gate is "informed" by global context before filtering local input.
 It's not a blind filter - it's a context-aware filter.
@@ -402,9 +402,9 @@ Also make output gate ablation the default (remove redundant gate).
 │     - New struct: SwiGLU                                                   │
 │     - Parameters: expansion_factor (default 4/3)                           │
 │     - Structure: Dense(d→2h) → split → SiLU(a)⊙b → Dense(h→d)             │
-│     - Location: src/Ossamma.jl or new src/SwiGLU.jl                        │
+│     - Location: src/Swamma.jl or new src/SwiGLU.jl                        │
 │                                                                            │
-│  2. Add SwiGLU to OssammaNERBlock                                          │
+│  2. Add SwiGLU to SwammaNERBlock                                          │
 │     ─────────────────────────────                                          │
 │     - New field: FFN::SwiGLU                                               │
 │     - New config: use_ffn::Bool = true                                     │
@@ -438,7 +438,7 @@ Also make output gate ablation the default (remove redundant gate).
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                                                                              │
-│                    OssammaNERBlock (Option E, Final)                         │
+│                    SwammaNERBlock (Option E, Final)                         │
 │                                                                              │
 │  INPUT: x                                                                    │
 │    │                                                                         │
@@ -458,7 +458,7 @@ Also make output gate ablation the default (remove redundant gate).
 │  │  path_a  path_b        │    │           │                            │   │
 │  │    │      │            │    │           ▼                            │   │
 │  │    ▼      ▼            │    │     SWAttention(gated_x)               │   │
-│  │ LinAttn  DLinOSS       │    │           │                            │   │
+│  │ LinAttn  WavePDE       │    │           │                            │   │
 │  │    │      │            │    │           ▼                            │   │
 │  │    │      ▼            │    │      local_out                         │   │
 │  │    │   sigmoid         │    │           │                            │   │
@@ -577,10 +577,10 @@ end
 
 
 # =============================================================================
-# Updated OssammaNERBlock
+# Updated SwammaNERBlock
 # =============================================================================
 
-struct OssammaNERBlock <: LuxLayer
+struct SwammaNERBlock <: LuxLayer
     # ... existing fields ...
 
     use_output_gate::Bool           # Default: false (ablated)
@@ -596,7 +596,7 @@ end
 # Updated Forward Pass
 # =============================================================================
 
-function (block::OssammaNERBlock)(inputs::Tuple, params, state)
+function (block::SwammaNERBlock)(inputs::Tuple, params, state)
     # ... existing code through α-mixing ...
 
     # Alpha mixing
@@ -673,15 +673,15 @@ For dim=384, 6 blocks:
 │ Step│ Task                                                                   │
 ├─────┼────────────────────────────────────────────────────────────────────────┤
 │  1  │ Change use_output_gate default to false in:                            │
-│     │   - OssammaNERBlock constructor                                        │
+│     │   - SwammaNERBlock constructor                                        │
 │     │   - NERConfig struct                                                   │
 │     │   - Production config files                                            │
 ├─────┼────────────────────────────────────────────────────────────────────────┤
 │  2  │ Create SwiGLU struct and forward pass                                  │
-│     │   - In src/Ossamma.jl or new file                                      │
+│     │   - In src/Swamma.jl or new file                                      │
 │     │   - Include initialparameters and initialstates                        │
 ├─────┼────────────────────────────────────────────────────────────────────────┤
-│  3  │ Add SwiGLU to OssammaNERBlock                                          │
+│  3  │ Add SwiGLU to SwammaNERBlock                                          │
 │     │   - Add FFN field                                                      │
 │     │   - Add use_ffn and ffn_expansion config                               │
 │     │   - Update constructor                                                 │

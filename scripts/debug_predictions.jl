@@ -4,9 +4,9 @@ Debug NER model predictions
 """
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma: OssammaNER, NERConfig
-using Ossamma.NER: ID_TO_LABEL, LABEL_TO_ID
+using Swamma
+using Swamma: SwammaNER, NERConfig
+using Swamma.NER: ID_TO_LABEL, LABEL_TO_ID
 using Lux
 using Serialization
 using JSON3
@@ -80,7 +80,7 @@ function main()
         ffn_expansion = 1.334375f0,
     )
 
-    model = OssammaNER(cfg)
+    model = SwammaNER(cfg)
 
     # Test tokenization and prediction
     text = "John Smith works at Google."

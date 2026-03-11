@@ -10,12 +10,12 @@ using Dates
 using JSON3
 using Serialization
 
-# Load Ossamma modules
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
-using .Ossamma: OssammaNER, NERConfig, tiny_ner
-using .Ossamma: ner_cross_entropy
-using .Ossamma: LABEL_TO_ID, NUM_LABELS
+# Load Swamma modules
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
+using .Swamma: SwammaNER, NERConfig, tiny_ner
+using .Swamma: ner_cross_entropy
+using .Swamma: LABEL_TO_ID, NUM_LABELS
 
 using Lux
 using Optimisers

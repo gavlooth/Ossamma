@@ -14,8 +14,8 @@ using Random
 using Statistics
 using Printf
 
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
 
 using Lux
 using Optimisers
@@ -59,7 +59,7 @@ end
 
 function main()
     println("=" ^ 60)
-    println("OssammaNER Learning Test (Patterned Data)")
+    println("SwammaNER Learning Test (Patterned Data)")
     println("=" ^ 60)
     println()
     println("This test uses PATTERNED data (not random) to verify")
@@ -81,7 +81,7 @@ function main()
 
     # Create model
     println("\n[1/3] Creating model...")
-    model = OssammaNER(config)
+    model = SwammaNER(config)
 
     rng = Random.default_rng()
     Random.seed!(rng, 42)

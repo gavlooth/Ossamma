@@ -1,5 +1,5 @@
 """
-SimpleNER - A minimal NER model using only attention (no OSSM) for fast training.
+SimpleNER - A minimal NER model using only attention (no Wave-PDE gate) for fast training.
 """
 module SimpleNER
 

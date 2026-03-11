@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Fast training script using SimpleNER (no OSSM layer).
+Fast training script using SimpleNER (no Wave-PDE gate layer).
 """
 
 using Random

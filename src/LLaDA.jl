@@ -1,7 +1,7 @@
 module LLaDA
 
 """
-LLaDA-style Text Diffusion Model using Ossamma architecture.
+LLaDA-style Text Diffusion Model using Swamma architecture.
 
 Forward (masking):   "The cat sat on mat" → "The [M] sat [M] mat" → "[M] [M] [M] [M] [M]"
 Reverse (denoising): "[M] [M] [M] [M] [M]" → "The [M] sat [M] mat" → "The cat sat on mat"
@@ -15,7 +15,7 @@ using NNlib
 using TOML
 
 # Import parent module components
-using ..Ossamma: OssammaBlock, LuxLayer
+using ..Swamma: SwammaBlock, LuxLayer
 
 # Helper to detect and transfer to GPU arrays without requiring CUDA at compile time
 function to_device_like(target, x::AbstractArray)
@@ -62,7 +62,7 @@ Base.@kwdef struct LLaDAConfig
     # Attention
     window_size::Int = 5
 
-    # Oscillator SSM
+    # Wave Gate (WavePDE)
     min_frequency::Float32 = 0.1f0
     max_frequency::Float32 = 10.0f0
     default_time_step::Float32 = 0.1f0
@@ -181,7 +181,7 @@ function save_config(config::LLaDAConfig, io::IO)
     println(io, "window_size = ", config.window_size)
     println(io)
 
-    println(io, "[model.oscillator]")
+    println(io, "[model.wave_gate]")
     println(io, "min_frequency = ", config.min_frequency)
     println(io, "max_frequency = ", config.max_frequency)
     println(io, "default_time_step = ", config.default_time_step)
@@ -450,9 +450,9 @@ function LLaDAModel(;
     # Token embedding includes mask token
     actual_vocab_size = mask_token_id < vocab_size ? vocab_size : vocab_size + 1
 
-    # Build stack of OssammaBlocks
+    # Build stack of SwammaBlocks
     blocks = Tuple([
-        OssammaBlock(
+        SwammaBlock(
             embedding_dimension,
             max_sequence_length,
             number_of_heads,
@@ -567,7 +567,7 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # time_emb: (time_dim, batch)
 
     # =========================================================================
-    # 5. Process through OssammaBlocks (Zygote-compatible using foldl)
+    # 5. Process through SwammaBlocks (Zygote-compatible using foldl)
     # =========================================================================
     # Use foldl to avoid mutation (push!) which Zygote doesn't support
     (hidden, block_states) = foldl(

@@ -2,8 +2,8 @@
 # Periodic HuggingFace checkpoint uploader
 # Uploads checkpoint_latest.jls every hour until training finishes (step 50000)
 
-CHECKPOINT_DIR="/root/Ossamma/checkpoints/ner_110m"
-LOG_FILE="/root/Ossamma/hf_upload.log"
+CHECKPOINT_DIR="/root/Swamma/checkpoints/ner_110m"
+LOG_FILE="/root/Swamma/hf_upload.log"
 
 echo "$(date): Starting periodic HF upload (every 1 hour)" >> "$LOG_FILE"
 
@@ -28,7 +28,7 @@ token = os.environ.get('HUGGING_FACE_BIOTZ_TOKEN')
 repo_id = 'Biotz/ossamma-ner-checkpoints'
 api = HfApi()
 
-checkpoint_dir = "/root/Ossamma/checkpoints/ner_110m"
+checkpoint_dir = "/root/Swamma/checkpoints/ner_110m"
 
 try:
     api.upload_file(
@@ -56,7 +56,7 @@ token = os.environ.get('HUGGING_FACE_BIOTZ_TOKEN')
 repo_id = 'Biotz/ossamma-ner-checkpoints'
 api = HfApi()
 
-checkpoint_dir = "/root/Ossamma/checkpoints/ner_110m"
+checkpoint_dir = "/root/Swamma/checkpoints/ner_110m"
 
 try:
     api.upload_file(

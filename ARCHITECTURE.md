@@ -2,17 +2,18 @@
 
 ## Overview
 
-Samba2 implements two novel neural network architectures using the Lux.jl framework:
-1. **SWAttention**: Multi-head attention with normalized sigmoid activation
-2. **OSSM**: Oscillatory State Space Model with learnable damped oscillators
+The active architecture in this repo is built around a composite `SwammaBlock`:
+1. **SWAttention**: multi-head sliding-window attention for sharp local structure
+2. **WavePDE**: projection-free spectral wave dynamics used as a gate path
+3. **LinearAttention**: efficient global content path
 
-Both are designed as standalone Lux layers that can be composed into larger networks.
+The old `OSSM` path is no longer the active block design.
 
 ---
 
 ## LLaDA Model (Text Diffusion LLM)
 
-The main model to be trained is **LLaDAModel** - a discrete text diffusion language model using Ossamma architecture.
+The main model to be trained is **LLaDAModel** - a discrete text diffusion language model using Swamma architecture.
 
 ```
                           ┌──────────────────────────────────────────────────────────────┐
@@ -37,7 +38,7 @@ The main model to be trained is **LLaDAModel** - a discrete text diffusion langu
                                        │
                           ╔════════════▼════════════╗
                           ║                         ║
-                          ║  OssammaBlock × N       ║  (N = number_of_layers)
+                          ║  SwammaBlock × N       ║  (N = number_of_layers)
                           ║                         ║
                           ╚════════════╤════════════╝
                                        │
@@ -55,12 +56,12 @@ The main model to be trained is **LLaDAModel** - a discrete text diffusion langu
                           └─────────────────────────┘
 ```
 
-### OssammaBlock Detail
+### SwammaBlock Detail
 
-```
+``` 
 ╔═════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                      OssammaBlock                                            ║
-║       Oscillatory State Space Attention Masked Mixer Architecture                            ║
+║                                      SwammaBlock                                            ║
+║       Spectral Wave-Attention Masked Mixer Architecture                                     ║
 ╠═════════════════════════════════════════════════════════════════════════════════════════════╣
 ║                                                                                             ║
 ║   Input ──────────────────────────────────────────────────────────────────── Residual       ║
@@ -68,84 +69,54 @@ The main model to be trained is **LLaDAModel** - a discrete text diffusion langu
 ║      ▼                                                                           │          ║
 ║   ┌───────────────────────────────┐                                              │          ║
 ║   │  Time-Conditioned LayerNorm   │◄── time_emb                                  │          ║
-║   │   (scale, shift, α_bias)      │                                              │          ║
+║   │ returns x_norm and α_bias(t)  │                                              │          ║
 ║   └───────────────┬───────────────┘                                              │          ║
 ║                   │ x_norm                                                       │          ║
 ║      ┌────────────┴────────────┐                                                 │          ║
 ║      │                         │                                                 │          ║
-║      ▼                         │                                                 │          ║
-║ ┌────────────────────────────────────────────────┐                               │          ║
-║ │         Global-Spectral GLU Branch             │                               │          ║
-║ │                                                │                               │          ║
-║ │   Dense(d→2d)                                  │                               │          ║
-║ │       │                                        │                               │          ║
-║ │       ├─────────────┬────────────┐             │                               │          ║
-║ │   content_half   gate_half       │             │                               │          ║
-║ │       │              │           │             │                               │          ║
-║ │       ▼              ▼           │             │                               │          ║
-║ │  ┌──────────┐  ┌──────────┐      │             │                               │          ║
-║ │  │ Linear   │  │ DLinOSS  │      │             │                               │          ║
-║ │  │ Attention│  │(Oscillator│     │             │                               │          ║
-║ │  │          │  │   SSM)    │     │             │                               │          ║
-║ │  └────┬─────┘  └────┬─────┘      │             │                               │          ║
-║ │       │             │            │             │                               │          ║
-║ │   RMSNorm       RMSNorm          │  ◄── NEW: Stabilize before GLU gating       │          ║
-║ │       │             │            │             │                               │          ║
-║ │       │         sigmoid          │             │                               │          ║
-║ │       │             │            │             │                               │          ║
-║ │       └──────⊙──────┘  (gate)    │             │                               │          ║
-║ │              │                   │             │                               │          ║
-║ └──────────────┼───────────────────┘             │                               │          ║
-║                │ glu_output                      │                               │          ║
-║                │                                 │                               │          ║
-║                ├─────────────────────────────────┤                               │          ║
-║                │                                 │                               │          ║
-║                │                                 ▼                               │          ║
-║                │                    ┌─────────────────────────┐                  │          ║
-║                │                    │       InputGate         │                  │          ║
-║                │                    │  σ(Dense(glu_output))   │                  │          ║
-║                │                    └───────────┬─────────────┘                  │          ║
-║                │                                │                                │          ║
-║                │                                ▼                                │          ║
-║                │                    ┌─────────────────────────┐                  │          ║
-║                │                    │   Local-Sharp Branch    │                  │          ║
-║                │                    │                         │                  │          ║
-║                │                    │   x_norm ⊙ input_gate   │                  │          ║
-║                │                    │          ↓              │                  │          ║
-║                │                    │     SWAttention         │                  │          ║
-║                │                    │   (Sliding Window)      │                  │          ║
-║                │                    └───────────┬─────────────┘                  │          ║
-║                │                                │                                │          ║
-║                └────────────┬───────────────────┘                                │          ║
-║                             │                                                    │          ║
-║                             ▼                                                    │          ║
-║                  ┌────────────────────────┐                                      │          ║
-║                  │  Token-wise Mixing     │                                      │          ║
-║                  │  α_t·GLU + (1-α_t)·Loc │◄── α_t = σ(Wα·h_t + α_bias(t))       │          ║
-║                  │  (per-token mixing)    │    (NEW: position-dependent α)       │          ║
-║                  └───────────┬────────────┘                                      │          ║
-║                              │                                                   │          ║
-║                              ▼                                                   │          ║
-║                  ┌────────────────────────┐                                      │          ║
-║                  │        Dropout         │                                      │          ║
-║                  └───────────┬────────────┘                                      │          ║
-║                              │                                                   │          ║
-║                              ▼                                                   │          ║
-║                  ┌────────────────────────┐                                      │          ║
-║                  │      SwiGLU FFN        │                                      │          ║
-║                  │  Dense(d→3d/2) → split │                                      │          ║
-║                  │  swish(a)⊙b → Dense    │                                      │          ║
-║                  └───────────┬────────────┘                                      │          ║
-║                              │                                                   │          ║
-║                              └───────────────────────────────┬───────────────────┘          ║
-║                                                              │ + (residual)                 ║
-║                                                              ▼                              ║
-║                                                   ┌────────────────────────┐                ║
-║                                                   │       LayerNorm        │                ║
-║                                                   └───────────┬────────────┘                ║
-║                                                               │                             ║
-║                                                               ▼                             ║
-║                                                            Output                           ║
+║      ▼                         ▼                                                 │          ║
+║ ┌──────────────────────────────────────────┐      ┌────────────────────────────┐ │          ║
+║ │       Global GLU-Gated Branch            │      │        Local Branch        │ │          ║
+║ │                                          │      │                            │ │          ║
+║ │ Dense(d→2d)                              │      │ normalized                 │ │          ║
+║ │   ├─ content_half ──► LinearAttention    │      │   ⊙ local_gate            │ │          ║
+║ │   │                    ↓                 │      │          ↓                │ │          ║
+║ │   │                 RMSNorm              │      │      SWAttention          │ │          ║
+║ │   └─ gate_half ─────► WavePDE            │      │                            │ │          ║
+║ │                        ↓                 │      └──────────────┬─────────────┘ │          ║
+║ │                     RMSNorm                              ▲      │               │          ║
+║ │                        ↓                                 │      │               │          ║
+║ │                     sigmoid                              │      │               │          ║
+║ │                        ↓                                 │      │               │          ║
+║ │          global = content_norm ⊙ gate_norm               │      │               │          ║
+║ └──────────────────────────┬───────────────────────────────┘      │               │          ║
+║                            │                                      │               │          ║
+║                            │  global -> local control             │               │          ║
+║                            ▼                                      │               │          ║
+║                 ┌────────────────────────┐                        │               │          ║
+║                 │ InputGate(glu_out)     │ = local_gate          │               │          ║
+║                 └─────────────┬──────────┘                        │               │          ║
+║                               └──────────────────┬────────────────┘               │          ║
+║                                                  ▼                                           ║
+║                                   ┌────────────────────────────┐                             ║
+║                                   │   Adaptive Token Mixing    │                             ║
+║                                   │ α·global + (1-α)·local     │                             ║
+║                                   │ α = σ(Wα·x_norm + α_bias)  │                             ║
+║                                   └─────────────┬──────────────┘                             ║
+║                                                 ▼                                            ║
+║                                   ┌────────────────────────────┐                             ║
+║                                   │    Dropout → SwiGLU FFN    │                             ║
+║                                   └─────────────┬──────────────┘                             ║
+║                                                 │                                            ║
+║                                                 └─────────────────┬──────────────────────────╣
+║                                                                   │ + (residual)            ║
+║                                                                   ▼                         ║
+║                                                        ┌────────────────────────┐           ║
+║                                                        │       LayerNorm        │           ║
+║                                                        └───────────┬────────────┘           ║
+║                                                                    │                        ║
+║                                                                    ▼                        ║
+║                                                                 Output                      ║
 ╚═════════════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
@@ -153,11 +124,31 @@ The main model to be trained is **LLaDAModel** - a discrete text diffusion langu
 
 | Component | Description |
 |-----------|-------------|
-| **DLinOSS** | Damped oscillators with ρ·R(θ) rotation, selective Δt |
+| **WavePDE** | Projection-free spectral wave gate with internal PDE integration |
 | **LinearAttention** | O(L) complexity, ELU+1 feature map |
 | **RMSNorm** | Root Mean Square normalization before GLU gating (stabilizes training) |
 | **Token-wise α** | Per-token mixing: α_t = σ(Wα·h_t + bias), not sequence-global |
 | **SWAttention** | Local window softmax attention with causal masking |
+
+### Current Architectural Thesis
+
+The current block is designed around complementary roles, not interchangeable
+mechanisms:
+
+- `LinearAttention` is the scalable global content carrier.
+- `WavePDE` gates that global path with a structured smooth dynamical prior, so
+  the encoder does not reduce to a conventional attention-only stack.
+- `InputGate(glu_out)` is the explicit global-to-local control channel. The
+  global branch enriches and filters what the local branch should examine.
+- `SWAttention` is the local refinement operator. It handles sharp neighborhood
+  corrections after the global branch has already contextualized the token stream.
+- `α`-mixing is the arbitration step between global structure and local correction.
+
+The intended processing order is:
+
+```text
+global interpretation -> local conditioning -> local refinement -> adaptive merge
+```
 
 ### Training Mode (Text Diffusion)
 
@@ -187,10 +178,10 @@ The model follows the **LLaDA** paradigm - a discrete text diffusion model:
 
 ### Core Innovation
 
-The **OssammaBlock** combines:
-- **Global-Spectral**: Linear attention gated by oscillatory SSM (captures long-range patterns)
-- **Local-Sharp**: Sliding window softmax attention (captures local precision)
-- **Adaptive mixing**: Learns when to use global vs local based on content and diffusion timestep `t`
+The **SwammaBlock** combines:
+- **Global structured path**: `LinearAttention(content)` gated by `sigmoid(WavePDE(gate))`
+- **Local sharp path**: sliding-window attention over a GLU-conditioned local input
+- **Adaptive mixing**: learns when to use global vs local based on content and diffusion timestep `t`
 
 ---
 
@@ -1040,11 +1031,11 @@ end
 
 ---
 
-## OssammaMLM: Triple Hybrid Architecture with Mask-Predict
+## SwammaMLM: Triple Hybrid Architecture with Mask-Predict
 
 ### Overview
 
-OssammaMLM combines three complementary mechanisms with discrete diffusion (mask-predict) training for an efficient LLM alternative.
+SwammaMLM combines three complementary mechanisms with discrete diffusion (mask-predict) training for an efficient LLM alternative.
 
 **Design Goals:**
 - Linear complexity O(n) for large context windows
@@ -1084,7 +1075,7 @@ OssammaMLM combines three complementary mechanisms with discrete diffusion (mask
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
-│  2. DLinOSS (Damped Linear Oscillatory SSM) - O(n)             │
+│  2. WavePDE (Damped Linear Oscillatory SSM) - O(n)             │
 │                                                                 │
 │     "What's the narrative state? What patterns over time?"     │
 │                                                                 │
@@ -1126,7 +1117,7 @@ FNet is elegant for signal processing where frequency matters. But language unde
                      ┌─────────────────────────────────────┐
                      │  Similarity Principle               │
                      │                                     │
-                     │  Cosformer ←──→ DLinOSS            │
+                     │  Cosformer ←──→ WavePDE            │
                      │  (both O(n), both recurrent-form)   │
                      │  → GLU-style gating                 │
                      │                                     │
@@ -1157,18 +1148,18 @@ Input: x (Features, SeqLen, Batch)
 │                                                                  │
 │    x_cos  ──→ Cosformer ────→ y_cos      (O(n), global)         │
 │                                                                  │
-│    x_dlin ──→ DLinOSS ──────→ y_dlin     (O(n), stateful)       │
+│    x_dlin ──→ WavePDE ──────→ y_dlin     (O(n), stateful)       │
 │                                                                  │
 │    x_attn ──→ SWAttention ──→ y_attn     (O(n·w), local)        │
 └──────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ 3. GLU GATE (Cosformer + DLinOSS - similar mechanisms)          │
+│ 3. GLU GATE (Cosformer + WavePDE - similar mechanisms)          │
 │                                                                  │
 │    y_linear = y_cos ⊙ σ(y_dlin)                                 │
 │                                                                  │
-│    Intuition: DLinOSS temporal state gates what global          │
+│    Intuition: WavePDE temporal state gates what global          │
 │               information from Cosformer passes through         │
 └──────────────────────────────────────────────────────────────────┘
                               │
@@ -1201,7 +1192,7 @@ Output: (logits, confidence), new_state
 
 | Gate Type | Components | Reasoning |
 |-----------|------------|-----------|
-| **GLU** | Cosformer + DLinOSS | Both O(n), both have recurrent interpretations. One naturally modulates the other. |
+| **GLU** | Cosformer + WavePDE | Both O(n), both have recurrent interpretations. One naturally modulates the other. |
 | **Mixture** | GLU_output + SWAttention | Fundamentally different operations. Model should learn when each is useful. |
 
 **GLU is wrong when:**
@@ -1274,14 +1265,14 @@ Output: (logits, confidence), new_state
 | Component | Role in Mask-Predict |
 |-----------|---------------------|
 | **Cosformer** | Aggregate global context from revealed tokens efficiently |
-| **DLinOSS** | Track "state of knowledge" as tokens are progressively revealed |
+| **WavePDE** | Track "state of knowledge" as tokens are progressively revealed |
 | **SWAttention** | Ensure local coherence between adjacent revealed tokens |
 | **confidence_head** | Decide which predictions are reliable enough to commit |
 
 ### Struct Definition (Julia/Lux)
 
 ```julia
-struct OssammaMLM <: Lux.AbstractLuxLayer
+struct SwammaMLM <: Lux.AbstractLuxLayer
     # Dimensions
     input_dim::Int
     hidden_dim::Int
@@ -1294,7 +1285,7 @@ struct OssammaMLM <: Lux.AbstractLuxLayer
 
     # Core components
     cosformer::Cosformer         # O(n) global linear attention
-    dlinoss::DLinOSS             # O(n) oscillatory SSM
+    dlinoss::WavePDE             # O(n) oscillatory SSM
     swattention::SWAttention     # O(n·w) local attention
 
     # Gating
@@ -1415,7 +1406,7 @@ Epoch 31+:    mask_ratio ~ U(0.15, 0.60)  # Random for robustness
 
 ### Comparison: AR vs Mask-Predict
 
-| Aspect | Autoregressive (GPT) | Mask-Predict (OssammaMLM) |
+| Aspect | Autoregressive (GPT) | Mask-Predict (SwammaMLM) |
 |--------|---------------------|--------------------------|
 | **Generation** | Left-to-right, one token at a time | Parallel, iterative refinement |
 | **Speed** | O(n) sequential steps | O(K) steps where K << n |
@@ -1433,7 +1424,7 @@ Epoch 31+:    mask_ratio ~ U(0.15, 0.60)  # Random for robustness
 │  ─────────────────────────────────────────────────────────── │
 │  Long-range deps        Cosformer         O(n) global mixing  │
 │                                                               │
-│  Sequential patterns    DLinOSS           Stateful oscillator │
+│  Sequential patterns    WavePDE           Stateful oscillator │
 │                                           memory              │
 │                                                               │
 │  Local coherence        SWAttention       Precise local       │
@@ -1452,12 +1443,12 @@ Epoch 31+:    mask_ratio ~ U(0.15, 0.60)  # Random for robustness
 ```
 Phase 1: Core Components
 ├── [ ] Implement Cosformer (linear attention)
-├── [ ] Wire existing DLinOSS
+├── [ ] Wire existing WavePDE
 ├── [ ] Wire existing SWAttention
 └── [ ] Verify each component works standalone
 
-Phase 2: OssammaMLM Layer
-├── [ ] Create OssammaMLM struct
+Phase 2: SwammaMLM Layer
+├── [ ] Create SwammaMLM struct
 ├── [ ] Implement double projection
 ├── [ ] Implement GLU gate (Cos + DLIN)
 ├── [ ] Implement mixture gate (Linear + Attn)
@@ -1482,7 +1473,7 @@ Phase 4: Inference
 
 ### Why Consider FNet Over Cosformer?
 
-FNet (Google, 2021) replaces attention entirely with Fourier transforms. For OssammaMLM, this creates an elegant synergy with DLinOSS.
+FNet (Google, 2021) replaces attention entirely with Fourier transforms. For SwammaMLM, this creates an elegant synergy with WavePDE.
 
 ### FNet vs Cosformer Comparison
 
@@ -1499,15 +1490,15 @@ FNet (Google, 2021) replaces attention entirely with Fourier transforms. For Oss
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                  Why FNet + DLinOSS Works                       │
+│                  Why FNet + WavePDE Works                       │
 │                                                                 │
 │  FNet:    "What frequencies are present in the input?"          │
 │           Static decomposition via FFT                          │
 │                                                                 │
-│  DLinOSS: "How should I respond to each frequency over time?"   │
+│  WavePDE: "How should I respond to each frequency over time?"   │
 │           Dynamic filtering via learned oscillators             │
 │                                                                 │
-│  Together: Analysis (FNet) → Filtering (DLinOSS)                │
+│  Together: Analysis (FNet) → Filtering (WavePDE)                │
 │            Both speak "frequency language"                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -1590,11 +1581,11 @@ x → FNet (global) + SWAttention (local) → gated combine
 - Attention only for local precision
 - Best of both worlds
 
-### Updated OssammaMLM with FNet
+### Updated SwammaMLM with FNet
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ OssammaMLM (FNet Variant)                                         │
+│ SwammaMLM (FNet Variant)                                         │
 │                                                                  │
 │ Input: x (Features, SeqLen, Batch)                               │
 │                                                                  │
@@ -1605,10 +1596,10 @@ x → FNet (global) + SWAttention (local) → gated combine
 │                                                                  │
 │ 2. PARALLEL PROCESSING                                           │
 │    x_fnet ──→ FNetMixer ───→ y_fft    (O(n log n), global)      │
-│    x_dlin ──→ DLinOSS ─────→ y_dlin   (O(n), temporal)          │
+│    x_dlin ──→ WavePDE ─────→ y_dlin   (O(n), temporal)          │
 │    x_attn ──→ SWAttention ─→ y_attn   (O(n·w), local)           │
 │                                                                  │
-│ 3. GLU GATE (FNet + DLinOSS)                                    │
+│ 3. GLU GATE (FNet + WavePDE)                                    │
 │    y_freq = y_fft ⊙ σ(y_dlin)                                   │
 │                                                                  │
 │    ↑ Both in frequency domain - natural pairing!                │
@@ -1625,18 +1616,18 @@ x → FNet (global) + SWAttention (local) → gated combine
 
 ### Why GLU Makes Even More Sense Now
 
-With Cosformer + DLinOSS, GLU worked because both were O(n) and had recurrent forms.
+With Cosformer + WavePDE, GLU worked because both were O(n) and had recurrent forms.
 
-With FNet + DLinOSS, GLU is **even more natural**:
+With FNet + WavePDE, GLU is **even more natural**:
 
 ```
 FNet output:   Frequency-decomposed representation
                "Here are the frequency components"
 
-DLinOSS output: Oscillator responses (σ applied)
+WavePDE output: Oscillator responses (σ applied)
                 "Here's how important each frequency is right now"
 
-GLU combination: FNet ⊙ σ(DLinOSS)
+GLU combination: FNet ⊙ σ(WavePDE)
                  "Pass frequencies that matter, gate others"
 ```
 
@@ -1645,7 +1636,7 @@ This is essentially **learned frequency-domain gating**.
 ### Struct Definition (FNet Variant)
 
 ```julia
-struct OssammaMLM_FNet <: Lux.AbstractLuxLayer
+struct SwammaMLM_FNet <: Lux.AbstractLuxLayer
     # Dimensions
     input_dim::Int
     hidden_dim::Int
@@ -1658,7 +1649,7 @@ struct OssammaMLM_FNet <: Lux.AbstractLuxLayer
 
     # Core components
     fnet::FNetMixer             # O(n log n) global frequency mixing
-    dlinoss::DLinOSS            # O(n) oscillatory SSM
+    dlinoss::WavePDE            # O(n) oscillatory SSM
     swattention::SWAttention    # O(n·w) local attention
 
     # Gating
@@ -1676,7 +1667,7 @@ end
 |----------|----------------|
 | **Maximum speed** | FNet (pure) |
 | **Minimum parameters** | FNet (pure) |
-| **Strong frequency patterns** | FNet + DLinOSS (natural synergy) |
+| **Strong frequency patterns** | FNet + WavePDE (natural synergy) |
 | **Need learned attention** | Cosformer |
 | **Complex token relationships** | Cosformer |
 | **Research/exploration** | Try both, compare |
@@ -1697,7 +1688,7 @@ Parameters (relative):
 Quality (estimated):
   Cosformer:     1.0x
   FNet (pure):   0.92-0.97x (per FNet paper)
-  FNet + DLinOSS: possibly better for frequency-rich data
+  FNet + WavePDE: possibly better for frequency-rich data
 ```
 
 ### References
@@ -1713,18 +1704,18 @@ Quality (estimated):
 
 ## Deep Scaling Strategies (DeepScaling.jl)
 
-Ossamma's O(T) complexity (vs Transformer's O(T²)) allows **4-8× more layers** for the same compute budget. The DeepScaling module implements strategies to leverage this advantage.
+Swamma's O(T) complexity (vs Transformer's O(T²)) allows **4-8× more layers** for the same compute budget. The DeepScaling module implements strategies to leverage this advantage.
 
 ### Core Insight: Depth vs Width Trade-off
 
 ```
 Transformer:  Layers = C / (T² × d)
-Ossamma:      Layers = C / (T × d²)
+Swamma:      Layers = C / (T × d²)
 
 Ratio = T / d
 
-For T=2048, d=512: Ossamma can afford 4× more layers
-For T=4096, d=512: Ossamma can afford 8× more layers
+For T=2048, d=512: Swamma can afford 4× more layers
+For T=4096, d=512: Swamma can afford 8× more layers
 ```
 
 ### 1. Hierarchical Frequency Ranges
@@ -1746,7 +1737,7 @@ Different oscillator frequency ranges per layer depth:
 
 **Usage:**
 ```julia
-using Ossamma
+using Swamma
 
 # Configure hierarchical frequencies
 freq_config = HierarchicalFrequencyConfig(
@@ -1830,12 +1821,12 @@ checkpoint_config = CheckpointConfig(
 # 48L with checkpoint (every 4): 12 × activations + recompute
 ```
 
-### 5. OssammaBlockDeep
+### 5. SwammaBlockDeep
 
 Deep-optimized block variant with all strategies built-in:
 
 ```julia
-block = OssammaBlockDeep(
+block = SwammaBlockDeep(
     384,                  # embedding_dimension
     4096,                 # sequence_length
     6,                    # number_of_heads
@@ -1855,8 +1846,8 @@ block = OssammaBlockDeep(
 **Block Types:**
 | Type | Components | Use Case |
 |------|------------|----------|
-| `:full` | LinearAttn + DLinOSS + SWAttention | Full expressivity |
-| `:global_only` | LinearAttn + DLinOSS | Semantic layers |
+| `:full` | LinearAttn + WavePDE + SWAttention | Full expressivity |
+| `:global_only` | LinearAttn + WavePDE | Semantic layers |
 | `:local_only` | SWAttention only | Syntax layers |
 
 ### 6. Block Type Schedules
@@ -1913,10 +1904,10 @@ print_model_summary(config)
 | `ultra_96L` | 96 | 256 | 4 | ~100M | Research |
 | `long_context` | 32 | 512 | 8 | ~130M | 16K+ sequences |
 
-### Example: Building a Deep Ossamma Model
+### Example: Building a Deep Swamma Model
 
 ```julia
-using Ossamma
+using Swamma
 using Lux
 using Random
 
@@ -1967,7 +1958,7 @@ end
 ## TiDAR: Speculative Decoding with Granite (TiDAR.jl & Drafter.jl)
 
 TiDAR (Token-level Iterative Drafting with AR Refinement) implements speculative decoding
-that pairs a fast, lightweight **OssammaDrafter** model with a large **Granite** autoregressive verifier.
+that pairs a fast, lightweight **SwammaDrafter** model with a large **Granite** autoregressive verifier.
 
 ### High-Level System Architecture
 
@@ -1977,7 +1968,7 @@ that pairs a fast, lightweight **OssammaDrafter** model with a large **Granite**
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │   ┌─────────────────┐                      ┌─────────────────────────┐      │
-│   │  OssammaDrafter │                      │   Granite AR Verifier   │      │
+│   │  SwammaDrafter │                      │   Granite AR Verifier   │      │
 │   │  (~40-100M)     │                      │   (2B/3B/8B params)     │      │
 │   │                 │                      │                         │      │
 │   │  • O(T) complex │──── K tokens ───────>│  • O(T²) attention      │      │
@@ -2002,9 +1993,9 @@ that pairs a fast, lightweight **OssammaDrafter** model with a large **Granite**
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### OssammaDrafter Full Architecture
+### SwammaDrafter Full Architecture
 
-The drafter is built from **OssammaDrafterBlock** layers with time conditioning for diffusion:
+The drafter is built from **SwammaDrafterBlock** layers with time conditioning for diffusion:
 
 ```
                               token_ids (seq_len, batch)
@@ -2051,7 +2042,7 @@ The drafter is built from **OssammaDrafterBlock** layers with time conditioning 
               │                         │
               v                         v
         ╔═════════════════════════════════════════════════════════════════╗
-        ║                  N × OssammaDrafterBlock                        ║
+        ║                  N × SwammaDrafterBlock                        ║
         ║         (6-96 layers depending on configuration)                ║
         ╚═════════════════════════════════════════════════════════════════╝
                                         │
@@ -2070,9 +2061,9 @@ The drafter is built from **OssammaDrafterBlock** layers with time conditioning 
                            logits (vocab, seq, batch)
 ```
 
-### OssammaDrafterBlock (Single Block Detail)
+### SwammaDrafterBlock (Single Block Detail)
 
-Each block uses GLU-style gating between LinearAttention and DLinOSS:
+Each block uses GLU-style gating between LinearAttention and WavePDE:
 
 ```
                     Input (d, seq, batch)
@@ -2087,7 +2078,7 @@ Each block uses GLU-style gating between LinearAttention and DLinOSS:
 │                               │           │
 │  Also outputs α_bias (unused  │           │
 │  in Drafter - used in full    │           │
-│  Ossamma for branch mixing)   │           │
+│  Swamma for branch mixing)   │           │
 └───────────────────────────────┘           │
             │                               │
             v                               │
@@ -2104,7 +2095,7 @@ Each block uses GLU-style gating between LinearAttention and DLinOSS:
       │           │                         │
       v           v                         │
 ┌───────────┐ ┌───────────────────┐         │
-│  LINEAR   │ │     DLinOSS       │         │
+│  LINEAR   │ │     WavePDE       │         │
 │ ATTENTION │ │ (Oscillator SSM)  │         │
 │           │ │                   │         │
 │ O(n) glob │ │ Sequential state  │         │
@@ -2152,7 +2143,7 @@ Each block uses GLU-style gating between LinearAttention and DLinOSS:
 - Uses linear attention mechanism (no softmax)
 - Processes `path_a` from the GLU split
 
-#### 2. DLinOSS (Oscillatory State Space Model)
+#### 2. WavePDE (Oscillatory State Space Model)
 - **Diagonal Linear Oscillatory State Space** model
 - Models temporal dependencies via damped harmonic oscillators
 - Each oscillator has learnable frequency `ω` and damping `α`
@@ -2163,7 +2154,7 @@ Each block uses GLU-style gating between LinearAttention and DLinOSS:
 
 #### 3. GLU Gating
 ```
-output = LinearAttention(path_a) ⊙ sigmoid(DLinOSS(path_b))
+output = LinearAttention(path_a) ⊙ sigmoid(WavePDE(path_b))
 ```
 - Oscillator output gates the attention output
 - Sigmoid provides soft gating ∈ (0, 1)
@@ -2198,7 +2189,7 @@ input = [token₁, token₂, ..., tokenₙ, [MASK], [MASK], ..., [MASK]]
                                        ╰───────── K masks ─────────╯
                     │
                     v
-            OssammaDrafter(input, t=0)
+            SwammaDrafter(input, t=0)
                     │
                     v
             logits → sample → [draft₁, draft₂, ..., draftₖ]
@@ -2267,7 +2258,7 @@ new_prefix = [token₁, ..., tokenₙ, accepted_drafts..., (verifier_token if re
 
 ### Why This Architecture?
 
-1. **Speed**: Drafter uses O(T) complexity (DLinOSS + LinearAttention), enabling 48-96 layers where a Transformer would be impractical
+1. **Speed**: Drafter uses O(T) complexity (WavePDE + LinearAttention), enabling 48-96 layers where a Transformer would be impractical
 
 2. **Quality**: Granite verifier ensures output quality matches the large model
 
@@ -2275,9 +2266,9 @@ new_prefix = [token₁, ..., tokenₙ, accepted_drafts..., (verifier_token if re
 
 4. **Parallel Drafting**: Unlike AR models, drafter predicts K tokens simultaneously
 
-### Why Deep Ossamma for TiDAR?
+### Why Deep Swamma for TiDAR?
 
-| Aspect | Transformer Drafter | Ossamma Drafter |
+| Aspect | Transformer Drafter | Swamma Drafter |
 |--------|---------------------|-----------------|
 | Complexity | O(T² × d) | **O(T × d²)** |
 | Layers for 80M params | 12L × 512d | **48L × 384d** |
@@ -2287,14 +2278,14 @@ new_prefix = [token₁, ..., tokenₙ, accepted_drafts..., (verifier_token if re
 ### Quick Start
 
 ```julia
-using Ossamma
+using Swamma
 
 # Create deep drafter for Granite 3B
 config = granite_3b_drafter_deep_config()
 print_tidar_config(config)
 
 # Create model
-drafter = OssammaDrafterDeep(config)
+drafter = SwammaDrafterDeep(config)
 
 # Initialize
 rng = Random.default_rng()
@@ -2397,11 +2388,11 @@ config = TiDARConfig(
 The drafter is trained with MLM loss on the same data as the verifier:
 
 ```julia
-using Ossamma
+using Swamma
 
 # Create drafter
 config = granite_3b_drafter_deep_config()
-drafter = OssammaDrafterDeep(config)
+drafter = SwammaDrafterDeep(config)
 
 # Training config
 train_config = DrafterTrainingConfig(
@@ -2414,9 +2405,9 @@ train_config = DrafterTrainingConfig(
 # Training loop uses drafter_mlm_loss from DrafterTraining module
 ```
 
-### Key Differences: OssammaDrafter vs Full OssammaBlock
+### Key Differences: SwammaDrafter vs Full SwammaBlock
 
-| Feature | Full OssammaBlock | OssammaDrafterBlock |
+| Feature | Full SwammaBlock | SwammaDrafterBlock |
 |---------|-------------------|---------------------|
 | SWAttention (local) | ✓ | ✗ (verifier handles local) |
 | α-mixing gating | ✓ | ✗ (standard residual) |

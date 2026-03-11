@@ -75,7 +75,7 @@ A novel **Mixture-of-Experts architecture for reasoning**, not just token routin
 │     Bottleneck: Attention is O(T²)                                          │
 │     Result: Can't go very deep without massive compute                      │
 │                                                                             │
-│   Ossamma MoET:                                                              │
+│   Swamma MoET:                                                              │
 │     Per token: O(T × d²) per expert tower                                   │
 │     No O(T²) bottleneck!                                                    │
 │     Result: Can afford 48-96 layers per expert                              │
@@ -85,7 +85,7 @@ A novel **Mixture-of-Experts architecture for reasoning**, not just token routin
 │                                                                             │
 │   For T=4096, d=384, L=48:                                                  │
 │     Transformer: 4096² × 384 × 48 = 300B FLOPs                             │
-│     Ossamma: 4096 × 384² × 48 × 1.5 = 43B FLOPs                            │
+│     Swamma: 4096 × 384² × 48 × 1.5 = 43B FLOPs                            │
 │                                                                             │
 │     7× cheaper → can afford 7× more layers!                                 │
 │                                                                             │
@@ -449,7 +449,7 @@ Training signal:
 #### 3. Logic Tower (20 Layers)
 
 ```
-Architecture: 20 × OssammaDrafterBlockDeep
+Architecture: 20 × SwammaDrafterBlockDeep
 
 Each block:
   Input ──► TimeConditionedLayerNorm ──► GLU Projection (d → 2d)
@@ -457,7 +457,7 @@ Each block:
                               ┌───────────────┴───────────────┐
                               │                               │
                               ▼                               ▼
-                      LinearAttention              DLinOSS (Oscillators)
+                      LinearAttention              WavePDE (Oscillators)
                               │                               │
                               └───────────┬───────────────────┘
                                           │
@@ -486,7 +486,7 @@ Training Data:
 #### 4. Language Tower (20 Layers)
 
 ```
-Architecture: 20 × OssammaDrafterBlockDeep (same structure as Logic Tower)
+Architecture: 20 × SwammaDrafterBlockDeep (same structure as Logic Tower)
 
 Oscillator Configuration (Language Tower):
   - Layers 1-7:   freq ∈ [5, 50]    "Fast language" (syntax, local coherence)
@@ -503,7 +503,7 @@ Training Data:
 #### 5. Fusion Layers (4 Layers)
 
 ```
-Architecture: 4 × OssammaDrafterBlockDeep
+Architecture: 4 × SwammaDrafterBlockDeep
 
 Purpose:
   - Combine logical and linguistic representations
@@ -793,7 +793,7 @@ Phase 4: Generate Answer
 │   No guarantee of correctness                                               │
 │                                                                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ Logic-Gated Ossamma:                                                        │
+│ Logic-Gated Swamma:                                                        │
 │   Logic Tower trained on: HS rule (P→Q, Q→R ⊢ P→R)                        │
 │   Applies HS three times: A→B, B→C ⊢ A→C                                   │
 │                           A→C, C→D ⊢ A→D                                   │
@@ -1215,7 +1215,7 @@ num_layers = 8
 
 ### TODO: Global–Local Gated Block Improvements (Requested)
 - [x] **Always RMSNorm** on:
-  - [x] Oscillator (DLinOSS) output
+  - [x] Oscillator (WavePDE) output
   - [x] Linear-attention output
   - [x] Before GLU gating (normalize both paths before element-wise multiply)
 - [x] Add explicit residual form: `y = x + α ⊙ g + (1-α) ⊙ l` (do not mix raw outputs without the skip).

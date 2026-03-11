@@ -1,4 +1,4 @@
-# OssammaNER Ablation Study - No Output Gate
+# SwammaNER Ablation Study - No Output Gate
 # Tests whether output gate provides value vs. just having input gate + adaptive mix
 # Based on ner_production_110m.toml with use_output_gate = false
 
@@ -20,7 +20,7 @@ state_dimension = 384
 [model.attention]
 window_size = 32
 
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.01
 max_frequency = 5.0
 default_time_step = 0.05

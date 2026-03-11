@@ -8,12 +8,12 @@ using Statistics
 using Printf
 using Dates
 
-# Load Ossamma modules
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
-using .Ossamma: OssammaNER, NERConfig
-using .Ossamma: ner_cross_entropy
-using .Ossamma: LABEL_TO_ID
+# Load Swamma modules
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
+using .Swamma: SwammaNER, NERConfig
+using .Swamma: ner_cross_entropy
+using .Swamma: LABEL_TO_ID
 
 using Lux
 using Optimisers
@@ -37,7 +37,7 @@ config = NERConfig(
 )
 
 println("\nCreating minimal model...")
-model = OssammaNER(config)
+model = SwammaNER(config)
 
 rng = Random.default_rng()
 params = Lux.initialparameters(rng, model)

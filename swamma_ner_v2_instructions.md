@@ -1,18 +1,18 @@
-# OSSAMMA-NER v2 Implementation Instructions
+# SWAMMA-NER v2 Implementation Instructions
 
 ## Overview
 
-You are implementing a modified OSSAMMA (Oscillatory State Space Attention Masked Mixer) architecture for Named Entity Recognition. The key modification is **dual gating** where the GLU-Global branch guides the Local-Sharp branch through two gates.
+You are implementing a modified SWAMMA (Oscillatory State Space Attention Masked Mixer) architecture for Named Entity Recognition. The key modification is **dual gating** where the GLU-Global branch guides the Local-Sharp branch through two gates.
 
 ---
 
 ## Architecture Summary
 
 ```
-Input → Embeddings → [OSSAMMA Block × N] → NER Head → Entity Labels
+Input → Embeddings → [SWAMMA Block × N] → NER Head → Entity Labels
 ```
 
-Each OSSAMMA Block contains:
+Each SWAMMA Block contains:
 1. Time-Conditioned LayerNorm
 2. GLU-Global Branch (processes first)
 3. Local-Sharp Branch (receives guidance from GLU)
@@ -72,7 +72,7 @@ Step 1 - Expand:
 
 Step 2 - Process paths:
     attn_out = LinearAttention(path_a)
-    osc_out = DLinOSS(path_b)  # Oscillator/state space
+    osc_out = WavePDE(path_b)  # Oscillator/state space
 
 Step 3 - Gate and combine:
     gated = attn_out * sigmoid(osc_out)
@@ -223,7 +223,7 @@ dropout: 0.1
 attention_dropout: 0.1
 ```
 
-### Oscillator (DLinOSS)
+### Oscillator (WavePDE)
 
 ```
 oscillator_dim: 64
@@ -258,7 +258,7 @@ crf_learning_rate: 1e-3  # CRF often needs higher LR
 - [ ] Rotary Position Embedding (RoPE)
 - [ ] Time-Conditioned LayerNorm
 - [ ] Linear Attention (for GLU branch)
-- [ ] DLinOSS Oscillator
+- [ ] WavePDE Oscillator
 - [ ] Sliding Window Attention
 - [ ] **Input Gate: `sigmoid(W₁ @ GLU_out)`**
 - [ ] **Output Gate: `sigmoid(W₂ @ GLU_out) * GLU_out`**
@@ -320,7 +320,7 @@ Local_final = local_out + output_gate * GLU_out
 ## Testing Your Implementation
 
 ### Sanity Checks
-1. Without gates (set to all 1s), should behave like original OSSAMMA
+1. Without gates (set to all 1s), should behave like original SWAMMA
 2. Input gate all 0s → Local sees nothing → output should rely on output gate
 3. Output gate all 0s → No GLU injection → pure local output
 4. Gradients should flow through both gate paths

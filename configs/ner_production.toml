@@ -1,4 +1,4 @@
-# OssammaNER Production Configuration
+# SwammaNER Production Configuration
 # ~150M Parameters - For production deployment
 
 # =============================================================================
@@ -26,7 +26,7 @@ window_size = 128
 [[model.attention.window_schedule]]
 window_size = 256
 
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.01            # Very slow oscillations for document-level
 max_frequency = 5.0             # Fast for word-level patterns
 default_time_step = 0.05

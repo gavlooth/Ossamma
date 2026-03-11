@@ -392,7 +392,7 @@ function main()
     println("Download complete!")
     println("=" ^ 50)
     println("\nTo use these datasets in training:")
-    println("  using Ossamma.NERDataset")
+    println("  using Swamma.NERDataset")
     println("  samples = load_dataset(\"$(joinpath(DATA_DIR, "conll2003", "train.txt"))\")")
 end
 

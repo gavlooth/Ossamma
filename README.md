@@ -1,12 +1,15 @@
-# Ossamma
+# SWAMMA (Spectral Wave-Attention Masked Mixer Architecture)
 
-**Oscillatory State Space Attention Masked Mixer Architecture** - A Julia-based neural network framework implementing novel state space models and attention mechanisms for Named Entity Recognition.
+**Spectral Wave-PDE Attention Masked Mixer Architecture** - A Julia-based neural network framework for efficient many-layer sequence models built around `LinearAttention`, `WavePDE`, and sharp local attention.
+
+Canonical naming in this repo is now **SWAMMA/Wave-PDE-first**.
+Preferred API aliases include `SwammaBlock`, `SwammaClassifier`, `SwammaNER`, and `wave_gate(...)`.
 
 ## Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         OssammaNER Architecture                             │
+│                         SwammaNER Architecture                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
   Input: "Barack Obama visited Paris"
@@ -20,36 +23,46 @@
                     │
                     ▼
     ┌───────────────────────────────────────────────────────────────┐
-    │                  OssammaNERBlock (×N layers)                  │
+    │                    SwammaBlock (×N layers)                   │
     │  ┌─────────────────────────────────────────────────────────┐  │
     │  │            Time-Conditioned LayerNorm                   │  │
-    │  │         (scale/shift modulated by timestep)             │  │
+    │  │         returns normalized x and α_bias(t)              │  │
     │  └────────────────────┬────────────────────────────────────┘  │
     │                       │                                       │
     │          ┌────────────┴────────────┐                          │
     │          │                         │                          │
     │          ▼                         ▼                          │
-    │  ┌───────────────┐        ┌────────────────┐                  │
-    │  │  GLU Branch   │        │  Local Branch  │                  │
-    │  │   (Global)    │        │   (Precise)    │                  │
-    │  │               │        │                │                  │
-    │  │ LinearAttn ⊙  │───────►│  Input Gate    │ σ(W·glu) gates   │
-    │  │   DLinOSS     │        │       ↓        │ input features   │
-    │  │       ↓       │        │  SWAttention   │                  │
-    │  │   glu_out     │        │                │                  │
-    │  └───────┬───────┘        └───────┬────────┘                  │
-    │          │                        │                           │
-    │          └──────────┬─────────────┘                           │
-    │                     ▼                                         │
-    │           ┌─────────────────┐                                 │
-    │           │  Adaptive Mix   │  α·GLU + (1-α)·Local            │
-    │           │  (α-mixing)     │  where α = σ(learned + t_bias)  │
-    │           └────────┬────────┘                                 │
-    │                    ▼                                          │
-    │           ┌─────────────────┐                                 │
-    │           │   SwiGLU FFN    │  d → 3d/2 → split → swish⊙ → d  │
-    │           │   + Residual    │  (transform nonlinearity)       │
-    │           └─────────────────┘                                 │
+    │  ┌────────────────┐      ┌───────────────────────┐           │
+    │  │ Global Branch  │      │ Local Branch          │           │
+    │  │                │      │                       │           │
+    │  │ Dense(d→2d)    │      │ normalized            │           │
+    │  │  ├─ content ──►│      │    ⊙ local_gate       │           │
+    │  │  │ LinearAttn  │      │         ↓             │           │
+    │  │  │ RMSNorm     │      │    SWAttention        │           │
+    │  │  └─ gate ─────►│      │                       │           │
+    │  │    WavePDE     │      └───────────┬───────────┘           │
+    │  │    RMSNorm     │                  │                       │
+    │  │    sigmoid     │                  │                       │
+    │  │ content ⊙ gate │ = glu_out        │                       │
+    │  └────────┬───────┘                  │                       │
+    │           │                          │                       │
+    │           │   global -> local control                         │
+    │           ▼                          │                       │
+    │    ┌───────────────────┐             │                       │
+    │    │ InputGate(glu_out)│ = local_gate│                       │
+    │    └─────────┬─────────┘             │                       │
+    │              └───────────────┬───────┘                       │
+    │                           ▼                                  │
+    │                ┌─────────────────────────┐                   │
+    │                │ Adaptive Mix            │                   │
+    │                │ α·global + (1-α)·local  │                   │
+    │                │ α = σ(Wα·x_norm+α_bias) │                   │
+    │                └───────────┬─────────────┘                   │
+    │                            ▼                                 │
+    │                ┌─────────────────────────┐                   │
+    │                │ Dropout → SwiGLU FFN    │                   │
+    │                │ → Residual → LayerNorm  │                   │
+    │                └─────────────────────────┘                   │
     └───────────────────────────────────────────────────────────────┘
                     │
                     ▼
@@ -67,22 +80,47 @@
   Output: [B-PERSON, I-PERSON, O, B-PLACE]
 ```
 
+## Architectural Thesis
+
+`SwammaBlock` is built around a division of labor rather than a single generic
+attention stack.
+
+- `LinearAttention` is the scalable global content path. It moves information
+  across the full sequence without paying the full `O(n^2)` cost of dense attention.
+- `WavePDE` is not a replacement for attention. It provides a structured smooth
+  dynamical prior that gates the global path, so the model does not collapse into
+  a plain attention-only encoder.
+- `InputGate(glu_out)` is the explicit global-to-local connection. The global
+  branch decides which features are worth presenting to the local operator before
+  `SWAttention` spends capacity on neighborhood refinement.
+- `SWAttention` is the sharp local corrector. It handles boundary-sensitive and
+  token-local structure that the smooth Wave-PDE gate should not be expected to model.
+- `α`-mixing is the arbitration layer. It learns how much of the final update
+  should come from the global structured path versus the local corrective path.
+
+The intended effect is not "more mechanisms". It is a hierarchy:
+
+```text
+global interpretation -> local conditioning -> local refinement -> adaptive merge
+```
+
 ## Core Components
 
-### DLinOSS (Damped Linear Oscillatory State Space Model)
+### WavePDE Gate
 
-Physics-inspired recurrent layer using coupled damped harmonic oscillators:
+Spectral structured gate based on a damped wave equation:
 
 ```
-State Evolution:  x_{t+1} = ρ · R(θ) · x_t + B · u_t
-                  where ρ = 1/(1 + Δt·damping)  (implicit damping)
-                        θ = ω · Δt              (rotation angle)
+u_t = v
+v_t = c²Δu - γv
+
+Forward pass uses `u(0)=x`, `v(0)=0` and integrates a small number of internal
+Wave-PDE steps spectrally, without a recurrent token-by-token scan.
 ```
 
-Each oscillator maintains 2D state (position, velocity) with learnable:
-- **Frequency (ω)**: Controls oscillation speed
-- **Damping (α)**: Controls decay rate
-- **Step size (Δt)**: Selective time discretization
+In the current `SwammaBlock`, `WavePDE` is used as the gate that modulates the
+global `LinearAttention` content path across the active model families in this
+repo.
 
 ### SWAttention (Sliding Window Attention)
 
@@ -121,7 +159,7 @@ Provides transform-type nonlinearity after the α-mixing step. The 3/2 expansion
 
 ## NER Label Schema
 
-OssammaNER uses a RAG-optimized 9-entity-type schema with BIO tagging (**19 labels** total).
+SwammaNER uses a RAG-optimized 9-entity-type schema with BIO tagging (**19 labels** total).
 
 ### Entity Types
 
@@ -175,14 +213,14 @@ What field?    → DOMAIN
 ## Project Structure
 
 ```
-Ossamma/
+Swamma/
 ├── src/
-│   ├── Ossamma.jl           # Main module, OssammaBlock, OssammaNERBlock
-│   ├── ossm.jl              # Basic OSSM layer
-│   ├── Dlinoss.jl           # DLinOSS (Damped Linear Oscillatory SSM)
+│   ├── Swamma.jl           # Main module, SwammaBlock, SwammaNERBlock
+│   ├── WavePDE.jl           # Spectral damped-wave gate used by SwammaBlock
 │   ├── Attention.jl         # SWAttention (Sliding Window)
 │   ├── linearAttention.jl   # O(n) Linear Attention
-│   ├── NER.jl               # OssammaNER model
+│   ├── NER.jl               # SwammaNER model
+│   ├── RelationExtraction.jl # Structured relation extraction model
 │   ├── CRF.jl               # Conditional Random Field
 │   ├── Training.jl          # Loss functions, training utilities
 │   ├── data/
@@ -196,6 +234,7 @@ Ossamma/
 │       └── Monitoring.jl       # GPU monitoring
 ├── scripts/
 │   ├── train_ner_production.jl  # Production training
+│   ├── train_rebel.jl           # Structured REBEL-style relation extraction training
 │   ├── export_model.jl          # Model serialization
 │   └── download_ner_data.jl     # Data utilities
 ├── configs/
@@ -203,7 +242,7 @@ Ossamma/
 │   └── ner_dev.toml             # Development config
 ├── checkpoints/                  # Saved model weights
 └── docs/
-    ├── OSSAMMA_NER_ARCHITECTURE.md
+    ├── SWAMMA_NER_ARCHITECTURE.md
     └── NER_TRAINING_PLAN.md
 ```
 
@@ -212,7 +251,7 @@ Ossamma/
 ### Installation
 
 ```bash
-cd Ossamma
+cd Swamma
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
@@ -229,11 +268,11 @@ julia --project=. scripts/train_ner_production.jl --config configs/ner_productio
 ### Inference
 
 ```julia
-using Ossamma
+using Swamma
 
 # Load model
 config = load_ner_config("configs/ner_production_110m.toml")
-model = OssammaNER(config)
+model = SwammaNER(config)
 ps, st = load_checkpoint("checkpoints/ner_110m/latest.jls")
 
 # Predict
@@ -286,7 +325,7 @@ MIT
 
 ```bibtex
 @software{ossamma2024,
-  title={Ossamma: Oscillatory State Space Attention for NER},
+  title={Swamma: Oscillatory State Space Attention for NER},
   year={2024},
   url={https://github.com/your-repo/ossamma}
 }

@@ -1,4 +1,4 @@
-# Nonlinearity Analysis for OssammaNERBlock
+# Nonlinearity Analysis for SwammaNERBlock
 
 ## Question
 
@@ -18,7 +18,7 @@ Dense(dim → 2dim)                    ← EXPAND
 path_a    path_b
   │         │
   ▼         ▼
-LinearAttn  DLinOSS
+LinearAttn  WavePDE
   │         │
   │         ▼
   │      sigmoid                     ← NONLIN: sigmoid activation
@@ -580,13 +580,13 @@ Parameter efficiency (to match standard FFN quality):
   SwiGLU:        d → 8d/3 → d   (5.33d² params)  ← 33% fewer params!
 ```
 
-### Implications for OssammaNERBlock
+### Implications for SwammaNERBlock
 
 ```
 Current GLU Branch:
 ───────────────────
 
-  LinearAttn(a) ⊙ sigmoid(DLinOSS(b))
+  LinearAttn(a) ⊙ sigmoid(WavePDE(b))
                     ↑
                  Uses sigmoid gate
 
@@ -833,13 +833,13 @@ function (ffn::SwiGLU)(x, ps, st)
     return output, (expand=st1, contract=st2)
 end
 
-# Add to OssammaNERBlock struct and forward pass
+# Add to SwammaNERBlock struct and forward pass
 ```
 
 ### Option D: Expanded Gate
 
 ```julia
-# Modified gate computation in OssammaNERBlock
+# Modified gate computation in SwammaNERBlock
 
 struct GatedFFN <: LuxLayer
     dim::Int
@@ -869,5 +869,5 @@ function (g::GatedFFN)(x, ps, st)
     return gate, (expand=st1, contract=st2)
 end
 
-# Replace InputGate with GatedFFN in OssammaNERBlock
+# Replace InputGate with GatedFFN in SwammaNERBlock
 ```

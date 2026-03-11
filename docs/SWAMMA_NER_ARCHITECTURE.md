@@ -1,10 +1,31 @@
-# OSSAMMA-NER Architecture Diagram
+# SWAMMA-NER Architecture Diagram
 
-A comprehensive technical reference for the OssammaNER (Named Entity Recognition with Dual-Gated Oscillatory Attention) architecture.
+A comprehensive technical reference for the SwammaNER (Named Entity Recognition with Dual-Gated Oscillatory Attention) architecture.
+
+## Design Thesis
+
+The active `SwammaNER` stack is built around a strict division of labor inside
+each `SwammaBlock`:
+
+- `LinearAttention` transports global content efficiently across the full sequence.
+- `WavePDE` gates that global path with a smooth spectral dynamical prior, so the
+  model does not collapse into a standard attention-only encoder.
+- `InputGate(glu_out)` is the explicit global-to-local bridge. The global branch
+  determines which features should be exposed to the local operator.
+- `SWAttention` performs the local corrective step, sharpening token boundaries
+  and neighborhood structure after global conditioning.
+- `α`-mixing combines the two paths adaptively instead of forcing one path to do
+  both jobs.
+
+In shorthand:
+
+```text
+global interpretation -> local conditioning -> local refinement -> adaptive merge
+```
 
 ```
 ╔═══════════════════════════════════════════════════════════════════════════════════════════════════╗
-║                                    OSSAMMA-NER ARCHITECTURE                                        ║
+║                                    SWAMMA-NER ARCHITECTURE                                        ║
 ║                      (Named Entity Recognition with Dual-Gated Oscillatory Attention)              ║
 ╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝
 
@@ -46,11 +67,11 @@ LAYER 1: INPUT EMBEDDINGS
                                                 ▼
 
 ═══════════════════════════════════════════════════════════════════════════════════════════════════════
-LAYER 2-N: OSSAMMA-NER BLOCKS (× number_of_layers)
+LAYER 2-N: SWAMMA-NER BLOCKS (× number_of_layers)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════════
 
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                            OSSAMMA-NER BLOCK (Dual Gating Architecture)                             │
+│                            SWAMMA-NER BLOCK (Dual Gating Architecture)                             │
 │                                                                                                     │
 │  ╔═════════════════════════════════════════════════════════════════════════════════════════════╗   │
 │  ║ ABSTRACTION: Two parallel processing streams with bidirectional gating                      ║   │
@@ -102,7 +123,7 @@ LAYER 2-N: OSSAMMA-NER BLOCKS (× number_of_layers)
 │     │                │                     │                                                 │   │
 │     │                ▼                     ▼                                                 │   │
 │     │   ┌────────────────────────┐   ┌────────────────────────────────────────────────────┐ │   │
-│     │   │   LINEAR ATTENTION     │   │            DLinOSS (Oscillator SSM)                │ │   │
+│     │   │   LINEAR ATTENTION     │   │            WavePDE (Oscillator SSM)                │ │   │
 │     │   │   ──────────────────   │   │            ──────────────────────                  │ │   │
 │     │   │                        │   │                                                    │ │   │
 │     │   │   ┌──────────────────┐ │   │  PHYSICS MODEL: Damped harmonic oscillators       │ │   │
@@ -452,12 +473,12 @@ MODEL CONFIGURATIONS (TOML-based)
     ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
     │                                                                                              │
     │  # Load model from TOML config                                                               │
-    │  model = OssammaNER("configs/ner_production.toml")                                          │
+    │  model = SwammaNER("configs/ner_production.toml")                                          │
     │                                                                                              │
     │  # Or load config separately                                                                 │
     │  config = load_ner_config("configs/ner_dev.toml")                                           │
     │  print_config_summary(config)  # Shows config with estimated params                         │
-    │  model = OssammaNER(config)                                                                  │
+    │  model = SwammaNER(config)                                                                  │
     │                                                                                              │
     │  # Load training hyperparameters                                                             │
     │  train_config = load_training_config("configs/ner_production.toml")                         │
@@ -485,7 +506,7 @@ MODEL CONFIGURATIONS (TOML-based)
     │  [model.attention]                 # Attention settings                                      │
     │  window_size = 64                                                                            │
     │                                                                                              │
-    │  [model.oscillator]                # DLinOSS physics parameters                              │
+    │  [model.wave_gate]                # WavePDE physics parameters                              │
     │  min_frequency = 0.01                                                                        │
     │  max_frequency = 5.0                                                                         │
     │  default_time_step = 0.05                                                                    │
@@ -525,7 +546,7 @@ ACTIVATION FUNCTION SUMMARY
     │──────────────┼──────────────────────────────────┼───────────────────────────────────────────│
     │  sigmoid     │ σ(x) = 1/(1+e^(-x))              │ All gates (GLU, input, output, α)         │
     │  sigsoftmax  │ softmax(x + log(σ(x)))           │ SWAttention weights                       │
-    │  softplus    │ log(1 + e^x)                     │ DLinOSS output, LinearAttention features  │
+    │  softplus    │ log(1 + e^x)                     │ WavePDE output, LinearAttention features  │
     │  gelu        │ x·Φ(x)                           │ LinearAttention feature projections       │
     │  (none)      │ linear                           │ Classification head (raw logits)          │
     └──────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -539,7 +560,7 @@ STATE MANAGEMENT (Lux.jl Convention)
     │   STATELESS LAYERS: SWAttention, Dense, LayerNorm                                           │
     │     → state = (;)  (empty NamedTuple)                                                       │
     │                                                                                              │
-    │   STATEFUL LAYERS: DLinOSS                                                                  │
+    │   STATEFUL LAYERS: WavePDE                                                                  │
     │     → state = (oscillator_state = zeros(2, state_dim),)                                     │
     │     → Carries velocity/position between timesteps within sequence                           │
     │     → Reset to zeros at sequence start                                                      │
@@ -559,7 +580,7 @@ KEY ARCHITECTURAL INNOVATIONS
     │     • Output gate: Injects global context where needed (post-attention gating)              │
     │     • Intent: Entity boundaries need local precision, but continuation needs global context │
     │                                                                                              │
-    │  2. PHYSICS-BASED SSM: DLinOSS uses damped harmonic oscillators                             │
+    │  2. PHYSICS-BASED SSM: WavePDE uses damped harmonic oscillators                             │
     │     • Learnable frequency (ω), damping (α), time step (Δt)                                  │
     │     • Stable evolution via implicit Euler integration                                       │
     │     • Intent: Natural decay/resonance patterns for sequence modeling                        │
@@ -593,7 +614,7 @@ DATA FLOW SUMMARY
          │
          ▼
     ┌─────────────────────────────────────┐
-    │       OssammaNERBlock × N           │
+    │       SwammaNERBlock × N           │
     │                                     │
     │  [Time-Norm → GLU-Global → Dual-    │
     │   Gated Local → Mix → Residual]     │
@@ -623,7 +644,7 @@ COMPLEXITY ANALYSIS
     │  Time Embedding               │ O(d_t)               │ O(d_t)              │ Sinusoidal     │
     │                                                                                              │
     │  ─────────────────────────────────────────────────────────────────────────────────────────── │
-    │  PER OSSAMMA-NER BLOCK:                                                                      │
+    │  PER SWAMMA-NER BLOCK:                                                                      │
     │  ─────────────────────────────────────────────────────────────────────────────────────────── │
     │                                                                                              │
     │  TimeConditionedLayerNorm     │ O(n × d)             │ O(d)                │ Element-wise   │
@@ -636,7 +657,7 @@ COMPLEXITY ANALYSIS
     │    - Context: V @ K^T         │ O(n × d_h²)          │ O(d_h × d_h)        │ Per head       │
     │    - Output: ctx @ Q          │ O(n × d_h²)          │                     │                │
     │                                                                                              │
-    │  DLinOSS Oscillators          │ O(n × d_s)           │ O(d_s × d)          │ Sequential     │
+    │  WavePDE Oscillators          │ O(n × d_s)           │ O(d_s × d)          │ Sequential     │
     │    - Input projection         │ O(n × d × d_s)       │                     │ scan           │
     │    - State evolution          │ O(n × d_s)           │ O(d_s)              │                │
     │    - Output projection        │ O(n × d_s × d)       │                     │                │
@@ -672,7 +693,7 @@ COMPLEXITY ANALYSIS
     │                                                                                              │
     │  KEY INSIGHT: Linear attention + sliding window = sub-quadratic in sequence length          │
     │               Standard transformer: O(n² × d)                                                │
-    │               OssammaNER:          O(n × d² + n × w × d) where w << n                       │
+    │               SwammaNER:          O(n × d² + n × w × d) where w << n                       │
     │                                                                                              │
     └──────────────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -697,7 +718,7 @@ PARAMETER COUNT BREAKDOWN (base model: d=512, h=8, N=6, d_s=512, d_t=128)
     │    Time Embedding:      (sinusoidal, no learnable params)      =          0                 │
     │                                                         Subtotal: 16,646,144                │
     │                                                                                              │
-    │  PER OSSAMMA-NER BLOCK:                                                                      │
+    │  PER SWAMMA-NER BLOCK:                                                                      │
     │  ────────────────────────────────────────────────────────────────────────────────────────── │
     │                                                                                              │
     │    TimeConditionedLayerNorm:                                                                 │
@@ -718,7 +739,7 @@ PARAMETER COUNT BREAKDOWN (base model: d=512, h=8, N=6, d_s=512, d_t=128)
     │      FeatureNorm:                64 × 2 × 4 streams            =        512                 │
     │      PositionEmbeddings:         (fixed sinusoidal)            =          0                 │
     │                                                                                              │
-    │    DLinOSS:                                                                                  │
+    │    WavePDE:                                                                                  │
     │      log_time_step:              512                           =        512                 │
     │      log_stiffness:              512                           =        512                 │
     │      log_damping:                512                           =        512                 │
@@ -838,7 +859,7 @@ GRADIENT FLOW ANALYSIS
     │     - ∂sigsoftmax/∂x has bounded magnitude (avoids exploding gradients)                 │
     │                                                                                           │
     │  4. OSCILLATOR GRADIENTS:                                                                │
-    │     - DLinOSS uses implicit Euler → stable backward pass                                 │
+    │     - WavePDE uses implicit Euler → stable backward pass                                 │
     │     - Log-parameterization → always positive frequencies/damping                         │
     │     - Damping ensures bounded state → bounded gradients                                  │
     │                                                                                           │
@@ -1033,22 +1054,22 @@ DESIGN RATIONALE & ABSTRACTIONS
     │  ABSTRACTION HIERARCHY:                                                                      │
     │  ═══════════════════════════════════════════════════════════════════════════════════════════ │
     │                                                                                              │
-    │  Level 4: OssammaNER                                                                         │
+    │  Level 4: SwammaNER                                                                         │
     │           │                                                                                  │
     │           │  "A complete NER system that combines embeddings,                               │
     │           │   processing blocks, and classification"                                        │
     │           │                                                                                  │
     │           ├── Embeddings (token + position + time)                                          │
-    │           ├── N × OssammaNERBlock                                                           │
+    │           ├── N × SwammaNERBlock                                                           │
     │           └── ClassificationHead                                                            │
     │                                                                                              │
-    │  Level 3: OssammaNERBlock                                                                    │
+    │  Level 3: SwammaNERBlock                                                                    │
     │           │                                                                                  │
     │           │  "A processing unit that fuses global context with                              │
     │           │   local precision via bidirectional gating"                                     │
     │           │                                                                                  │
     │           ├── TimeConditionedLayerNorm                                                      │
-    │           ├── GLU-Global Branch (LinearAttention + DLinOSS + GLU gate)                     │
+    │           ├── GLU-Global Branch (LinearAttention + WavePDE + GLU gate)                     │
     │           ├── Dual Gates (Input + Output)                                                   │
     │           ├── Local-Sharp Branch (SWAttention)                                              │
     │           └── Adaptive Mixing + Residual                                                    │
@@ -1056,7 +1077,7 @@ DESIGN RATIONALE & ABSTRACTIONS
     │  Level 2: Core Components                                                                    │
     │           │                                                                                  │
     │           ├── LinearAttention: "Global context via O(n) attention"                         │
-    │           ├── DLinOSS: "Temporal dynamics via physics-based oscillators"                   │
+    │           ├── WavePDE: "Temporal dynamics via physics-based oscillators"                   │
     │           ├── SWAttention: "Local precision via windowed attention"                        │
     │           └── TimeConditionedLayerNorm: "Diffusion-aware normalization"                    │
     │                                                                                              │
@@ -1085,7 +1106,7 @@ DESIGN RATIONALE & ABSTRACTIONS
     │  │                                                                                        │ │
     │  │  1. GLU-Global branch captures document-level semantics:                              │ │
     │  │     - LinearAttention: What topics/entities are in the document?                      │ │
-    │  │     - DLinOSS: How do concepts flow/decay through the sequence?                      │ │
+    │  │     - WavePDE: How do concepts flow/decay through the sequence?                      │ │
     │  │     - GLU gate: Which global features are relevant at each position?                 │ │
     │  │                                                                                        │ │
     │  │  2. Local-Sharp branch captures boundary patterns:                                    │ │
@@ -1100,7 +1121,7 @@ DESIGN RATIONALE & ABSTRACTIONS
     │  └────────────────────────────────────────────────────────────────────────────────────────┘ │
     │                                                                                              │
     │  ┌────────────────────────────────────────────────────────────────────────────────────────┐ │
-    │  │  WHY OSCILLATORS (DLinOSS)?                                                           │ │
+    │  │  WHY OSCILLATORS (WavePDE)?                                                           │ │
     │  │                                                                                        │ │
     │  │  Traditional RNNs: Exponential decay/growth, hard to control                         │ │
     │  │  Transformers: All-to-all attention, computationally expensive                       │ │
@@ -1145,21 +1166,21 @@ FILE REFERENCE
     │  configs/ner_production.toml   Production config (~150M params)                             │
     │                                                                                              │
     │  SOURCE FILES:                                                                               │
-    │  src/NER.jl                    OssammaNER model, config loading, loss functions             │
+    │  src/NER.jl                    SwammaNER model, config loading, loss functions             │
     │    - NERConfig struct          Configuration with all hyperparameters                       │
     │    - load_ner_config()         Load config from TOML file                                   │
     │    - load_training_config()    Load training hyperparameters from TOML                      │
     │    - estimate_parameters()     Estimate model parameter count                               │
     │    - print_config_summary()    Display config with param estimate                           │
     │                                                                                              │
-    │  src/Ossamma.jl                OssammaNERBlock (dual gating architecture)                   │
+    │  src/Swamma.jl                SwammaNERBlock (dual gating architecture)                   │
     │  src/Attention.jl              SWAttention (sliding window)                                 │
     │  src/linearAttention.jl        LinearAttentionLayer                                         │
-    │  src/Dlinoss.jl                DLinOSS oscillator SSM                                       │
+    │  src/WavePDE.jl                WavePDE oscillator SSM                                       │
     │                                                                                              │
     │  DOCUMENTATION:                                                                              │
     │  docs/NER_TRAINING_PLAN.md     Complete training pipeline specification                     │
-    │  docs/OSSAMMA_NER_ARCHITECTURE.md  This file                                                │
+    │  docs/SWAMMA_NER_ARCHITECTURE.md  This file                                                │
     │                                                                                              │
     └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```

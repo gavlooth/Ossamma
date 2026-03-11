@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Train OssammaNER model (v2) with CRF and Dual Gating.
+Train SwammaNER model (v2) with CRF and Dual Gating.
 
 Usage:
     julia --project=. scripts/train_ner.jl --data data/rag/ --output models/ner/
@@ -16,14 +16,14 @@ using Optimisers
 using Zygote
 using NNlib
 
-# Load Ossamma
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
-using .Ossamma.NER
-using .Ossamma.CRF
-using .Ossamma.NERDataset
-using .Ossamma.Tokenizer
-using .Ossamma.NERMetrics
+# Load Swamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
+using .Swamma.NER
+using .Swamma.CRF
+using .Swamma.NERDataset
+using .Swamma.Tokenizer
+using .Swamma.NERMetrics
 
 # =============================================================================
 # Configuration
@@ -175,7 +175,7 @@ function train(config::TrainConfig)
     tokenize_dataset!(val_samples, tokenizer)
     
     # 3. Create Model
-    println("Initializing OssammaNER (v2) model...")
+    println("Initializing SwammaNER (v2) model...")
     ner_config = NERConfig(
         vocab_size = length(vocab),
         max_sequence_length = config.max_len,
@@ -188,7 +188,7 @@ function train(config::TrainConfig)
         use_crf = true
     )
     
-    model = OssammaNER(ner_config)
+    model = SwammaNER(ner_config)
     rng = Random.default_rng()
     ps, st = Lux.setup(rng, model)
     

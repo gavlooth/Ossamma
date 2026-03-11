@@ -8,7 +8,7 @@ using Pkg
 Pkg.activate(dirname(@__DIR__))
 
 println("=" ^ 70); flush(stdout)
-println("OSSAMMA LLM Training - Higher Complexity"); flush(stdout)
+println("SWAMMA LLM Training - Higher Complexity"); flush(stdout)
 println("=" ^ 70); flush(stdout)
 
 println("\nLoading packages..."); flush(stdout)
@@ -38,8 +38,8 @@ else
     const GPU_DEVICE = cpu_device()
 end
 
-include(joinpath(dirname(@__DIR__), "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(dirname(@__DIR__), "src", "Swamma.jl"))
+using .Swamma
 
 include(joinpath(dirname(@__DIR__), "src", "DataLoader.jl"))
 using .DataLoader

@@ -25,8 +25,8 @@ using Random
 
 # Import project modules
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma.NER: RAG_LABELS, ENTITY_TYPES, ID_TO_LABEL, LABEL_TO_ID, NUM_LABELS
+using Swamma
+using Swamma.NER: RAG_LABELS, ENTITY_TYPES, ID_TO_LABEL, LABEL_TO_ID, NUM_LABELS
 
 # =============================================================================
 # Configuration
@@ -224,7 +224,7 @@ function export_model(config::ExportConfig)
 
     # Generate metadata
     metadata = Dict(
-        "model_type" => "OssammaNER",
+        "model_type" => "SwammaNER",
         "model_name" => config.model_name,
         "export_version" => EXPORT_VERSION,
         "num_labels" => NUM_LABELS,
@@ -272,7 +272,7 @@ function export_model(config::ExportConfig)
 
     println("\nTo load the exported model:")
     println("  weights = deserialize(\"$(joinpath(config.output_dir, weights_filename))\")")
-    println("  model = OssammaNER(config)")
+    println("  model = SwammaNER(config)")
     println("  # Use weights.params and weights.state for inference")
 
     return config.output_dir

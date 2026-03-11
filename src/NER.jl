@@ -1,9 +1,9 @@
 module NER
 
 """
-Token-level NER using Ossamma architecture.
+Token-level NER using Swamma architecture.
 
-Unlike OssammaClassifier (sequence → single label), OssammaNER outputs
+Unlike SwammaClassifier (sequence → single label), SwammaNER outputs
 a label for each token position (sequence → sequence of labels).
 
 RAG-optimized 9-label schema:
@@ -20,7 +20,7 @@ import CUDA
 using Zygote: @ignore
 
 # Import parent module components
-import ..OssammaNERBlock
+import ..SwammaNERBlock
 import ..TimeConditionedLayerNorm
 import ..LinearChainCRF
 
@@ -73,8 +73,12 @@ Base.@kwdef struct NERConfig
 
     # Attention
     window_size::Int = 5
+    local_operator::Symbol = :swattention
 
-    # Oscillator SSM
+    # Residual path
+    residual_mode::Symbol = :plain
+
+    # Wave Gate (WavePDE)
     min_frequency::Float32 = 0.1f0
     max_frequency::Float32 = 10.0f0
     default_time_step::Float32 = 0.1f0
@@ -110,7 +114,7 @@ Load NER configuration from a TOML file.
 # Example
 ```julia
 config = load_ner_config("configs/ner_production.toml")
-model = OssammaNER(config)
+model = SwammaNER(config)
 ```
 """
 function load_ner_config(path::String)::NERConfig
@@ -118,7 +122,8 @@ function load_ner_config(path::String)::NERConfig
     model = get(toml, "model", Dict())
     dims = get(model, "dimensions", Dict())
     attn = get(model, "attention", Dict())
-    osc = get(model, "oscillator", Dict())
+    residual = get(model, "residual", Dict())
+    osc = get(model, "wave_gate", Dict())
     reg = get(model, "regularization", Dict())
     ablation = get(model, "ablation", Dict())
     parallel = get(toml, "parallelization", Dict())
@@ -138,8 +143,18 @@ function load_ner_config(path::String)::NERConfig
 
         # Attention
         window_size = get(attn, "window_size", 5),
+        local_operator = begin
+            raw = get(attn, "local_operator", "swattention")
+            raw isa Symbol ? raw : Symbol(raw)
+        end,
 
-        # Oscillator SSM
+        # Residual path
+        residual_mode = begin
+            raw = get(residual, "mode", "plain")
+            raw isa Symbol ? raw : Symbol(raw)
+        end,
+
+        # Wave Gate (WavePDE)
         min_frequency = Float32(get(osc, "min_frequency", 0.1)),
         max_frequency = Float32(get(osc, "max_frequency", 10.0)),
         default_time_step = Float32(get(osc, "default_time_step", 0.1)),
@@ -208,18 +223,18 @@ function load_training_config(path::String)
 end
 
 """
-    OssammaNER(config_path::String)
+    SwammaNER(config_path::String)
 
 Create NER model from a TOML configuration file.
 
 # Example
 ```julia
-model = OssammaNER("configs/ner_production.toml")
+model = SwammaNER("configs/ner_production.toml")
 ```
 """
-function OssammaNER(config_path::String)
+function SwammaNER(config_path::String)
     config = load_ner_config(config_path)
-    return OssammaNER(config)
+    return SwammaNER(config)
 end
 
 """
@@ -242,7 +257,7 @@ function estimate_parameters(config::NERConfig)
     pos_emb = S * d
     embeddings = token_emb + pos_emb
 
-    # Per OssammaNERBlock
+    # Per SwammaNERBlock
     time_cond_norm = d * 2 + d_t * d + d_t * d + d_t  # LayerNorm + Scale/Shift/AlphaBias proj
     glu_proj = d * 2d + 2d  # GLU projection
     glu_out_proj = d * d + d
@@ -253,8 +268,8 @@ function estimate_parameters(config::NERConfig)
     lin_attn_time = d_t * (d ÷ h) + d ÷ h
     lin_attn = lin_attn_qkvo + lin_attn_features + lin_attn_time
 
-    # DLinOSS
-    dlinoss = 3 * d_s + d_s * d + d * d_s  # log params + projections
+    # WavePDE (projection-free core): log_wave_speed + log_damping
+    wave_pde = 2 * d_s
 
     # Input gate (no bias)
     input_gate = d * d
@@ -265,7 +280,7 @@ function estimate_parameters(config::NERConfig)
     # Alpha + output norm
     alpha_norm = d + 1 + d * 2
 
-    per_block = time_cond_norm + glu_proj + glu_out_proj + lin_attn + dlinoss + input_gate + sw_attn + alpha_norm
+    per_block = time_cond_norm + glu_proj + glu_out_proj + lin_attn + wave_pde + input_gate + sw_attn + alpha_norm
 
     # Classification head
     class_head = d * 2 + d * n_labels + n_labels  # LayerNorm + Dense
@@ -288,7 +303,7 @@ function print_config_summary(config::NERConfig)
     params_m = params / 1_000_000
 
     println("=" ^ 60)
-    println("OssammaNER Configuration Summary")
+    println("SwammaNER Configuration Summary")
     println("=" ^ 60)
     println("Architecture:")
     println("  vocab_size:           $(config.vocab_size)")
@@ -302,8 +317,10 @@ function print_config_summary(config::NERConfig)
     println("  time_dimension:       $(config.time_dimension)")
     println("  state_dimension:      $(config.state_dimension == -1 ? "$(config.embedding_dimension) (auto)" : config.state_dimension)")
     println("  window_size:          $(config.window_size)")
+    println("  local_operator:       $(config.local_operator)")
+    println("  residual_mode:        $(config.residual_mode)")
     println()
-    println("Oscillator:")
+    println("Wave Gate:")
     println("  min_frequency:        $(config.min_frequency)")
     println("  max_frequency:        $(config.max_frequency)")
     println("  default_time_step:    $(config.default_time_step)")
@@ -346,10 +363,10 @@ function (layer::FixedTimeEmbedding)(batch_size::Int, params, state)
 end
 
 # =============================================================================
-# OssammaNER Model
+# SwammaNER Model
 # =============================================================================
 
-struct OssammaNER{E, P, T, B, D, H, C, BH} <: LuxLayer
+struct SwammaNER{E, P, T, B, D, H, C, BH} <: LuxLayer
     vocab_size::Int
     max_sequence_length::Int
     embedding_dimension::Int
@@ -380,14 +397,14 @@ struct OssammaNER{E, P, T, B, D, H, C, BH} <: LuxLayer
 end
 
 """
-    OssammaNER(config::NERConfig)
+    SwammaNER(config::NERConfig)
 
 Create NER model from configuration.
 """
-function OssammaNER(config::NERConfig)
+function SwammaNER(config::NERConfig)
     state_dimension = config.state_dimension == -1 ? config.embedding_dimension : config.state_dimension
 
-    return OssammaNER(;
+    return SwammaNER(;
         vocab_size = config.vocab_size,
         max_sequence_length = config.max_sequence_length,
         embedding_dimension = config.embedding_dimension,
@@ -397,6 +414,8 @@ function OssammaNER(config::NERConfig)
         time_dimension = config.time_dimension,
         state_dimension = state_dimension,
         window_size = config.window_size, # Pass window_size from config
+        local_operator = config.local_operator,
+        residual_mode = config.residual_mode,
         min_frequency = config.min_frequency,
         max_frequency = config.max_frequency,
         default_time_step = config.default_time_step,
@@ -412,7 +431,7 @@ function OssammaNER(config::NERConfig)
     )
 end
 
-function OssammaNER(;
+function SwammaNER(;
     vocab_size::Int,
     max_sequence_length::Int,
     embedding_dimension::Int,
@@ -422,6 +441,8 @@ function OssammaNER(;
     time_dimension::Int = 64,
     state_dimension::Int = embedding_dimension,
     window_size::Int = 256, # Changed default window size to 256 as per docs/NER_TRAINING_PLAN.md
+    local_operator::Symbol = :swattention,
+    residual_mode::Symbol = :plain,
     min_frequency::Float32 = 0.1f0,
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
@@ -435,15 +456,17 @@ function OssammaNER(;
     use_per_head_alpha::Bool = false,    # Per-head α instead of scalar (+d*h params/layer)
     use_branch_projections::Bool = false, # Full d→d projections per branch (+2d² params/layer)
 )
-    # Build stack of OssammaNERBlocks (with dual gating)
+    # Build stack of SwammaNERBlocks (with dual gating)
     blocks = Tuple([
-        OssammaNERBlock(
+        SwammaNERBlock(
             embedding_dimension,
             max_sequence_length,
             number_of_heads,
             time_dimension;
             state_dimension = state_dimension,
             window_size = window_size,
+            local_operator = local_operator,
+            residual_mode = residual_mode,
             min_frequency = min_frequency,
             max_frequency = max_frequency,
             default_time_step = default_time_step,
@@ -460,7 +483,7 @@ function OssammaNER(;
         for _ in 1:number_of_layers
     ])
 
-    return OssammaNER(
+    return SwammaNER(
         vocab_size,
         max_sequence_length,
         embedding_dimension,
@@ -492,7 +515,7 @@ function OssammaNER(;
     )
 end
 
-function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaNER)
+function Lux.initialparameters(rng::Random.AbstractRNG, model::SwammaNER)
     block_params = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         Tuple(Lux.initialparameters(rng, block) for block in model.Blocks)
     )
@@ -509,7 +532,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaNER)
     )
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaNER)
+function Lux.initialstates(rng::Random.AbstractRNG, model::SwammaNER)
     block_states = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         Tuple(Lux.initialstates(rng, block) for block in model.Blocks)
     )
@@ -530,7 +553,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaNER)
     )
 end
 
-function (model::OssammaNER)(token_ids::AbstractArray, params, state)
+function (model::SwammaNER)(token_ids::AbstractArray, params, state)
     # token_ids: (seq_len,) or (seq_len, batch)
     # Output: ((emissions, boundary_logits), new_state)
 
@@ -568,7 +591,7 @@ function (model::OssammaNER)(token_ids::AbstractArray, params, state)
     time_emb, time_state = model.TimeEmbedding(batch_size, params.TimeEmbedding, state.TimeEmbedding)
 
     # =========================================================================
-    # 5. Process through OssammaBlocks
+    # 5. Process through SwammaBlocks
     # =========================================================================
     (hidden, block_states) = foldl(
         enumerate(model.Blocks);
@@ -651,7 +674,7 @@ function tiny_ner(; vocab_size::Int = 1000, max_sequence_length::Int = 64, kwarg
         time_dimension = 32,
         kwargs...
     )
-    return OssammaNER(config)
+    return SwammaNER(config)
 end
 
 """
@@ -669,7 +692,7 @@ function small_ner(; vocab_size::Int = 32000, max_sequence_length::Int = 256, kw
         time_dimension = 64,
         kwargs...
     )
-    return OssammaNER(config)
+    return SwammaNER(config)
 end
 
 """
@@ -687,7 +710,7 @@ function base_ner(; vocab_size::Int = 32000, max_sequence_length::Int = 512, kwa
         time_dimension = 128,
         kwargs...
     )
-    return OssammaNER(config)
+    return SwammaNER(config)
 end
 
 # =============================================================================
@@ -770,7 +793,7 @@ end
 
 Predict NER labels for a sequence.
 """
-function predict_labels(model::OssammaNER, params, state, token_ids)
+function predict_labels(model::SwammaNER, params, state, token_ids)
     logits, _ = model(token_ids, params, state)
 
     # Get argmax predictions
@@ -845,7 +868,7 @@ end
 # Exports
 # =============================================================================
 
-export OssammaNER, NERConfig
+export SwammaNER, NERConfig
 export tiny_ner, small_ner, base_ner
 export ner_cross_entropy, predict_labels, extract_entities
 export RAG_LABELS, ENTITY_TYPES, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS

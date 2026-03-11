@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-OssammaNER ONNX Export Script
+SwammaNER ONNX Export Script
 
-Converts trained Julia/Lux OssammaNER models to ONNX format for deployment.
+Converts trained Julia/Lux SwammaNER models to ONNX format for deployment.
 
 This script:
-1. Defines the PyTorch equivalent of the OssammaNER architecture
+1. Defines the PyTorch equivalent of the SwammaNER architecture
 2. Loads weights from Julia .jls checkpoint
 3. Exports to ONNX format
 
@@ -117,10 +117,10 @@ def load_julia_checkpoint(path: str) -> dict:
 
         try:
             result = subprocess.run(
-                ['julia', '--project=/root/Ossamma', script_path],
+                ['julia', '--project=/root/Swamma', script_path],
                 capture_output=True,
                 text=True,
-                cwd='/root/Ossamma'
+                cwd='/root/Swamma'
             )
             if result.returncode != 0:
                 print(f"Julia error: {result.stderr}")
@@ -147,26 +147,32 @@ def load_julia_checkpoint(path: str) -> dict:
 # Model Components
 # =============================================================================
 
-class DLinOSS(nn.Module):
-    """Damped Linear Oscillator State Space Model (DLinOSS)"""
+class WavePDELayer(nn.Module):
+    """Spectral damped-wave gate matching the Julia WavePDE layer interface."""
 
     def __init__(self, input_dim: int, state_dim: int, output_dim: int,
                  min_freq: float = 0.1, max_freq: float = 10.0,
-                 default_dt: float = 0.1):
+                 default_dt: float = 0.1, integration_steps: int = 8):
         super().__init__()
         self.input_dim = input_dim
         self.state_dim = state_dim
         self.output_dim = output_dim
 
-        # Learnable parameters (initialized from Julia)
-        self.log_time_step = nn.Parameter(torch.zeros(state_dim))
-        self.log_stiffness = nn.Parameter(torch.linspace(
-            math.log(min_freq), math.log(max_freq), state_dim
-        ))
-        self.log_damping = nn.Parameter(torch.full((state_dim,), math.log(0.01)))
+        if not (input_dim == state_dim == output_dim):
+            raise ValueError(
+                f"WavePDELayer is projection-free and requires input_dim == state_dim == output_dim, "
+                f"got ({input_dim}, {state_dim}, {output_dim})."
+            )
 
-        self.input_proj = nn.Linear(input_dim, state_dim, bias=False)
-        self.output_proj = nn.Linear(state_dim, output_dim, bias=False)
+        self.default_dt = default_dt
+        self.integration_steps = integration_steps
+        m = torch.fft.fftfreq(state_dim, d=1.0) * state_dim
+        lam = 2.0 * (torch.cos(2.0 * math.pi * m / state_dim) - 1.0)
+        self.register_buffer("lambda_vals", lam.float())
+
+        # Match Julia init: softplus(0) ~ 0.693 for c, softplus(-3) ~ 0.049 for gamma.
+        self.log_wave_speed = nn.Parameter(torch.zeros(state_dim))
+        self.log_damping = nn.Parameter(torch.full((state_dim,), -3.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -186,48 +192,34 @@ class DLinOSS(nn.Module):
         D, T, B = x.shape
 
         # Compute physics parameters
-        dt = torch.exp(self.log_time_step)  # (N,)
-        k = torch.exp(self.log_stiffness)   # (N,)
-        c = torch.exp(self.log_damping)     # (N,)
+        c = F.softplus(self.log_wave_speed)
+        gamma = F.softplus(self.log_damping)
+        c_sq = c.square()
+        dt = self.default_dt
 
-        # Physics operators
-        implicit_factor = 1.0 / (1.0 + dt * c)
-        vel_retain = implicit_factor
-        spring_coupling = -dt * k * implicit_factor
-        input_gain = dt * implicit_factor
+        if D != self.state_dim:
+            raise ValueError(f"Expected first axis {self.state_dim}, got {D}.")
 
-        # Project input: (N, T, B)
-        # Transpose to (B, T, D) for linear, then back
-        x_t = x.permute(2, 1, 0)  # (B, T, D)
-        proj_input = self.input_proj(x_t)  # (B, T, N)
-        proj_input = proj_input.permute(2, 1, 0)  # (N, T, B)
+        # Column-batch the PDE solve: (N, T, B) -> (N, T*B)
+        u = x.reshape(self.state_dim, T * B)
+        v = torch.zeros_like(u)
 
-        # Initialize state: velocity and position
-        velocity = torch.zeros(self.state_dim, B, device=x.device, dtype=x.dtype)
-        position = torch.zeros(self.state_dim, B, device=x.device, dtype=x.dtype)
+        c2 = c_sq.unsqueeze(-1)
+        damp = torch.exp(-gamma * dt / 2.0).unsqueeze(-1)
+        lam = self.lambda_vals.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
 
-        # Collect outputs
-        outputs = []
+        for _ in range(self.integration_steps):
+            # Leapfrog + exact damping split
+            va = damp * v
+            Lu = torch.fft.ifft(lam * torch.fft.fft(u, dim=0), dim=0).real
+            vb = va + (dt / 2.0) * (c2 * Lu)
+            u_next = u + dt * vb
+            Lu_next = torch.fft.ifft(lam * torch.fft.fft(u_next, dim=0), dim=0).real
+            vc = vb + (dt / 2.0) * (c2 * Lu_next)
+            v_next = damp * vc
+            u, v = u_next, v_next
 
-        # Sequential scan through time
-        for t in range(T):
-            u_t = proj_input[:, t, :]  # (N, B)
-
-            # Physics update
-            velocity = (vel_retain.unsqueeze(-1) * velocity +
-                       spring_coupling.unsqueeze(-1) * position +
-                       input_gain.unsqueeze(-1) * u_t)
-            position = position + dt.unsqueeze(-1) * velocity
-
-            outputs.append(position)
-
-        # Stack outputs: (N, T, B)
-        state_seq = torch.stack(outputs, dim=1)
-
-        # Output projection: (B, T, N) -> (B, T, D_out)
-        state_seq_t = state_seq.permute(2, 1, 0)  # (B, T, N)
-        output = self.output_proj(state_seq_t)    # (B, T, D_out)
-        output = output.permute(2, 1, 0)          # (D_out, T, B)
+        output = u.reshape(self.state_dim, T, B)
 
         if squeeze_output:
             output = output.squeeze(-1)
@@ -506,8 +498,8 @@ class TimeConditionedLayerNorm(nn.Module):
         return out.permute(2, 1, 0), alpha_bias.permute(1, 0)
 
 
-class OssammaNERBlock(nn.Module):
-    """Single OssammaNER block with dual gating"""
+class SwammaNERBlock(nn.Module):
+    """Single SwammaNER block with dual gating"""
 
     def __init__(self, embedding_dim: int, seq_len: int, num_heads: int, time_dim: int,
                  state_dim: Optional[int] = None, window_size: int = 256,
@@ -523,7 +515,7 @@ class OssammaNERBlock(nn.Module):
         # GLU branch
         self.glu_proj = nn.Linear(embedding_dim, 2 * embedding_dim)
         self.linear_attn = LinearAttentionLayer(embedding_dim, seq_len, num_heads, time_dim)
-        self.oscillator = DLinOSS(embedding_dim, state_dim, embedding_dim)
+        self.wave_gate = WavePDELayer(embedding_dim, state_dim, embedding_dim)
         self.glu_out_proj = nn.Linear(embedding_dim, embedding_dim)
 
         # Local branch
@@ -572,7 +564,7 @@ class OssammaNERBlock(nn.Module):
 
         # Oscillator on gate
         path_b = path_b.permute(2, 1, 0)
-        osc_out = self.oscillator(path_b)
+        osc_out = self.wave_gate(path_b)
 
         # GLU gating
         gated = attn_out * torch.sigmoid(osc_out)
@@ -632,8 +624,8 @@ class FixedTimeEmbedding(nn.Module):
         return self.embedding.unsqueeze(1).expand(-1, batch_size)
 
 
-class OssammaNER(nn.Module):
-    """Full OssammaNER model for ONNX export"""
+class SwammaNER(nn.Module):
+    """Full SwammaNER model for ONNX export"""
 
     def __init__(self, config: dict):
         super().__init__()
@@ -658,7 +650,7 @@ class OssammaNER(nn.Module):
 
         # Encoder blocks
         self.blocks = nn.ModuleList([
-            OssammaNERBlock(
+            SwammaNERBlock(
                 self.embedding_dim, self.max_seq_len, self.num_heads, self.time_dim,
                 self.state_dim, self.window_size, self.dropout_rate,
                 self.use_ffn, self.ffn_expansion
@@ -738,7 +730,7 @@ class OssammaNER(nn.Module):
 # Weight Loading
 # =============================================================================
 
-def load_weights_from_julia(model: OssammaNER, params: dict) -> None:
+def load_weights_from_julia(model: SwammaNER, params: dict) -> None:
     """Load weights from Julia checkpoint into PyTorch model"""
 
     def get_param(key: str) -> Optional[np.ndarray]:
@@ -813,23 +805,14 @@ def load_weights_from_julia(model: OssammaNER, params: dict) -> None:
         set_layer_norm(block.linear_attn.feature_norm, f"{la_prefix}.FeatureNorm")
 
         # Oscillator
-        osc_prefix = f"{prefix}.OscillatorLayer"
-        log_dt = get_param(f"{osc_prefix}.log_time_step")
-        log_k = get_param(f"{osc_prefix}.log_stiffness_coefficients")
-        log_c = get_param(f"{osc_prefix}.log_damping_coefficients")
-        input_proj = get_param(f"{osc_prefix}.input_projection")
-        output_proj = get_param(f"{osc_prefix}.output_projection")
+        osc_prefix = f"{prefix}.WaveGateLayer"
+        log_wave_speed = get_param(f"{osc_prefix}.log_wave_speed")
+        log_damping = get_param(f"{osc_prefix}.log_damping")
 
-        if log_dt is not None:
-            block.oscillator.log_time_step.data.copy_(torch.from_numpy(log_dt))
-        if log_k is not None:
-            block.oscillator.log_stiffness.data.copy_(torch.from_numpy(log_k))
-        if log_c is not None:
-            block.oscillator.log_damping.data.copy_(torch.from_numpy(log_c))
-        if input_proj is not None:
-            block.oscillator.input_proj.weight.data.copy_(torch.from_numpy(input_proj))
-        if output_proj is not None:
-            block.oscillator.output_proj.weight.data.copy_(torch.from_numpy(output_proj))
+        if log_wave_speed is not None:
+            block.oscillator.log_wave_speed.data.copy_(torch.from_numpy(log_wave_speed))
+        if log_damping is not None:
+            block.oscillator.log_damping.data.copy_(torch.from_numpy(log_damping))
 
         # Sliding window attention
         sw_prefix = f"{prefix}.SlidingWindowAttention"
@@ -867,7 +850,7 @@ def load_weights_from_julia(model: OssammaNER, params: dict) -> None:
 # ONNX Export
 # =============================================================================
 
-def export_to_onnx(model: OssammaNER, output_path: str, seq_len: int = 128):
+def export_to_onnx(model: SwammaNER, output_path: str, seq_len: int = 128):
     """Export model to ONNX format"""
     model.eval()
 
@@ -902,7 +885,7 @@ def export_to_onnx(model: OssammaNER, output_path: str, seq_len: int = 128):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Export OssammaNER to ONNX")
+    parser = argparse.ArgumentParser(description="Export SwammaNER to ONNX")
     parser.add_argument("checkpoint", type=Path, help="Path to Julia .jls checkpoint")
     parser.add_argument("output", type=Path, help="Output ONNX path")
     parser.add_argument("--seq-len", type=int, default=128, help="Sequence length for export")
@@ -926,7 +909,7 @@ def main():
 
     # Create model
     print("Creating PyTorch model...")
-    model = OssammaNER(config)
+    model = SwammaNER(config)
 
     # Load weights
     print("Loading weights from checkpoint...")

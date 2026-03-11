@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-OssammaNER Benchmark Script
+SwammaNER Benchmark Script
 
 Tests inference speed and accuracy on sample data.
 """
@@ -11,9 +11,9 @@ using JSON3
 using Statistics
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma: OssammaNER, NERConfig
-using Ossamma.NER: ID_TO_LABEL, LABEL_TO_ID
+using Swamma
+using Swamma: SwammaNER, NERConfig
+using Swamma.NER: ID_TO_LABEL, LABEL_TO_ID
 
 using Lux
 using CUDA
@@ -126,7 +126,7 @@ function load_model()
         ffn_expansion = MODEL_CONFIG.ffn_expansion,
     )
 
-    model = OssammaNER(ner_config)
+    model = SwammaNER(ner_config)
 
     return model, params, state, vocab, id_to_token, MODEL_CONFIG
 end
@@ -325,7 +325,7 @@ end
 
 function main()
     println("="^60)
-    println("OssammaNER Benchmark")
+    println("SwammaNER Benchmark")
     println("="^60)
 
     # Check GPU

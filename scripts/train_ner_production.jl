@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Production training script for OssammaNER 110M parameter model.
+Production training script for SwammaNER 110M parameter model.
 
 Features:
 - Progress bars with ETA
@@ -28,12 +28,12 @@ using LinearAlgebra
 # Enable multi-threaded BLAS for CPU acceleration
 BLAS.set_num_threads(min(64, Threads.nthreads() > 1 ? Threads.nthreads() : 64))
 
-# Load Ossamma modules
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
-using .Ossamma: OssammaNER, NERConfig
-using .Ossamma: ner_cross_entropy, predict_labels, extract_entities
-using .Ossamma: RAG_LABELS, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
+# Load Swamma modules
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
+using .Swamma: SwammaNER, NERConfig
+using .Swamma: ner_cross_entropy, predict_labels, extract_entities
+using .Swamma: RAG_LABELS, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
 
 using Lux
 using LuxCUDA  # GPU support
@@ -509,7 +509,7 @@ function create_110m_model(vocab_size::Int, config::TrainingConfig)
         dropout_rate = config.dropout_rate,
     )
 
-    return OssammaNER(ner_config)
+    return SwammaNER(ner_config)
 end
 
 function count_parameters(params)
@@ -538,7 +538,7 @@ function train_production(;
     use_synthetic::Bool = false,
 )
     println("=" ^ 70)
-    println("OssammaNER 110M Production Training")
+    println("SwammaNER 110M Production Training")
     println("=" ^ 70)
     println("Start time: $(Dates.now())")
     println()
@@ -830,7 +830,7 @@ function main()
             i += 1
         elseif arg == "--help"
             println("""
-OssammaNER 110M Production Training
+SwammaNER 110M Production Training
 
 Usage:
     julia --project=. scripts/train_ner_production.jl [OPTIONS]

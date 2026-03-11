@@ -1,22 +1,22 @@
 #!/usr/bin/env julia
-"""Test the trained OssammaNER model"""
+"""Test the trained SwammaNER model"""
 
 using Random
 using Serialization
 using Printf
 using JSON3
 
-# Load Ossamma with full dependencies
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
-using .Ossamma: OssammaNER, NERConfig, ID_TO_LABEL, LABEL_TO_ID
+# Load Swamma with full dependencies
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
+using .Swamma: SwammaNER, NERConfig, ID_TO_LABEL, LABEL_TO_ID
 
 using Lux
 using LuxCUDA
 using CUDA
 
 println("=" ^ 60)
-println("OssammaNER Model Testing")
+println("SwammaNER Model Testing")
 println("=" ^ 60)
 
 # Load vocab separately
@@ -53,7 +53,7 @@ ner_config = NERConfig(
     window_size = config.window_size,
     dropout_rate = 0.0f0,  # No dropout for inference
 )
-model = OssammaNER(ner_config)
+model = SwammaNER(ner_config)
 
 # Get parameters - they should already be on CPU from checkpoint save
 params = checkpoint[:params]

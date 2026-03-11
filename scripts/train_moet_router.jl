@@ -6,10 +6,10 @@ Minimal MoET router training on synthetic token categories.
 using Random
 using Printf
 
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
-using .Ossamma: MoETConfig, MoETModel
-using .Ossamma: heuristic_labels_batch, router_loss, router_metrics
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
+using .Swamma: MoETConfig, MoETModel
+using .Swamma: heuristic_labels_batch, router_loss, router_metrics
 
 using Lux
 using Optimisers

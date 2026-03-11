@@ -1,5 +1,5 @@
 #!/bin/bash
-# OssammaNER Training Status Monitor
+# SwammaNER Training Status Monitor
 # Usage: ./scripts/training_status.sh [--watch]
 
 # Colors
@@ -21,9 +21,9 @@ show_status() {
     GPU_TEMP=$(echo "$GPU_STATS" | cut -d',' -f4 | tr -d ' ')
 
     # Find training output file
-    OUTPUT_FILE=$(ls -t /tmp/claude/-root-Ossamma/tasks/*.output 2>/dev/null | head -1)
+    OUTPUT_FILE=$(ls -t /tmp/claude/-root-Swamma/tasks/*.output 2>/dev/null | head -1)
     if [ -z "$OUTPUT_FILE" ]; then
-        OUTPUT_FILE="/root/Ossamma/training.log"
+        OUTPUT_FILE="/root/Swamma/training.log"
     fi
 
     # Get latest training stats
@@ -81,7 +81,7 @@ show_status() {
 
     # Display
     echo -e "${CYAN}╔════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}          ${BLUE}OSSAMMANER TRAINING STATUS${NC}     $(date '+%Y-%m-%d %H:%M:%S')      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}          ${BLUE}SWAMMANER TRAINING STATUS${NC}     $(date '+%Y-%m-%d %H:%M:%S')      ${CYAN}║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  Status: $STATUS                                                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  Step: ${GREEN}${STEP}${NC} / ${TOTAL_STEPS}  (${PROGRESS}%)                                      ${CYAN}║${NC}"

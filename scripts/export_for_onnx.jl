@@ -11,10 +11,10 @@ using Lux
 using CUDA
 using LuxCUDA
 
-# Load Ossamma
+# Load Swamma
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma.NER: NERConfig, load_ner_config
+using Swamma
+using Swamma.NER: NERConfig, load_ner_config
 
 # Include the training script's TrainingConfig (must match the one used for saving)
 # We'll extract just the struct definition

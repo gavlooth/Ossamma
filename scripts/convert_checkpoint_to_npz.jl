@@ -17,10 +17,10 @@ catch
     # CUDA not available, that's fine
 end
 
-# Load Ossamma module (needed to deserialize TrainingConfig, etc.)
+# Load Swamma module (needed to deserialize TrainingConfig, etc.)
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma.Training: TrainingConfig
+using Swamma
+using Swamma.Training: TrainingConfig
 
 function flatten_params(params, prefix="")
     result = Dict{String, Any}()

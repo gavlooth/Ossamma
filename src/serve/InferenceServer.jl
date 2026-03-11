@@ -45,7 +45,7 @@ end
 
 mutable struct NERServer
     config::ServerConfig
-    model::Any           # OssammaNER model
+    model::Any           # SwammaNER model
     params::NamedTuple   # Model parameters
     state::NamedTuple    # Model state
     vocab::Any           # Vocabulary
@@ -76,7 +76,7 @@ function load_server(config::ServerConfig)
     end
 
     # Get label mappings from the NER module
-    # These are defined in the parent Ossamma module
+    # These are defined in the parent Swamma module
     id_to_label = Dict{Int, String}()
     label_to_id = Dict{String, Int}()
 
@@ -114,10 +114,10 @@ function load_server(config::ServerConfig)
     println("  Labels: $(length(id_to_label))")
 
     # Note: model is set to nothing here - in production you'd load the actual model
-    # The full implementation requires the Ossamma module to be loaded
+    # The full implementation requires the Swamma module to be loaded
     return NERServer(
         config,
-        nothing,  # model - would be OssammaNER instance
+        nothing,  # model - would be SwammaNER instance
         params,
         state,
         vocab,
@@ -306,7 +306,7 @@ Model info handler.
 """
 function handle_info(server::NERServer, req::HTTP.Request)
     response = Dict(
-        "model_type" => "OssammaNER",
+        "model_type" => "SwammaNER",
         "num_labels" => length(server.id_to_label),
         "max_sequence_length" => server.config.max_sequence_length,
         "labels" => collect(values(server.id_to_label)),

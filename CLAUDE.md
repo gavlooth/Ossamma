@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## DIRECTIVE: Autonomous GPU Training Mode
 
-**PRIMARY OBJECTIVE**: Train OssammaNER model autonomously on GPU (RTX 5090 32GB).
+**PRIMARY OBJECTIVE**: Train SwammaNER model autonomously on GPU (RTX 5090 32GB).
 
 ### Training Commands
 ```bash
@@ -26,7 +26,7 @@ nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noh
 5. Report progress periodically without stopping training
 
 ### Current Training Target
-- **Model**: OssammaNER (~15M parameters)
+- **Model**: SwammaNER (~15M parameters)
 - **Task**: Named Entity Recognition (19 labels)
 - **Steps**: 50,000 total
 - **Expected Loss**: Start ~2.94, converge to <1.0

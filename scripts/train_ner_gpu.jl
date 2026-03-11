@@ -13,8 +13,8 @@ using Printf
 using Dates
 
 # Load the main module
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
 
 using Lux
 using NNlib
@@ -142,7 +142,7 @@ end
 
 function main()
     println("=" ^ 60)
-    println("OssammaNER GPU Training")
+    println("SwammaNER GPU Training")
     println("=" ^ 60)
     println("Backend: ", GPU_BACKEND)
     println("Time: ", Dates.now())
@@ -170,7 +170,7 @@ function main()
     # Create model
     # =========================================================================
     println("\n[1/5] Creating model...")
-    model = OssammaNER(config)
+    model = SwammaNER(config)
 
     rng = Random.default_rng()
     Random.seed!(rng, 42)

@@ -4,7 +4,7 @@ High-parameter training script for LLaDA on Google Colab L4 GPU.
 """
 
 using Pkg
-Pkg.activate("/content/Ossamma")
+Pkg.activate("/content/Swamma")
 
 # ============================================================================
 # Configuration - HIGH PARAMETERS for L4 GPU (23GB VRAM)
@@ -31,7 +31,7 @@ const CONFIG = (
 
     # Output
     save_checkpoints = true,
-    checkpoint_dir = "/content/Ossamma/checkpoints",
+    checkpoint_dir = "/content/Swamma/checkpoints",
 )
 
 # ============================================================================
@@ -53,14 +53,14 @@ else
 end
 println()
 
-# Load the Ossamma package (this includes LLaDA, Training, etc.)
-using Ossamma
+# Load the Swamma package (this includes LLaDA, Training, etc.)
+using Swamma
 using Random
 using Optimisers
 using Lux
 
 # We still need DataLoader separately since it's not exported fully
-include("/content/Ossamma/src/DataLoader.jl")
+include("/content/Swamma/src/DataLoader.jl")
 using .DataLoader
 
 # Set random seed

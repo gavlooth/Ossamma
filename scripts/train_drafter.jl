@@ -1,7 +1,7 @@
 #!/usr/bin/env julia
-# train_drafter.jl - Training script for OssammaDrafter
+# train_drafter.jl - Training script for SwammaDrafter
 #
-# This script trains the Ossamma drafter model for TiDAR-style generation.
+# This script trains the Swamma drafter model for TiDAR-style generation.
 # The drafter learns to predict masked tokens, optionally with distillation
 # from a teacher AR model (e.g., Granite 4.0).
 #
@@ -15,7 +15,7 @@ using Printf
 using Random
 using Statistics
 
-using Ossamma
+using Swamma
 using Lux
 using Optimisers
 using Zygote
@@ -25,7 +25,7 @@ using Zygote
 # =============================================================================
 
 function parse_commandline()
-    s = ArgParseSettings(description="Train OssammaDrafter model")
+    s = ArgParseSettings(description="Train SwammaDrafter model")
 
     @add_arg_table! s begin
         "--config"
@@ -268,7 +268,7 @@ function main()
     rng = Random.default_rng()
 
     println("=" ^ 60)
-    println("OssammaDrafter Training")
+    println("SwammaDrafter Training")
     println("=" ^ 60)
 
     # Load model config
@@ -281,7 +281,7 @@ function main()
 
     # Create model
     println("\nCreating model...")
-    model = OssammaDrafter(model_config)
+    model = SwammaDrafter(model_config)
 
     # Initialize or resume
     if !isempty(args["resume"]) && isfile(args["resume"])

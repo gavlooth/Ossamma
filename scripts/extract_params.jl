@@ -13,8 +13,8 @@ using JSON3
 
 # Load project modules to get TrainingConfig and other types
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma.Training: TrainingConfig
+using Swamma
+using Swamma.Training: TrainingConfig
 
 # Define a function to recursively extract arrays
 function extract_arrays(data, prefix="")

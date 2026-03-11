@@ -8,7 +8,7 @@ using Pkg
 Pkg.activate(dirname(@__DIR__))
 
 println("=" ^ 70); flush(stdout)
-println("OSSAMMA Fast Training"); flush(stdout)
+println("SWAMMA Fast Training"); flush(stdout)
 println("=" ^ 70); flush(stdout)
 
 println("\nLoading packages..."); flush(stdout)
@@ -20,8 +20,8 @@ using Statistics: mean
 using Serialization
 using NNlib: logsoftmax
 
-include(joinpath(dirname(@__DIR__), "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(dirname(@__DIR__), "src", "Swamma.jl"))
+using .Swamma
 
 include(joinpath(dirname(@__DIR__), "src", "DataLoader.jl"))
 using .DataLoader

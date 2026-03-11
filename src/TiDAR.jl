@@ -3,11 +3,11 @@ module TiDAR
 """
 TiDAR - Token-level Iterative Drafting with AR Refinement
 
-This module implements speculative decoding with OssammaDrafter and
+This module implements speculative decoding with SwammaDrafter and
 an AR verifier (Granite 3B, Qwen3, Llama3).
 
 Architecture:
-1. Drafter: Deep Ossamma model predicts K tokens in parallel (diffusion-style)
+1. Drafter: Deep Swamma model predicts K tokens in parallel (diffusion-style)
 2. Verifier: AR model (Granite 3B) validates/rejects predictions
 3. Accept: Tokens that match verifier's top prediction
 4. Reject: Re-draft from first rejection point
@@ -28,8 +28,7 @@ import TOML
 # Import from parent module
 import ..TimeConditionedLayerNorm
 import ..LinearAttentionLayer
-import ..DLinOSS
-import ..DLinOSSParallel
+import ..WavePDELayer
 import ..SwiGLU
 
 # Import deep scaling utilities
@@ -66,7 +65,7 @@ const GRANITE_3B_MASK_TOKEN_ID = GRANITE_MASK_TOKEN_ID
 const GRANITE_3B_PAD_TOKEN_ID = GRANITE_PAD_TOKEN_ID
 const GRANITE_3B_EOS_TOKEN_ID = GRANITE_EOS_TOKEN_ID
 
-export OssammaDrafterDeep, TiDARConfig
+export SwammaDrafterDeep, TiDARConfig
 export granite_2b_drafter_config, granite_3b_drafter_config, granite_4_3b_drafter_config, granite_8b_drafter_config
 export granite_drafter_deep_config
 export GRANITE_VOCAB_SIZE, GRANITE_MASK_TOKEN_ID, GRANITE_4_VOCAB_SIZE, GRANITE_4_MASK_TOKEN_ID
@@ -77,7 +76,7 @@ export GRANITE_3B_VOCAB_SIZE, GRANITE_3B_MASK_TOKEN_ID  # Legacy
 # =============================================================================
 
 """
-    OssammaDrafterBlockDeep
+    SwammaDrafterBlockDeep
 
 Deep-optimized drafter block with:
 - Hierarchical frequency ranges
@@ -87,7 +86,7 @@ Deep-optimized drafter block with:
 
 This is the building block for TiDAR drafters.
 """
-struct OssammaDrafterBlockDeep <: LuxCore.AbstractLuxLayer
+struct SwammaDrafterBlockDeep <: LuxCore.AbstractLuxLayer
     # Dimensions
     embedding_dimension::Int
     sequence_length::Int
@@ -113,13 +112,13 @@ struct OssammaDrafterBlockDeep <: LuxCore.AbstractLuxLayer
     InputNorm::TimeConditionedLayerNorm
     GluProjection::Lux.Dense
     LinearAttention::LinearAttentionLayer
-    OscillatorLayer::DLinOSSParallel  # Always parallel for TiDAR
+    WaveGateLayer::WavePDELayer
     Dropout::LuxCore.AbstractLuxLayer
     FFN::Union{SwiGLU, Nothing}
     OutputNorm::Lux.LayerNorm
 end
 
-function OssammaDrafterBlockDeep(
+function SwammaDrafterBlockDeep(
     embedding_dimension::Int,
     sequence_length::Int,
     number_of_heads::Int,
@@ -140,14 +139,13 @@ function OssammaDrafterBlockDeep(
     # Compute layer-specific frequencies
     min_freq, max_freq = compute_layer_frequencies(layer_idx, total_layers, freq_config)
 
-    # Always use parallel scan for TiDAR (speed is critical)
-    oscillator = DLinOSSParallel(
+    # WavePDE is the structured gate path used by TiDAR.
+    oscillator = WavePDELayer(
         embedding_dimension, state_dimension, embedding_dimension,
-        min_freq, max_freq, 0.1f0;
-        chunk_size = parallel_chunk_size
+        min_freq, max_freq, 0.1f0,
     )
 
-    return OssammaDrafterBlockDeep(
+    return SwammaDrafterBlockDeep(
         embedding_dimension,
         sequence_length,
         number_of_heads,
@@ -174,7 +172,7 @@ function OssammaDrafterBlockDeep(
     )
 end
 
-function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaDrafterBlockDeep)
+function Lux.initialparameters(rng::Random.AbstractRNG, block::SwammaDrafterBlockDeep)
     ffn_params = if block.use_ffn && block.FFN !== nothing
         Lux.initialparameters(rng, block.FFN)
     else
@@ -185,7 +183,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaDrafterBlo
         InputNorm = Lux.initialparameters(rng, block.InputNorm),
         GluProjection = Lux.initialparameters(rng, block.GluProjection),
         LinearAttention = Lux.initialparameters(rng, block.LinearAttention),
-        OscillatorLayer = Lux.initialparameters(rng, block.OscillatorLayer),
+        WaveGateLayer = Lux.initialparameters(rng, block.WaveGateLayer),
         Dropout = Lux.initialparameters(rng, block.Dropout),
         FFN = ffn_params,
         OutputNorm = Lux.initialparameters(rng, block.OutputNorm),
@@ -204,7 +202,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaDrafterBlo
     return params
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaDrafterBlockDeep)
+function Lux.initialstates(rng::Random.AbstractRNG, block::SwammaDrafterBlockDeep)
     ffn_state = if block.use_ffn && block.FFN !== nothing
         Lux.initialstates(rng, block.FFN)
     else
@@ -215,7 +213,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaDrafterBlockDe
         InputNorm = Lux.initialstates(rng, block.InputNorm),
         GluProjection = Lux.initialstates(rng, block.GluProjection),
         LinearAttention = Lux.initialstates(rng, block.LinearAttention),
-        OscillatorLayer = Lux.initialstates(rng, block.OscillatorLayer),
+        WaveGateLayer = Lux.initialstates(rng, block.WaveGateLayer),
         Dropout = Lux.initialstates(rng, block.Dropout),
         FFN = ffn_state,
         OutputNorm = Lux.initialstates(rng, block.OutputNorm),
@@ -223,7 +221,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaDrafterBlockDe
     )
 end
 
-function (block::OssammaDrafterBlockDeep)(inputs::Tuple, params, state)
+function (block::SwammaDrafterBlockDeep)(inputs::Tuple, params, state)
     input_tensor, time_input = inputs
     training = get(state, :training, true)
 
@@ -259,9 +257,9 @@ function (block::OssammaDrafterBlockDeep)(inputs::Tuple, params, state)
         (path_a, time_input), params.LinearAttention, state.LinearAttention
     )
 
-    # Oscillator SSM (temporal memory)
-    osc_out, osc_state = block.OscillatorLayer(
-        path_b, params.OscillatorLayer, state.OscillatorLayer
+    # Wave Gate (WavePDE temporal memory)
+    osc_out, osc_state = block.WaveGateLayer(
+        path_b, params.WaveGateLayer, state.WaveGateLayer
     )
 
     # GLU gating
@@ -294,7 +292,7 @@ function (block::OssammaDrafterBlockDeep)(inputs::Tuple, params, state)
         InputNorm = norm_state,
         GluProjection = glu_proj_state,
         LinearAttention = lin_attn_state,
-        OscillatorLayer = osc_state,
+        WaveGateLayer = osc_state,
         Dropout = dropout_state,
         FFN = ffn_state,
         OutputNorm = output_norm_state,
@@ -390,17 +388,17 @@ function (layer::TimeMLPEmbedding)(t, params, state)
 end
 
 # =============================================================================
-# OssammaDrafterDeep - Full Deep Drafter Model for TiDAR
+# SwammaDrafterDeep - Full Deep Drafter Model for TiDAR
 # =============================================================================
 
 """
-    OssammaDrafterDeep
+    SwammaDrafterDeep
 
-Deep Ossamma drafter model optimized for TiDAR speculative decoding.
+Deep Swamma drafter model optimized for TiDAR speculative decoding.
 
 Features:
 - 48-96 layers (leveraging O(T) complexity)
-- Hierarchical oscillator frequencies
+- Hierarchical wave-gate frequencies
 - Layer scale + stochastic depth
 - Parallel scan (mandatory)
 - Matches Granite 3B vocabulary
@@ -413,7 +411,7 @@ TokenEmbedding + PositionEmbedding
     ↓
 TimeEmbedding(t) → time_emb
     ↓
-N × OssammaDrafterBlockDeep(hidden, time_emb)
+N × SwammaDrafterBlockDeep(hidden, time_emb)
     ↓
 Final LayerNorm
     ↓
@@ -422,7 +420,7 @@ LM Head (d → vocab_size)
 logits
 ```
 """
-struct OssammaDrafterDeep{E,P,T,N,L} <: LuxCore.AbstractLuxLayer
+struct SwammaDrafterDeep{E,P,T,N,L} <: LuxCore.AbstractLuxLayer
     # Configuration
     vocab_size::Int
     max_sequence_length::Int
@@ -436,7 +434,7 @@ struct OssammaDrafterDeep{E,P,T,N,L} <: LuxCore.AbstractLuxLayer
     TokenEmbedding::E
     PositionEmbedding::P
     TimeEmbedding::T
-    Blocks::Vector{OssammaDrafterBlockDeep}
+    Blocks::Vector{SwammaDrafterBlockDeep}
     FinalNorm::N
     LMHead::L
 end
@@ -645,14 +643,14 @@ end
 granite_3b_drafter_deep_config(; kwargs...) = granite_drafter_deep_config(; ar_model="granite_3b", kwargs...)
 
 """
-    OssammaDrafterDeep(config::TiDARConfig)
+    SwammaDrafterDeep(config::TiDARConfig)
 
-Create an OssammaDrafterDeep from a TiDARConfig.
+Create an SwammaDrafterDeep from a TiDARConfig.
 """
-function OssammaDrafterDeep(config::TiDARConfig)
+function SwammaDrafterDeep(config::TiDARConfig)
     # Create deep blocks
     blocks = [
-        OssammaDrafterBlockDeep(
+        SwammaDrafterBlockDeep(
             config.embedding_dimension,
             config.max_sequence_length,
             config.number_of_heads,
@@ -673,7 +671,7 @@ function OssammaDrafterDeep(config::TiDARConfig)
 
     actual_vocab_size = max(config.vocab_size, config.mask_token_id)
 
-    return OssammaDrafterDeep(
+    return SwammaDrafterDeep(
         actual_vocab_size,
         config.max_sequence_length,
         config.embedding_dimension,
@@ -691,7 +689,7 @@ function OssammaDrafterDeep(config::TiDARConfig)
     )
 end
 
-function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaDrafterDeep)
+function Lux.initialparameters(rng::Random.AbstractRNG, model::SwammaDrafterDeep)
     block_params = [Lux.initialparameters(rng, block) for block in model.Blocks]
 
     return (
@@ -704,7 +702,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaDrafterDee
     )
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaDrafterDeep)
+function Lux.initialstates(rng::Random.AbstractRNG, model::SwammaDrafterDeep)
     block_states = [Lux.initialstates(rng, block) for block in model.Blocks]
 
     return (
@@ -718,7 +716,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaDrafterDeep)
 end
 
 """
-    (model::OssammaDrafterDeep)(token_ids, t, params, state)
+    (model::SwammaDrafterDeep)(token_ids, t, params, state)
 
 Forward pass of the deep drafter.
 
@@ -732,7 +730,7 @@ Forward pass of the deep drafter.
 - `logits`: (vocab_size, seq_len, batch) - predictions for all positions
 - `new_state`: Updated state
 """
-function (model::OssammaDrafterDeep)(token_ids, t, params, state)
+function (model::SwammaDrafterDeep)(token_ids, t, params, state)
     # Handle input dimensions
     if ndims(token_ids) == 1
         token_ids = reshape(token_ids, :, 1)
@@ -828,7 +826,7 @@ Uses diffusion-style parallel prediction:
 - `draft_logits`: (vocab, draft_length) - logits for drafted tokens
 """
 function draft_tokens(
-    model::OssammaDrafterDeep,
+    model::SwammaDrafterDeep,
     prefix_ids::AbstractVector{<:Integer},
     draft_length::Int,
     params,
@@ -1006,7 +1004,7 @@ end
 One step of TiDAR generation.
 
 # Arguments
-- `drafter`: OssammaDrafterDeep model
+- `drafter`: SwammaDrafterDeep model
 - `drafter_params`: Drafter parameters
 - `drafter_state`: Drafter state
 - `verifier_fn`: Function (token_ids[, verifier_state]) -> logits or (logits, verifier_state)
@@ -1027,7 +1025,7 @@ One step of TiDAR generation.
 - `new_drafter_state`: Updated drafter state
 """
 function tidar_generate_step(
-    drafter::OssammaDrafterDeep,
+    drafter::SwammaDrafterDeep,
     drafter_params,
     drafter_state,
     verifier_fn::Function,
@@ -1094,7 +1092,7 @@ end
 One step of TiDAR generation with a verifier cache/state.
 
 # Arguments
-- `drafter`: OssammaDrafterDeep model
+- `drafter`: SwammaDrafterDeep model
 - `drafter_params`: Drafter parameters
 - `drafter_state`: Drafter state
 - `verifier_fn`: Function (token_ids[, verifier_state]) -> logits or (logits, verifier_state)
@@ -1117,7 +1115,7 @@ One step of TiDAR generation with a verifier cache/state.
 - `new_verifier_state`: Updated verifier cache/state
 """
 function tidar_generate_step_cached(
-    drafter::OssammaDrafterDeep,
+    drafter::SwammaDrafterDeep,
     drafter_params,
     drafter_state,
     verifier_fn::Function,
@@ -1198,10 +1196,10 @@ function estimate_drafter_params(config::TiDARConfig)
     pos_emb = S * d
     time_emb = t_dim * d + d * d + d * d
 
-    # Per block (GLU + LinearAttn + DLinOSS + FFN)
+    # Per block (GLU + LinearAttn + WavePDE + FFN)
     per_block = 2 * d * d +  # GLU projection
                 4 * d * d +  # LinearAttn (Q, K, V, O)
-                d * d +      # DLinOSS projections
+                2 * d +      # WavePDE log params (projection-free)
                 round(Int, d * config.ffn_expansion * 2) * d  # SwiGLU
 
     blocks_total = per_block * L
@@ -1267,7 +1265,7 @@ function print_tidar_config(config::TiDARConfig)
     println("Complexity Advantage (vs Transformer):")
     println("  Sequence length T = $(T)")
     println("  Transformer: O(T² × d) = O($(T^2 * d / 1e9) B)")
-    println("  Ossamma:     O(T × d²) = O($(T * d^2 / 1e9) B)")
+    println("  Swamma:     O(T × d²) = O($(T * d^2 / 1e9) B)")
     println("  Ratio: $(round(T / d, digits=1))× more layers possible")
     println("=" ^ 70)
 end

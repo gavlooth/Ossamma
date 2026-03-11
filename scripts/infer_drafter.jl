@@ -17,7 +17,7 @@ using Printf
 using Random
 using Statistics
 
-using Ossamma
+using Swamma
 using Lux
 using NNlib
 
@@ -26,7 +26,7 @@ using NNlib
 # =============================================================================
 
 function parse_commandline()
-    s = ArgParseSettings(description="TiDAR-style inference with OssammaDrafter")
+    s = ArgParseSettings(description="TiDAR-style inference with SwammaDrafter")
 
     @add_arg_table! s begin
         "--checkpoint"
@@ -353,7 +353,7 @@ function main()
     rng = Random.default_rng()
 
     println("=" ^ 60)
-    println("TiDAR Inference with OssammaDrafter")
+    println("TiDAR Inference with SwammaDrafter")
     println("=" ^ 60)
 
     # Load checkpoint
@@ -368,7 +368,7 @@ function main()
     println("  Step: $(checkpoint.step)")
 
     # Create model
-    model = OssammaDrafter(model_config)
+    model = SwammaDrafter(model_config)
 
     # Encode prompt
     prompt = args["prompt"]

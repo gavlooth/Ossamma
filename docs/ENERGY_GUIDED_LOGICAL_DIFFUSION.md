@@ -1,6 +1,6 @@
 # Energy-Guided Diffusion for Logical Thought Generation
 
-> Research notes on embedding "Laws of Thought" into the OssammaDrafter diffusion process.
+> Research notes on embedding "Laws of Thought" into the SwammaDrafter diffusion process.
 
 ## Table of Contents
 
@@ -21,7 +21,7 @@
 
 ## Motivation
 
-The OssammaDrafter generates "thought tokens" via diffusion - these are internal reasoning steps before producing the final output. We want these thoughts to follow logical structure, not just be coherent text, but **valid reasoning chains**.
+The SwammaDrafter generates "thought tokens" via diffusion - these are internal reasoning steps before producing the final output. We want these thoughts to follow logical structure, not just be coherent text, but **valid reasoning chains**.
 
 ### Why Logic Matters for Thought Tokens
 
@@ -75,7 +75,7 @@ Each sentence is well-formed, but Thought 3 contradicts the logical chain.
 
 ### Standard Diffusion Recap
 
-In discrete diffusion (like LLaDA/MDLM that OssammaDrafter uses):
+In discrete diffusion (like LLaDA/MDLM that SwammaDrafter uses):
 
 ```
 Forward process:  x_0 → x_1 → ... → x_T  (gradually add noise/masks)
@@ -227,7 +227,7 @@ end
 
 ```julia
 struct DrafterWithEnergyHead
-    backbone::OssammaDrafter      # Main model
+    backbone::SwammaDrafter      # Main model
     energy_head::Chain            # Small MLP: hidden_dim → 1
 end
 
@@ -429,7 +429,7 @@ end
 
 ```julia
 struct LogicalDrafter
-    drafter::OssammaDrafter
+    drafter::SwammaDrafter
     energy_head::Chain
 end
 
@@ -1822,10 +1822,10 @@ end
 
 **Goal**: Get basic energy-guided diffusion working
 
-1. **Add energy head to OssammaDrafter**
+1. **Add energy head to SwammaDrafter**
    ```julia
    # Modify src/Drafter.jl
-   struct OssammaDrafter
+   struct SwammaDrafter
        ...
        energy_head::Chain  # NEW
    end
@@ -1949,7 +1949,7 @@ end
 
 ## Status
 
-- [ ] Add energy head to OssammaDrafter
+- [ ] Add energy head to SwammaDrafter
 - [ ] Implement entailment energy with NLI model
 - [ ] Implement contradiction detector
 - [ ] Training with energy auxiliary loss

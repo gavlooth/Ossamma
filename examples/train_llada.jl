@@ -15,8 +15,8 @@ using Random
 using Optimisers
 
 # Load our module
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
 
 # ============================================================================
 # Synthetic Data Generator (for demonstration)

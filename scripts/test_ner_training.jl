@@ -14,8 +14,8 @@ using Statistics
 using Printf
 
 # Load the main module
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
 
 using Lux
 using Optimisers
@@ -38,7 +38,7 @@ end
 
 function main()
     println("=" ^ 60)
-    println("OssammaNER Training Test")
+    println("SwammaNER Training Test")
     println("=" ^ 60)
 
     # =========================================================================
@@ -58,7 +58,7 @@ function main()
     # 2. Create model
     # =========================================================================
     println("\n[2/6] Creating model...")
-    model = OssammaNER(config)
+    model = SwammaNER(config)
 
     rng = Random.default_rng()
     Random.seed!(rng, 42)

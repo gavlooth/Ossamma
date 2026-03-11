@@ -15,8 +15,8 @@ using Optimisers
 using Statistics: mean
 using Serialization
 
-include(joinpath(dirname(@__DIR__), "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(dirname(@__DIR__), "src", "Swamma.jl"))
+using .Swamma
 
 include(joinpath(dirname(@__DIR__), "src", "DataLoader.jl"))
 using .DataLoader
@@ -40,7 +40,7 @@ const CONFIG = (
 )
 
 println("=" ^ 70); flush(stdout)
-println("OSSAMMA Extended Training"); flush(stdout)
+println("SWAMMA Extended Training"); flush(stdout)
 println("=" ^ 70); flush(stdout)
 println("Config: $(CONFIG.num_epochs) epochs, batch=$(CONFIG.batch_size), seq=$(CONFIG.seq_length)"); flush(stdout)
 

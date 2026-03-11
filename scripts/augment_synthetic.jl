@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Synthetic Data Augmentation Script for OssammaNER.
+Synthetic Data Augmentation Script for SwammaNER.
 
 1. "Pumps up" specific categories (like WORK) using templates + word lists.
 2. Adds "Robustness" by generating lowercased/noisy versions of existing data.

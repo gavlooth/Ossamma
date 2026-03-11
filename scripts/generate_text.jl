@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Text generation script for Ossamma LLaDA model.
+Text generation script for Swamma LLaDA model.
 Trains on Gutenberg data and generates text samples.
 """
 
@@ -14,8 +14,8 @@ using Zygote
 using Optimisers
 using Statistics: mean
 
-include(joinpath(dirname(@__DIR__), "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(dirname(@__DIR__), "src", "Swamma.jl"))
+using .Swamma
 
 include(joinpath(dirname(@__DIR__), "src", "DataLoader.jl"))
 using .DataLoader
@@ -27,7 +27,7 @@ const TRAIN_STEPS = 1000  # More steps for better generation
 const WARMUP_STEPS = 100
 
 println("=" ^ 60)
-println("Ossamma Text Generation")
+println("Swamma Text Generation")
 println("=" ^ 60)
 
 # Load data

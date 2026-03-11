@@ -1,18 +1,18 @@
 module DeepScaling
 
 """
-DeepScaling - Strategies for training very deep Ossamma models (48-96+ layers).
+DeepScaling - Strategies for training very deep Swamma models (48-96+ layers).
 
 This module implements:
-1. Hierarchical frequency ranges - different oscillator frequencies per layer
+1. Hierarchical frequency ranges - different wave-gate frequencies per layer
 2. Layer scale initialization - stabilize deep networks
 3. Stochastic depth - regularization via random layer dropping
 4. Gradient checkpointing - memory-efficient training
-5. OssammaBlockDeep - deep-optimized block variant
+5. SwammaBlockDeep - deep-optimized block variant
 6. Mixed attention builders - allocate attention budget wisely
 7. Deep model configurations
 
-Key insight: Ossamma's O(T) complexity (vs Transformer's O(T²)) allows
+Key insight: Swamma's O(T) complexity (vs Transformer's O(T²)) allows
 4-8× more layers for the same compute budget.
 
 Reference: docs/DEPTH_SCALING_STRATEGY.md
@@ -27,8 +27,7 @@ using Statistics: mean
 # Import parent module types (will be set when included)
 import ..TimeConditionedLayerNorm
 import ..LinearAttentionLayer
-import ..DLinOSS
-import ..DLinOSSParallel
+import ..WavePDELayer
 import ..SwiGLU
 import ..SWAttention
 import ..RMSNorm
@@ -36,7 +35,7 @@ import ..RMSNorm
 export HierarchicalFrequencyConfig, compute_layer_frequencies
 export LayerScaleConfig, apply_layer_scale
 export StochasticDepthConfig, should_drop_layer
-export OssammaBlockDeep
+export SwammaBlockDeep
 export DeepModelConfig, create_deep_blocks
 export deep_48L_config, ultra_96L_config, long_context_config
 
@@ -47,7 +46,7 @@ export deep_48L_config, ultra_96L_config, long_context_config
 """
     HierarchicalFrequencyConfig
 
-Configuration for layer-dependent oscillator frequency ranges.
+Configuration for layer-dependent wave-gate frequency ranges.
 
 The intuition:
 - Early layers (high freq): Capture local syntax, adjacent word patterns
@@ -337,24 +336,24 @@ end
 # which is integrated at the training loop level, not here.
 
 # =============================================================================
-# 5. DEEP OSSAMMA BLOCK
+# 5. DEEP SWAMMA BLOCK
 # =============================================================================
 
 """
-    OssammaBlockDeep
+    SwammaBlockDeep
 
-A deep-network optimized variant of OssammaBlock with:
+A deep-network optimized variant of SwammaBlock with:
 - Layer scale initialization
 - Stochastic depth support
 - Hierarchical frequency configuration
 - Optional block type variants (local-only, global-only, full)
 
 # Architecture variants
-- `:full`: Full OssammaBlock (LinearAttn + DLinOSS + SWAttention)
-- `:global_only`: LinearAttention + DLinOSS only (like OssammaDrafterBlock)
+- `:full`: Full SwammaBlock (LinearAttn + WavePDE + SWAttention)
+- `:global_only`: LinearAttention + WavePDE only (like SwammaDrafterBlock)
 - `:local_only`: SWAttention only (lightweight local processing)
 """
-struct OssammaBlockDeep <: LuxCore.AbstractLuxLayer
+struct SwammaBlockDeep <: LuxCore.AbstractLuxLayer
     # Core dimensions
     embedding_dimension::Int
     sequence_length::Int
@@ -384,9 +383,9 @@ struct OssammaBlockDeep <: LuxCore.AbstractLuxLayer
     InputNorm::TimeConditionedLayerNorm
     GluProjection::Union{Lux.Dense, Nothing}
     LinearAttention::Union{LinearAttentionLayer, Nothing}
-    OscillatorLayer::Union{DLinOSS, DLinOSSParallel, Nothing}
+    WaveGateLayer::Union{WavePDELayer, Nothing}
     LinearAttnNorm::Union{RMSNorm, Nothing}    # RMSNorm after linear attention
-    OscillatorNorm::Union{RMSNorm, Nothing}    # RMSNorm after oscillator
+    WaveGateNorm::Union{RMSNorm, Nothing}    # RMSNorm after wave gate
     InputGate::Union{Lux.Dense, Nothing}
     SlidingWindowAttention::Union{SWAttention, Nothing}
     AlphaProjection::Union{Lux.Dense, Nothing}
@@ -396,9 +395,9 @@ struct OssammaBlockDeep <: LuxCore.AbstractLuxLayer
 end
 
 """
-    OssammaBlockDeep(embedding_dim, seq_len, heads, time_dim; kwargs...)
+    SwammaBlockDeep(embedding_dim, seq_len, heads, time_dim; kwargs...)
 
-Create a deep-optimized Ossamma block.
+Create a deep-optimized Swamma block.
 
 # Arguments
 - `embedding_dimension::Int`: Model dimension
@@ -415,10 +414,10 @@ Create a deep-optimized Ossamma block.
 - `layer_scale_init::Float32 = 0.1`: Layer scale init value
 - `use_stochastic_depth::Bool = true`: Enable stochastic depth
 - `stochastic_depth_rate::Float32 = 0.1`: Max drop rate
-- `use_parallel_scan::Bool = true`: Use parallel oscillator scan
+- `use_parallel_scan::Bool = true`: Retained for config compatibility
 - `window_size::Int = 64`: SWAttention window size
 """
-function OssammaBlockDeep(
+function SwammaBlockDeep(
     embedding_dimension::Int,
     sequence_length::Int,
     number_of_heads::Int,
@@ -447,23 +446,12 @@ function OssammaBlockDeep(
     needs_local = block_type in (:full, :local_only)
     needs_mixing = block_type == :full
 
-    # Oscillator layer (for global branch)
-    oscillator_layer = if needs_global
-        if use_parallel_scan
-            DLinOSSParallel(
-                embedding_dimension, state_dimension, embedding_dimension,
-                min_freq, max_freq, 0.1f0;
-                chunk_size = parallel_chunk_size
-            )
-        else
-            DLinOSS(
-                embedding_dimension, state_dimension, embedding_dimension,
-                min_freq, max_freq, 0.1f0
-            )
-        end
-    else
-        nothing
-    end
+    # Wave-PDE wave-gate layer (for global branch)
+    oscillator_layer = needs_global ?
+        WavePDELayer(
+            embedding_dimension, state_dimension, embedding_dimension,
+            min_freq, max_freq, 0.1f0,
+        ) : nothing
 
     # Linear attention (for global branch)
     linear_attn = needs_global ?
@@ -494,7 +482,7 @@ function OssammaBlockDeep(
     lin_attn_norm = needs_global ? RMSNorm(embedding_dimension) : nothing
     osc_norm = needs_global ? RMSNorm(embedding_dimension) : nothing
 
-    return OssammaBlockDeep(
+    return SwammaBlockDeep(
         embedding_dimension,
         sequence_length,
         number_of_heads,
@@ -528,7 +516,7 @@ function OssammaBlockDeep(
     )
 end
 
-function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaBlockDeep)
+function Lux.initialparameters(rng::Random.AbstractRNG, block::SwammaBlockDeep)
     params = Dict{Symbol, Any}()
 
     params[:InputNorm] = Lux.initialparameters(rng, block.InputNorm)
@@ -542,15 +530,15 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaBlockDeep)
     if block.LinearAttention !== nothing
         params[:LinearAttention] = Lux.initialparameters(rng, block.LinearAttention)
     end
-    if block.OscillatorLayer !== nothing
-        params[:OscillatorLayer] = Lux.initialparameters(rng, block.OscillatorLayer)
+    if block.WaveGateLayer !== nothing
+        params[:WaveGateLayer] = Lux.initialparameters(rng, block.WaveGateLayer)
     end
     # RMSNorm for GLU gating
     if block.LinearAttnNorm !== nothing
         params[:LinearAttnNorm] = Lux.initialparameters(rng, block.LinearAttnNorm)
     end
-    if block.OscillatorNorm !== nothing
-        params[:OscillatorNorm] = Lux.initialparameters(rng, block.OscillatorNorm)
+    if block.WaveGateNorm !== nothing
+        params[:WaveGateNorm] = Lux.initialparameters(rng, block.WaveGateNorm)
     end
 
     # Local branch params
@@ -587,7 +575,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaBlockDeep)
     return NamedTuple(params)
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaBlockDeep)
+function Lux.initialstates(rng::Random.AbstractRNG, block::SwammaBlockDeep)
     states = Dict{Symbol, Any}()
 
     states[:InputNorm] = Lux.initialstates(rng, block.InputNorm)
@@ -600,15 +588,15 @@ function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaBlockDeep)
     if block.LinearAttention !== nothing
         states[:LinearAttention] = Lux.initialstates(rng, block.LinearAttention)
     end
-    if block.OscillatorLayer !== nothing
-        states[:OscillatorLayer] = Lux.initialstates(rng, block.OscillatorLayer)
+    if block.WaveGateLayer !== nothing
+        states[:WaveGateLayer] = Lux.initialstates(rng, block.WaveGateLayer)
     end
     # RMSNorm for GLU gating
     if block.LinearAttnNorm !== nothing
         states[:LinearAttnNorm] = Lux.initialstates(rng, block.LinearAttnNorm)
     end
-    if block.OscillatorNorm !== nothing
-        states[:OscillatorNorm] = Lux.initialstates(rng, block.OscillatorNorm)
+    if block.WaveGateNorm !== nothing
+        states[:WaveGateNorm] = Lux.initialstates(rng, block.WaveGateNorm)
     end
     if block.InputGate !== nothing
         states[:InputGate] = Lux.initialstates(rng, block.InputGate)
@@ -629,7 +617,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaBlockDeep)
     return NamedTuple(states)
 end
 
-function (block::OssammaBlockDeep)(inputs::Tuple, params, state)
+function (block::SwammaBlockDeep)(inputs::Tuple, params, state)
     input_tensor, time_input = inputs
 
     # Check for stochastic depth skip
@@ -691,7 +679,7 @@ function (block::OssammaBlockDeep)(inputs::Tuple, params, state)
     return output, NamedTuple(new_states)
 end
 
-# Helper: Global-only forward (LinearAttn + DLinOSS)
+# Helper: Global-only forward (LinearAttn + WavePDE)
 function forward_global_only(block, normalized, time_input, params, state, new_states)
     dim = block.embedding_dimension
 
@@ -713,13 +701,13 @@ function forward_global_only(block, normalized, time_input, params, state, new_s
     )
     new_states[:LinearAttnNorm] = lin_attn_norm_state
 
-    # Gate → Oscillator → RMSNorm → sigmoid
-    gate_output, osc_state = block.OscillatorLayer(gate_half, params.OscillatorLayer, state.OscillatorLayer)
-    new_states[:OscillatorLayer] = osc_state
-    gate_output, osc_norm_state = block.OscillatorNorm(
-        gate_output, params.OscillatorNorm, state.OscillatorNorm
+    # Gate → Wave Gate → RMSNorm → sigmoid
+    gate_output, osc_state = block.WaveGateLayer(gate_half, params.WaveGateLayer, state.WaveGateLayer)
+    new_states[:WaveGateLayer] = osc_state
+    gate_output, osc_norm_state = block.WaveGateNorm(
+        gate_output, params.WaveGateNorm, state.WaveGateNorm
     )
-    new_states[:OscillatorNorm] = osc_norm_state
+    new_states[:WaveGateNorm] = osc_norm_state
 
     # GLU gating: RMSNorm(content) ⊙ sigmoid(RMSNorm(gate))
     return content_output .* NNlib.sigmoid.(gate_output)
@@ -755,13 +743,13 @@ function forward_full(block, normalized, time_input, alpha_bias, params, state, 
     )
     new_states[:LinearAttnNorm] = lin_attn_norm_state
 
-    # Gate → Oscillator → RMSNorm → sigmoid
-    gate_output, osc_state = block.OscillatorLayer(gate_half, params.OscillatorLayer, state.OscillatorLayer)
-    new_states[:OscillatorLayer] = osc_state
-    gate_output, osc_norm_state = block.OscillatorNorm(
-        gate_output, params.OscillatorNorm, state.OscillatorNorm
+    # Gate → Wave Gate → RMSNorm → sigmoid
+    gate_output, osc_state = block.WaveGateLayer(gate_half, params.WaveGateLayer, state.WaveGateLayer)
+    new_states[:WaveGateLayer] = osc_state
+    gate_output, osc_norm_state = block.WaveGateNorm(
+        gate_output, params.WaveGateNorm, state.WaveGateNorm
     )
-    new_states[:OscillatorNorm] = osc_norm_state
+    new_states[:WaveGateNorm] = osc_norm_state
 
     # GLU gating: RMSNorm(content) ⊙ sigmoid(RMSNorm(gate))
     glu_output = content_output .* NNlib.sigmoid.(gate_output)
@@ -873,7 +861,7 @@ end
 """
     DeepModelConfig
 
-Configuration for deep Ossamma models.
+Configuration for deep Swamma models.
 """
 Base.@kwdef struct DeepModelConfig
     # Core architecture
@@ -912,15 +900,15 @@ end
 """
     create_deep_blocks(config)
 
-Create a vector of OssammaBlockDeep instances based on config.
+Create a vector of SwammaBlockDeep instances based on config.
 """
 function create_deep_blocks(config::DeepModelConfig)
-    blocks = OssammaBlockDeep[]
+    blocks = SwammaBlockDeep[]
 
     for i in 1:config.number_of_layers
         block_type = get_block_type(i, config.number_of_layers, config.block_schedule)
 
-        block = OssammaBlockDeep(
+        block = SwammaBlockDeep(
             config.embedding_dimension,
             config.max_sequence_length,
             config.number_of_heads,
@@ -953,7 +941,7 @@ Print a summary of the deep model configuration.
 """
 function print_model_summary(config::DeepModelConfig)
     println("=" ^ 70)
-    println("Deep Ossamma Model Configuration")
+    println("Deep Swamma Model Configuration")
     println("=" ^ 70)
     println()
     println("Architecture:")
@@ -991,8 +979,8 @@ function print_model_summary(config::DeepModelConfig)
     V = config.vocab_size
 
     # Per block estimate
-    full_block_params = 4 * d * d + 2 * d * d + d * d + round(Int, d * config.ffn_expansion * 2) * d
-    global_block_params = 4 * d * d + d * d + round(Int, d * config.ffn_expansion * 2) * d
+    full_block_params = 4 * d * d + 2 * d * d + 2 * d + round(Int, d * config.ffn_expansion * 2) * d
+    global_block_params = 4 * d * d + 2 * d + round(Int, d * config.ffn_expansion * 2) * d
     local_block_params = 2 * d * d + round(Int, d * config.ffn_expansion * 2) * d
 
     total_block_params = (

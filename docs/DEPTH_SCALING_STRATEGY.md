@@ -6,14 +6,14 @@ For a fixed compute budget `C`, compare layer allocation:
 
 ```
 Transformer:  C = L_t × T² × d    →  L_t = C / (T² × d)
-Ossamma:      C = L_o × T × d²    →  L_o = C / (T × d²)
+Swamma:      C = L_o × T × d²    →  L_o = C / (T × d²)
 
 Ratio:  L_o / L_t = T / d
 ```
 
-**For T=2048, d=512:**  Ossamma can afford **4× more layers** at the same compute cost.
+**For T=2048, d=512:**  Swamma can afford **4× more layers** at the same compute cost.
 
-**For T=4096, d=512:**  Ossamma can afford **8× more layers**.
+**For T=4096, d=512:**  Swamma can afford **8× more layers**.
 
 This is the key advantage to exploit.
 
@@ -23,20 +23,20 @@ This is the key advantage to exploit.
 
 ### Principle
 
-Trade width (embedding dimension) for depth (layers). Ossamma's linear complexity makes this viable.
+Trade width (embedding dimension) for depth (layers). Swamma's linear complexity makes this viable.
 
 ### Comparison: Equivalent Compute Models
 
 | Model | Layers | Dim | Heads | Params | FLOPs/token |
 |-------|--------|-----|-------|--------|-------------|
 | **Transformer-Base** | 12 | 768 | 12 | 110M | O(T² × 768) |
-| **Ossamma-Deep** | 48 | 384 | 6 | ~110M | O(T × 384²) |
-| **Ossamma-VeryDeep** | 96 | 256 | 4 | ~100M | O(T × 256²) |
+| **Swamma-Deep** | 48 | 384 | 6 | ~110M | O(T × 384²) |
+| **Swamma-VeryDeep** | 96 | 256 | 4 | ~100M | O(T × 256²) |
 
-### Why Depth > Width for Ossamma
+### Why Depth > Width for Swamma
 
 1. **O(T) makes depth cheap**: Each layer costs O(T×d²), not O(T²×d)
-2. **Oscillator memory compounds**: DLinOSS state carries through layers - more layers = richer state evolution
+2. **Oscillator memory compounds**: WavePDE state carries through layers - more layers = richer state evolution
 3. **Gradient flow with residuals**: Post-norm + residual scaling handles deep networks
 4. **Hierarchical abstraction**: More layers = more levels of representation
 
@@ -71,22 +71,22 @@ stochastic_depth_rate = 0.1
 
 ### Current Bottleneck
 
-Without parallel scan, OSSM is O(T) sequential steps - **kills GPU utilization**.
+Without a parallel formulation, the removed legacy state-space path was O(T) sequential steps - **kills GPU utilization**.
 
 ```
-Sequential OSSM:  GPU util = 30-35% (from CLAUDE.md)
+Sequential legacy state-space path: GPU util = 30-35% (from CLAUDE.md)
 Parallel Scan:    GPU util = 80-90% (theoretical)
 ```
 
 ### Implementation Requirement
 
 ```julia
-# In DlinossParallel.jl - already implemented!
+# In WavePDE.jl - already implemented!
 # The key is the associative combination:
 #   (A, b) ⊕ (A', b') = (A'·A, A'·b + b')
 
 # Enable via:
-oscillator_layer = DLinOSSParallel(
+oscillator_layer = WavePDE(
     dim, state_dim, dim,
     min_freq, max_freq, default_dt;
     chunk_size = 64  # Tune for GPU
@@ -159,12 +159,12 @@ Late layers (low freq):
 ### Solution: Layer Scale (from CaiT, DeepViT)
 
 ```julia
-struct OssammaBlockDeep <: LuxCore.AbstractLuxLayer
+struct SwammaBlockDeep <: LuxCore.AbstractLuxLayer
     # ... existing fields ...
     layer_scale_init::Float32  # e.g., 0.1 or 1e-4
 end
 
-function (block::OssammaBlockDeep)(inputs, params, state)
+function (block::SwammaBlockDeep)(inputs, params, state)
     # ... compute output ...
 
     # Scale residual contribution
@@ -174,7 +174,7 @@ function (block::OssammaBlockDeep)(inputs, params, state)
     return residual .+ scaled_output, new_state
 end
 
-function Lux.initialparameters(rng, block::OssammaBlockDeep)
+function Lux.initialparameters(rng, block::SwammaBlockDeep)
     # Initialize layer_scale small for deep networks
     layer_scale = fill(block.layer_scale_init, block.embedding_dimension)
     # ... rest of params ...
@@ -184,7 +184,7 @@ end
 ### Stochastic Depth (optional but recommended)
 
 ```julia
-function (block::OssammaBlockDeep)(inputs, params, state; training::Bool=true)
+function (block::SwammaBlockDeep)(inputs, params, state; training::Bool=true)
     if training && rand() < block.drop_rate
         # Skip this layer entirely during training
         return inputs, state
@@ -198,7 +198,7 @@ end
 
 ## Strategy 5: Diffusion for Parallel Generation
 
-### Why Diffusion + Deep Ossamma
+### Why Diffusion + Deep Swamma
 
 1. **No autoregressive bottleneck**: Generate all T tokens in parallel
 2. **Iterative refinement**: K steps (4-10) vs T steps (512-4096)
@@ -210,17 +210,17 @@ end
 |--------|-------|-------------|---------------|
 | AR (GPT-style) | T | 1 | T × L × O(T²×d) |
 | Diffusion + Transformer | K | T | K × L × O(T²×d) |
-| **Diffusion + Ossamma** | K | T | **K × L × O(T×d²)** |
+| **Diffusion + Swamma** | K | T | **K × L × O(T×d²)** |
 
 For K=8, T=2048, L=48:
 - AR Transformer: 2048 × 12 × O(T²) = very slow
-- Diffusion + Ossamma-48L: 8 × 48 × O(T) = **much faster**
+- Diffusion + Swamma-48L: 8 × 48 × O(T) = **much faster**
 
-### OssammaDrafter Configuration
+### SwammaDrafter Configuration
 
 ```toml
 [model]
-type = "OssammaDrafter"
+type = "SwammaDrafter"
 vocab_size = 100352          # Granite 4.0
 max_sequence_length = 4096
 embedding_dimension = 384
@@ -252,8 +252,8 @@ Layer Type Distribution (48 layers):
 
 Layers 1-12:   SWAttention only (window=64)   - local syntax
 Layers 13-24:  SWAttention (window=128)       - clause-level
-Layers 25-36:  LinearAttention + DLinOSS      - global semantics
-Layers 37-48:  Full OssammaBlock              - final integration
+Layers 25-36:  LinearAttention + WavePDE      - global semantics
+Layers 37-48:  Full SwammaBlock              - final integration
 ```
 
 ### Implementation
@@ -274,11 +274,11 @@ function create_deep_ossamma(;
             # Early-mid: Local with larger window
             push!(blocks, SWAttentionBlock(embedding_dim, window=128))
         elseif i <= 3 * num_layers ÷ 4
-            # Late-mid: Global linear only (OssammaDrafterBlock style)
-            push!(blocks, OssammaDrafterBlock(embedding_dim, ...))
+            # Late-mid: Global linear only (SwammaDrafterBlock style)
+            push!(blocks, SwammaDrafterBlock(embedding_dim, ...))
         else
-            # Late: Full OssammaBlock
-            push!(blocks, OssammaBlock(embedding_dim, ...))
+            # Late: Full SwammaBlock
+            push!(blocks, SwammaBlock(embedding_dim, ...))
         end
     end
 
@@ -399,9 +399,9 @@ checkpoint_every = 4
 ## Implementation Roadmap
 
 ### Phase 1: Enable Parallel Scan (Week 1)
-- [ ] Verify DLinOSSParallel works correctly
+- [ ] Verify WavePDE works correctly
 - [ ] Benchmark parallel vs sequential scan
-- [ ] Integrate into OssammaBlock with `use_parallel_scan` flag
+- [ ] Integrate into SwammaBlock with `use_parallel_scan` flag
 - [ ] Target: 10-40× speedup on GPU
 
 ### Phase 2: Deep Architecture Support (Week 2)
@@ -433,7 +433,7 @@ checkpoint_every = 4
 
 With parallel scan + diffusion:
 ```
-Current (sequential OSSM, AR generation):
+Current (sequential legacy state-space path, AR generation):
   7-10 sec/step, 30-35% GPU util
 
 Target (parallel scan + diffusion):
@@ -454,11 +454,11 @@ Deeper networks should show:
 For same FLOP budget:
 ```
 Transformer-12L-768d:  L=12,  d=768,  T²=T² bottleneck
-Ossamma-48L-384d:      L=48,  d=384,  T bottleneck
+Swamma-48L-384d:      L=48,  d=384,  T bottleneck
 
 At T=4096:
   Transformer: ~67B FLOPs/sequence
-  Ossamma:     ~8B FLOPs/sequence (8× cheaper)
+  Swamma:     ~8B FLOPs/sequence (8× cheaper)
 
 Can afford 48 layers for price of 6 transformer layers.
 ```
@@ -470,11 +470,11 @@ Can afford 48 layers for price of 6 transformer layers.
 | Strategy | Key Insight | Implementation |
 |----------|-------------|----------------|
 | **Deep & Narrow** | O(T) allows 4-8× more layers | 48L/384d instead of 12L/768d |
-| **Parallel Scan** | O(log T) depth, not O(T) | Use DLinOSSParallel |
+| **Parallel Scan** | O(log T) depth, not O(T) | Use WavePDE |
 | **Hierarchical Freq** | Different layers, different timescales | `layer_frequency_range()` |
 | **Deep Residuals** | Stabilize 48+ layers | Layer scale + stochastic depth |
-| **Diffusion** | Parallel generation | OssammaDrafter with K steps |
+| **Diffusion** | Parallel generation | SwammaDrafter with K steps |
 | **Mixed Attention** | Allocate attention budget wisely | Early=local, late=global |
 | **Checkpointing** | Fit 48-96L in memory | Checkpoint every 4-6 layers |
 
-**The fundamental insight**: Ossamma's O(T) complexity is only useful if you **spend the saved compute on depth**. Going deeper with parallel scan + diffusion is the winning strategy.
+**The fundamental insight**: Swamma's O(T) complexity is only useful if you **spend the saved compute on depth**. Going deeper with parallel scan + diffusion is the winning strategy.

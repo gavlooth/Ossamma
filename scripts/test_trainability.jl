@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Quick trainability test for Ossamma models.
+Quick trainability test for Swamma models.
 
 Tests:
 1. Model instantiation
@@ -16,7 +16,7 @@ using Pkg
 Pkg.activate(dirname(@__DIR__))
 
 println("=" ^ 60)
-println("TRAINABILITY TEST - Ossamma")
+println("TRAINABILITY TEST - Swamma")
 println("=" ^ 60)
 println()
 
@@ -26,8 +26,8 @@ using Zygote
 using NNlib
 using Optimisers
 
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
 
 # ============================================================================
 # Test Configuration

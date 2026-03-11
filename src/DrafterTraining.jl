@@ -1,4 +1,4 @@
-# DrafterTraining.jl - Training utilities for OssammaDrafter
+# DrafterTraining.jl - Training utilities for SwammaDrafter
 #
 # Provides:
 # - Distillation loss (KL divergence from AR model)

@@ -15,7 +15,7 @@ state_dimension = 1024
 [model.attention]
 window_size = 128
 
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.05
 max_frequency = 20.0
 default_time_step = 0.05

@@ -2,8 +2,8 @@ using Lux
 using Random
 using Test
 
-include("../src/Ossamma.jl")
-using .Ossamma
+include("../src/Swamma.jl")
+using .Swamma
 
 @testset "MoETModel Shapes" begin
     config = MoETConfig(

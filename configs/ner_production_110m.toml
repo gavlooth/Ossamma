@@ -1,4 +1,4 @@
-# OssammaNER Production Configuration - 75M Parameters
+# SwammaNER Production Configuration - 75M Parameters
 # Optimized for RTX 5090 (32GB VRAM)
 
 # =============================================================================
@@ -27,7 +27,7 @@ window_size = 128
 percent = 0.30
 window_size = 256
 
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.01            # Slow oscillations for long-range
 max_frequency = 5.0             # Fast for word-level patterns
 default_time_step = 0.05

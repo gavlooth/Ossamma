@@ -2,7 +2,7 @@
 
 Named Entity Recognition schema optimized for Retrieval-Augmented Generation.
 
-**Uses OssammaNER** - Token-level NER model built on OssammaBlocks (SWAttention + DLinOSS oscillators).
+**Uses SwammaNER** - Token-level NER model built on SwammaBlocks (SWAttention + WavePDE gate).
 
 ## Labels
 
@@ -46,12 +46,12 @@ MEASURE       ← TIME
 | DOMAIN | ✅ High | ✅ High | "advances in X" |
 | MEASURE | ❌ Low | Medium | Fact grounding |
 
-## Quick Start (Julia + OssammaBlocks)
+## Quick Start (Julia + SwammaBlocks)
 
-### 1. Train with OssammaNER
+### 1. Train with SwammaNER
 
 ```julia
-using Ossamma
+using Swamma
 
 # Create NER model
 model = small_ner(vocab_size=32000, max_sequence_length=256)
@@ -63,7 +63,7 @@ config = NERConfig(
     number_of_heads = 4,
     number_of_layers = 4,
 )
-model = OssammaNER(config)
+model = SwammaNER(config)
 
 # Initialize
 rng = Random.default_rng()

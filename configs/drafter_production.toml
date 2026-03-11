@@ -1,5 +1,5 @@
 # =============================================================================
-# OssammaDrafter Production Training Configuration
+# SwammaDrafter Production Training Configuration
 # =============================================================================
 # Use with:
 #   julia --project=. scripts/train_drafter_production.jl --train-config configs/drafter_production.toml

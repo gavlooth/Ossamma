@@ -1,4 +1,4 @@
-# OssammaNER Development Configuration
+# SwammaNER Development Configuration
 # ~35M Parameters - For local development and experimentation
 
 # =============================================================================
@@ -19,7 +19,7 @@ state_dimension = 256           # Match embedding dim
 [model.attention]
 window_size = 32                # Local attention window
 
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.05
 max_frequency = 8.0
 default_time_step = 0.08

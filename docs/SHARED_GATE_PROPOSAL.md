@@ -1,4 +1,4 @@
-# Shared Gate Proposal for OssammaNERBlock
+# Shared Gate Proposal for SwammaNERBlock
 
 ## Current Architecture (5 Gates, 2 Gate Projections)
 
@@ -47,7 +47,7 @@ INPUT: x (dim, seq, batch)
    │         │                         │
    ▼         ▼                         │
 ┌──────┐  ┌──────────┐                 │
-│Linear│  │  DLinOSS │                 │
+│Linear│  │  WavePDE │                 │
 │Attn  │  │          │                 │
 │      │  │oscillator│                 │
 │(dim) │  │  (dim)   │                 │
@@ -251,7 +251,7 @@ INPUT: x (dim, seq, batch)
 │ path_a   path_b                          │
 │   │         │                            │
 │   ▼         ▼                            │
-│ LinearAttn  DLinOSS                      │
+│ LinearAttn  WavePDE                      │
 │   │         │                            │
 │   │         ▼                            │
 │   │      sigmoid                         │
@@ -455,7 +455,7 @@ For dim=384 (production config):
 
 | Gate | Current | Shared Gate |
 |------|---------|-------------|
-| #1: GLU (LinearAttn ⊙ sigmoid(DLinOSS)) | ✓ | ✓ |
+| #1: GLU (LinearAttn ⊙ sigmoid(WavePDE)) | ✓ | ✓ |
 | #2: Input gate (g ⊙ normalized) | g_input | g_shared |
 | #3: SWAttention sigsoftmax | ✓ | ✓ |
 | #4: Output gate (g ⊙ glu_out) | g_output | g_shared (reused) |

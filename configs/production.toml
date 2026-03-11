@@ -29,7 +29,7 @@ window_size = 256
 # Oscillator SSM Parameters
 # Frequencies represent "cycles per unit time" - log-spaced across oscillators
 # Lower = slow/global patterns, Higher = fast/local patterns
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.01        # Very slow oscillations for long-range dependencies
 max_frequency = 5.0         # Fast oscillations for word-level patterns
 default_time_step = 0.05    # Fine temporal resolution

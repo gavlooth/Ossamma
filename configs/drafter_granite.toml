@@ -1,12 +1,12 @@
 # =============================================================================
-# OssammaDrafter Configuration for Granite 4.0
+# SwammaDrafter Configuration for Granite 4.0
 # =============================================================================
 # This config sets up the drafter to use IBM Granite 4.0 as the AR verifier.
 # Granite 4.0 Micro (3B) is recommended for verification.
 #
 # Usage:
 #   config = load_drafter_config("configs/drafter_granite.toml")
-#   drafter = OssammaDrafter(config)
+#   drafter = SwammaDrafter(config)
 
 # AR Model Selection
 # Options: "granite", "granite4", "qwen3", "llama3"
@@ -42,5 +42,5 @@ ffn_expansion = 1.5    # 3d/2 expansion
 # =============================================================================
 # Optimization
 # =============================================================================
-# Use parallel scan for DLinOSS (faster on GPU, slightly less accurate)
+# Retained for config compatibility; WavePDE is already parallel
 use_parallel_scan = false

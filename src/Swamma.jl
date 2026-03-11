@@ -1,27 +1,27 @@
-module Ossamma
+module Swamma
 
 """
-Ossamma -> Oscillatory State Space Attention Masked Mixer Architecture
+Swamma -> Spectral Wave-PDE Attention Masked Mixer Architecture
 
 Architecture:
 - Input → LayerNorm (time-conditioned with scale, shift, α_bias)
 - Two parallel branches:
-  1. Global-Spectral GLU: Dense(dim→2*dim) → split → LinearAttn(content) ⊙ sigmoid(OscSSM(gate)) → Dense
+  1. Global-Spectral GLU: Dense(dim→2*dim) → split → LinearAttn(content) ⊙ sigmoid(WavePDE(gate)) → Dense
+     WavePDE solves the damped wave equation spectrally (FFT Laplacian).
   2. Local-Sharp: Windowed Softmax Attention (SWAttention)
 - Mix: α·GLU + (1-α)·Local where α = σ(f(x) + α_bias(t))
 - Residual + FFN
+
+Notes:
+- `SwammaBlock` uses `WavePDELayer` as its structured gate path.
 """
 
-include("Dlinoss.jl")
-include("DlinossParallel.jl")
 include("Attention.jl")
 include("linearAttention.jl")
-include("ossm.jl")
+include("WavePDE.jl")
 
 using .Attention: SWAttention
-using .Dlinoss: DLinOSS
-using .DlinossParallel: DLinOSSParallel
-using .ossm: OSSMLayer as OscSSM
+using .WavePDE: WavePDELayer
 
 # Import struct from LinearAttention module
 using .LinearAttention: LinearAttentionLayer
@@ -230,9 +230,60 @@ function (ffn::SwiGLU)(x, ps, st)
 end
 
 # ============================================================================
-# Main Ossamma Block
+# Main Swamma Block
 # ============================================================================
-struct OssammaBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
+Base.@kwdef struct SwammaBlockConfig
+    embedding_dimension::Int
+    sequence_length::Int
+    number_of_heads::Int
+    time_dimension::Int
+    state_dimension::Int = embedding_dimension
+    window_size::Int = 256
+    min_frequency::Float32 = 0.1f0
+    max_frequency::Float32 = 10.0f0
+    default_time_step::Float32 = 0.1f0
+    dropout_rate::Float32 = 0.1f0
+    use_ffn::Bool = true
+    ffn_expansion::Float32 = 3f0 / 2f0
+    use_glu_output_projection::Bool = false
+    use_parallel_scan::Bool = false
+    parallel_chunk_size::Int = 64
+    local_operator::Symbol = :swattention
+    residual_mode::Symbol = :plain
+    use_vector_gains::Bool = false
+    use_per_head_alpha::Bool = false
+    use_branch_projections::Bool = false
+end
+
+function validate_swamma_block_config(config::SwammaBlockConfig)
+    config.embedding_dimension > 0 || throw(ArgumentError("embedding_dimension must be positive"))
+    config.sequence_length > 0 || throw(ArgumentError("sequence_length must be positive"))
+    config.number_of_heads > 0 || throw(ArgumentError("number_of_heads must be positive"))
+    config.time_dimension > 0 || throw(ArgumentError("time_dimension must be positive"))
+    config.state_dimension > 0 || throw(ArgumentError("state_dimension must be positive"))
+    config.window_size > 0 || throw(ArgumentError("window_size must be positive"))
+    config.embedding_dimension % config.number_of_heads == 0 || throw(ArgumentError(
+        "embedding_dimension=$(config.embedding_dimension) must be divisible by number_of_heads=$(config.number_of_heads)."
+    ))
+    config.min_frequency > 0 || throw(ArgumentError("min_frequency must be positive"))
+    config.max_frequency > config.min_frequency || throw(ArgumentError(
+        "max_frequency=$(config.max_frequency) must be greater than min_frequency=$(config.min_frequency)."
+    ))
+    config.default_time_step > 0 || throw(ArgumentError("default_time_step must be positive"))
+    0.0f0 <= config.dropout_rate < 1.0f0 || throw(ArgumentError(
+        "dropout_rate=$(config.dropout_rate) must be in [0, 1)."
+    ))
+    config.ffn_expansion > 0 || throw(ArgumentError("ffn_expansion must be positive"))
+    config.local_operator == :swattention || throw(ArgumentError(
+        "Unsupported local_operator=$(repr(config.local_operator)). Current implementation supports only :swattention."
+    ))
+    config.residual_mode == :plain || throw(ArgumentError(
+        "Unsupported residual_mode=$(repr(config.residual_mode)). Current implementation supports only :plain."
+    ))
+    return config
+end
+
+struct SwammaBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
     embedding_dimension::Int
     sequence_length::Int
     number_of_heads::Int
@@ -242,6 +293,8 @@ struct OssammaBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
     use_ffn::Bool
     use_glu_output_projection::Bool    # Optional d→d Dense after GLU (disabled by default)
     use_parallel_scan::Bool            # GPU optimization: parallel associative scan
+    local_operator::Symbol             # Currently :swattention
+    residual_mode::Symbol              # Currently :plain, future: :mhc
 
     # Alpha mixing ablation flags
     use_vector_gains::Bool             # Learnable per-dim gains s_g, s_l (cheap: 2d params)
@@ -251,15 +304,15 @@ struct OssammaBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
     # Time-conditioned normalization
     InputNorm::TimeConditionedLayerNorm
 
-    # GLU branch: Dense → split → LinearAttn(content) ⊙ sigmoid(OscSSM(gate))
+    # GLU branch: Dense → split → LinearAttn(content) ⊙ sigmoid(WavePDE(gate))
     GluProjection::Lux.Dense           # dim → 2*dim
     LinearAttention::LinearAttentionLayer
-    OscillatorLayer::OSC               # DLinOSS or DLinOSSParallel
+    WaveGateLayer::OSC               # Wave-PDE gate path
     GluOutputProjection::Union{Lux.Dense, Nothing}  # Optional d→d (ablation)
 
     # RMSNorm for GLU branch outputs (stabilizes gating)
     LinearAttnNorm::RMSNorm            # Normalize linear attention output before GLU
-    OscillatorNorm::RMSNorm            # Normalize oscillator output before GLU
+    WaveGateNorm::RMSNorm            # Normalize wave-gate output before GLU
 
     # Local branch: InputGate + Windowed Softmax Attention
     InputGate::Lux.Dense               # dim → dim (no bias, sigmoid activation)
@@ -281,7 +334,73 @@ struct OssammaBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
     OutputNorm::Lux.LayerNorm
 end
 
-function OssammaBlock(
+function SwammaBlock(config::SwammaBlockConfig)
+    validate_swamma_block_config(config)
+
+    # Wave-PDE layer: spectral damped wave equation for the structured gate.
+    # use_parallel_scan is retained in the config for compatibility
+    # but the Wave-PDE's FFT scan is inherently parallelisable.
+    oscillator_layer = WavePDELayer(
+        config.embedding_dimension, config.state_dimension, config.embedding_dimension,
+        config.min_frequency, config.max_frequency, config.default_time_step,
+    )
+
+    # Alpha projection output dim: 1 (scalar) or num_heads (per-head)
+    alpha_out_dim = config.use_per_head_alpha ? config.number_of_heads : 1
+
+    return SwammaBlock(
+        config.embedding_dimension,
+        config.sequence_length,
+        config.number_of_heads,
+        config.time_dimension,
+        config.state_dimension,
+        config.dropout_rate,
+        config.use_ffn,
+        config.use_glu_output_projection,
+        config.use_parallel_scan,
+        config.local_operator,
+        config.residual_mode,
+        # Alpha mixing ablation flags
+        config.use_vector_gains,
+        config.use_per_head_alpha,
+        config.use_branch_projections,
+        # Time-conditioned LayerNorm
+        TimeConditionedLayerNorm(config.embedding_dimension, config.time_dimension),
+        # GLU branch
+        Lux.Dense(config.embedding_dimension => 2 * config.embedding_dimension),
+        LinearAttentionLayer(
+            config.embedding_dimension,
+            config.sequence_length,
+            config.number_of_heads,
+            config.time_dimension,
+        ),
+        oscillator_layer,
+        config.use_glu_output_projection ? Lux.Dense(config.embedding_dimension => config.embedding_dimension) : nothing,
+        # RMSNorm for GLU branch outputs (stabilizes gating)
+        RMSNorm(config.embedding_dimension),   # LinearAttnNorm
+        RMSNorm(config.embedding_dimension),   # WaveGateNorm
+        # Local branch: InputGate + SlidingWindowAttention
+        Lux.Dense(config.embedding_dimension => config.embedding_dimension; use_bias = false),
+        SWAttention(
+            config.sequence_length,
+            config.embedding_dimension,
+            config.number_of_heads;
+            window_size = config.window_size,
+        ),
+        # Alpha mixing projection: dim → 1 (scalar α) or dim → num_heads (per-head α)
+        Lux.Dense(config.embedding_dimension => alpha_out_dim),
+        # Branch projections (optional, expensive d→d)
+        config.use_branch_projections ? Lux.Dense(config.embedding_dimension => config.embedding_dimension) : nothing,
+        config.use_branch_projections ? Lux.Dense(config.embedding_dimension => config.embedding_dimension) : nothing,
+        # Dropout after mixing
+        Lux.Dropout(config.dropout_rate),
+        # SwiGLU FFN + Output normalization
+        config.use_ffn ? SwiGLU(config.embedding_dimension; expansion_factor = config.ffn_expansion) : nothing,
+        Lux.LayerNorm((config.embedding_dimension,)),
+    )
+end
+
+function SwammaBlock(
     embedding_dimension::Int,
     sequence_length::Int,
     number_of_heads::Int,
@@ -294,70 +413,40 @@ function OssammaBlock(
     dropout_rate::Float32 = 0.1f0,
     use_ffn::Bool = true,
     ffn_expansion::Float32 = 3f0 / 2f0,
-    use_glu_output_projection::Bool = false,  # Optional d→d Dense after GLU
-    use_parallel_scan::Bool = false,          # GPU optimization
+    use_glu_output_projection::Bool = false,
+    use_parallel_scan::Bool = false,
     parallel_chunk_size::Int = 64,
-    # Alpha mixing ablation options
-    use_vector_gains::Bool = false,           # Learnable per-dim gains s_g, s_l (+2d params)
-    use_per_head_alpha::Bool = false,         # Per-head α instead of scalar (+d*h params)
-    use_branch_projections::Bool = false,     # Full d→d per-branch projections (+2d² params)
+    local_operator::Symbol = :swattention,
+    residual_mode::Symbol = :plain,
+    use_vector_gains::Bool = false,
+    use_per_head_alpha::Bool = false,
+    use_branch_projections::Bool = false,
 )
-    # Choose oscillator implementation based on parallelization setting
-    oscillator_layer = if use_parallel_scan
-        DLinOSSParallel(
-            embedding_dimension, state_dimension, embedding_dimension,
-            min_frequency, max_frequency, default_time_step;
-            chunk_size = parallel_chunk_size
-        )
-    else
-        DLinOSS(embedding_dimension, state_dimension, embedding_dimension,
-                min_frequency, max_frequency, default_time_step)
-    end
-
-    # Alpha projection output dim: 1 (scalar) or num_heads (per-head)
-    alpha_out_dim = use_per_head_alpha ? number_of_heads : 1
-
-    return OssammaBlock(
-        embedding_dimension,
-        sequence_length,
-        number_of_heads,
-        time_dimension,
-        state_dimension,
-        dropout_rate,
-        use_ffn,
-        use_glu_output_projection,
-        use_parallel_scan,
-        # Alpha mixing ablation flags
-        use_vector_gains,
-        use_per_head_alpha,
-        use_branch_projections,
-        # Time-conditioned LayerNorm
-        TimeConditionedLayerNorm(embedding_dimension, time_dimension),
-        # GLU branch
-        Lux.Dense(embedding_dimension => 2 * embedding_dimension),
-        LinearAttentionLayer(embedding_dimension, sequence_length, number_of_heads, time_dimension),
-        oscillator_layer,
-        use_glu_output_projection ? Lux.Dense(embedding_dimension => embedding_dimension) : nothing,
-        # RMSNorm for GLU branch outputs (stabilizes gating)
-        RMSNorm(embedding_dimension),   # LinearAttnNorm
-        RMSNorm(embedding_dimension),   # OscillatorNorm
-        # Local branch: InputGate + SlidingWindowAttention
-        Lux.Dense(embedding_dimension => embedding_dimension; use_bias = false),
-        SWAttention(sequence_length, embedding_dimension, number_of_heads; window_size = window_size),
-        # Alpha mixing projection: dim → 1 (scalar α) or dim → num_heads (per-head α)
-        Lux.Dense(embedding_dimension => alpha_out_dim),
-        # Branch projections (optional, expensive d→d)
-        use_branch_projections ? Lux.Dense(embedding_dimension => embedding_dimension) : nothing,
-        use_branch_projections ? Lux.Dense(embedding_dimension => embedding_dimension) : nothing,
-        # Dropout after mixing
-        Lux.Dropout(dropout_rate),
-        # SwiGLU FFN + Output normalization
-        use_ffn ? SwiGLU(embedding_dimension; expansion_factor = ffn_expansion) : nothing,
-        Lux.LayerNorm((embedding_dimension,)),
-    )
+    return SwammaBlock(SwammaBlockConfig(
+        embedding_dimension = embedding_dimension,
+        sequence_length = sequence_length,
+        number_of_heads = number_of_heads,
+        time_dimension = time_dimension,
+        state_dimension = state_dimension,
+        window_size = window_size,
+        min_frequency = min_frequency,
+        max_frequency = max_frequency,
+        default_time_step = default_time_step,
+        dropout_rate = dropout_rate,
+        use_ffn = use_ffn,
+        ffn_expansion = ffn_expansion,
+        use_glu_output_projection = use_glu_output_projection,
+        use_parallel_scan = use_parallel_scan,
+        parallel_chunk_size = parallel_chunk_size,
+        local_operator = local_operator,
+        residual_mode = residual_mode,
+        use_vector_gains = use_vector_gains,
+        use_per_head_alpha = use_per_head_alpha,
+        use_branch_projections = use_branch_projections,
+    ))
 end
 
-function Lux.initialparameters(rng::Random.AbstractRNG, layer::OssammaBlock)
+function Lux.initialparameters(rng::Random.AbstractRNG, layer::SwammaBlock)
     ffn_params = if layer.use_ffn && layer.FFN !== nothing
         Lux.initialparameters(rng, layer.FFN)
     else
@@ -403,10 +492,10 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::OssammaBlock)
         InputNorm = Lux.initialparameters(rng, layer.InputNorm),
         GluProjection = Lux.initialparameters(rng, layer.GluProjection),
         LinearAttention = Lux.initialparameters(rng, layer.LinearAttention),
-        OscillatorLayer = Lux.initialparameters(rng, layer.OscillatorLayer),
+        WaveGateLayer = Lux.initialparameters(rng, layer.WaveGateLayer),
         GluOutputProjection = glu_out_params,
         LinearAttnNorm = Lux.initialparameters(rng, layer.LinearAttnNorm),
-        OscillatorNorm = Lux.initialparameters(rng, layer.OscillatorNorm),
+        WaveGateNorm = Lux.initialparameters(rng, layer.WaveGateNorm),
         InputGate = input_gate_params,
         SlidingWindowAttention = Lux.initialparameters(rng, layer.SlidingWindowAttention),
         AlphaProjection = Lux.initialparameters(rng, layer.AlphaProjection),
@@ -420,7 +509,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::OssammaBlock)
     )
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, layer::OssammaBlock)
+function Lux.initialstates(rng::Random.AbstractRNG, layer::SwammaBlock)
     ffn_state = if layer.use_ffn && layer.FFN !== nothing
         Lux.initialstates(rng, layer.FFN)
     else
@@ -450,10 +539,10 @@ function Lux.initialstates(rng::Random.AbstractRNG, layer::OssammaBlock)
         InputNorm = Lux.initialstates(rng, layer.InputNorm),
         GluProjection = Lux.initialstates(rng, layer.GluProjection),
         LinearAttention = Lux.initialstates(rng, layer.LinearAttention),
-        OscillatorLayer = Lux.initialstates(rng, layer.OscillatorLayer),
+        WaveGateLayer = Lux.initialstates(rng, layer.WaveGateLayer),
         GluOutputProjection = glu_out_state,
         LinearAttnNorm = Lux.initialstates(rng, layer.LinearAttnNorm),
-        OscillatorNorm = Lux.initialstates(rng, layer.OscillatorNorm),
+        WaveGateNorm = Lux.initialstates(rng, layer.WaveGateNorm),
         InputGate = Lux.initialstates(rng, layer.InputGate),
         SlidingWindowAttention = Lux.initialstates(rng, layer.SlidingWindowAttention),
         AlphaProjection = Lux.initialstates(rng, layer.AlphaProjection),
@@ -465,7 +554,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, layer::OssammaBlock)
     )
 end
 
-function (block::OssammaBlock)(inputs::Tuple, params, state)
+function (block::SwammaBlock)(inputs::Tuple, params, state)
     input_tensor, time_input = inputs
     # input_tensor: (embedding_dim, seq_len, batch) or (embedding_dim, seq_len)
     # time_input: (time_dim, batch) or (time_dim,)
@@ -500,12 +589,12 @@ function (block::OssammaBlock)(inputs::Tuple, params, state)
         content_output, params.LinearAttnNorm, state.LinearAttnNorm
     )
 
-    # Gate → Oscillator SSM → RMSNorm → sigmoid (stabilize before gating)
-    gate_output, osc_state = block.OscillatorLayer(
-        gate_half, params.OscillatorLayer, state.OscillatorLayer
+    # Gate → structured WavePDE gate → RMSNorm → sigmoid (stabilize before gating)
+    gate_output, osc_state = block.WaveGateLayer(
+        gate_half, params.WaveGateLayer, state.WaveGateLayer
     )
-    gate_output, osc_norm_state = block.OscillatorNorm(
-        gate_output, params.OscillatorNorm, state.OscillatorNorm
+    gate_output, osc_norm_state = block.WaveGateNorm(
+        gate_output, params.WaveGateNorm, state.WaveGateNorm
     )
     gate_activated = NNlib.sigmoid.(gate_output)
 
@@ -522,7 +611,7 @@ function (block::OssammaBlock)(inputs::Tuple, params, state)
     # =========================================================================
     # 3. Local-Sharp Branch with Input Gating
     # =========================================================================
-    # Step 3a: Input Gate - GLU controls what features Local should attend to
+    # Step 3a: Input gate - the global branch conditions what the local branch should refine
     input_gate_logits, input_gate_state = block.InputGate(
         glu_output, params.InputGate, state.InputGate
     )
@@ -676,10 +765,10 @@ function (block::OssammaBlock)(inputs::Tuple, params, state)
         InputNorm = norm_state,
         GluProjection = glu_proj_state,
         LinearAttention = lin_attn_state,
-        OscillatorLayer = osc_state,
+        WaveGateLayer = osc_state,
         GluOutputProjection = glu_out_state,
         LinearAttnNorm = lin_attn_norm_state,
-        OscillatorNorm = osc_norm_state,
+        WaveGateNorm = osc_norm_state,
         InputGate = input_gate_state,
         SlidingWindowAttention = sw_attn_state,
         AlphaProjection = alpha_state,
@@ -694,14 +783,13 @@ function (block::OssammaBlock)(inputs::Tuple, params, state)
 end
 
 # ============================================================================
-# OssammaNERBlock - Alias for backward compatibility
+# SwammaNERBlock
 # ============================================================================
 """
-OssammaNERBlock is now an alias for OssammaBlock.
-Both blocks have identical architecture - the only difference in usage
-is the classification head added by the NER model.
+`SwammaNERBlock` is a semantic alias for `SwammaBlock`.
+The block implementation is shared; the distinction is only at the model head level.
 """
-const OssammaNERBlock = OssammaBlock
+const SwammaNERBlock = SwammaBlock
 
 # ============================================================================
 # LLaDA Text Diffusion Model
@@ -726,7 +814,7 @@ using .Training: load_checkpoint, save_checkpoint
 # Classification Model
 # ============================================================================
 include("Classification.jl")
-using .Classification: OssammaClassifier, ClassifierConfig
+using .Classification: SwammaClassifier, ClassifierConfig
 using .Classification: SequencePooling, FixedTimeEmbedding
 using .Classification: tiny_classifier, small_classifier, base_classifier
 using .Classification: load_pretrained_encoder
@@ -735,12 +823,22 @@ using .Classification: load_pretrained_encoder
 # NER Model (Token-level classification)
 # ============================================================================
 include("NER.jl")
-using .NER: OssammaNER, NERConfig
+using .NER: SwammaNER, NERConfig
 using .NER: tiny_ner, small_ner, base_ner
 using .NER: ner_cross_entropy, predict_labels, extract_entities
 using .NER: RAG_LABELS, ENTITY_TYPES, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
 using .NER: load_ner_config, estimate_parameters, print_config_summary
 using .NER: load_training_config as load_ner_training_config
+
+# ============================================================================
+# Relation Extraction Model
+# ============================================================================
+include("RelationExtraction.jl")
+using .RelationExtraction: RelationExtractionConfig, SwammaRelationExtractor
+using .RelationExtraction: load_relation_extraction_config, print_relation_extraction_summary
+using .RelationExtraction: entity_cross_entropy, boundary_bce, relation_cross_entropy, confidence_bce
+using .RelationExtraction: load_rebel_jsonl, build_token_vocab, build_entity_label_space, build_relation_label_space
+using .RelationExtraction: prepare_rebel_batch, DEFAULT_ENTITY_LABELS, DEFAULT_ENTITY_TYPES
 
 # ============================================================================
 # CRF Layer (Conditional Random Field for sequence labeling)
@@ -754,7 +852,7 @@ using .CRF: is_valid_transition, build_transition_mask
 # Drafter Model (TiDAR-style diffusion drafter for LLM generation)
 # ============================================================================
 include("Drafter.jl")
-using .Drafter: OssammaDrafterBlock, OssammaDrafter
+using .Drafter: SwammaDrafterBlock, SwammaDrafter
 using .Drafter: GRANITE_VOCAB_SIZE, QWEN3_VOCAB_SIZE, LLAMA3_VOCAB_SIZE
 using .Drafter: DrafterConfig, load_drafter_config, default_granite_config, default_qwen3_config
 
@@ -775,7 +873,7 @@ using .DeepScaling: HierarchicalFrequencyConfig, compute_layer_frequencies, freq
 using .DeepScaling: LayerScaleConfig, apply_layer_scale, init_layer_scale
 using .DeepScaling: StochasticDepthConfig, should_drop_layer, layer_drop_rate, drop_path
 using .DeepScaling: CheckpointConfig, should_checkpoint
-using .DeepScaling: OssammaBlockDeep
+using .DeepScaling: SwammaBlockDeep
 using .DeepScaling: DeepModelConfig, create_deep_blocks, print_model_summary
 using .DeepScaling: deep_48L_config, ultra_96L_config, long_context_config
 using .DeepScaling: BlockTypeSchedule, UNIFORM, PROGRESSIVE, SANDWICH, ALTERNATING, get_block_type
@@ -784,7 +882,7 @@ using .DeepScaling: BlockTypeSchedule, UNIFORM, PROGRESSIVE, SANDWICH, ALTERNATI
 # TiDAR - Speculative Decoding with Granite Models
 # ============================================================================
 include("TiDAR.jl")
-using .TiDAR: OssammaDrafterDeep, OssammaDrafterBlockDeep
+using .TiDAR: SwammaDrafterDeep, SwammaDrafterBlockDeep
 using .TiDAR: TiDARConfig
 using .TiDAR: granite_2b_drafter_config, granite_3b_drafter_config, granite_4_3b_drafter_config, granite_8b_drafter_config
 using .TiDAR: granite_drafter_deep_config, granite_3b_drafter_deep_config
@@ -813,7 +911,7 @@ using .MoET: MoETConfig, ExpertTower, MoETModel
 # ============================================================================
 include("HFTokenizer.jl")
 # Note: HFTokenizer requires PyCall and transformers Python package
-# Usage: using Ossamma.HFTokenizer
+# Usage: using Swamma.HFTokenizer
 
 # ============================================================================
 # Data Processing Modules
@@ -834,16 +932,39 @@ include("serve/Monitoring.jl")
 include("serve/InferenceServer.jl")
 
 # ============================================================================
+# Wave-Gate Accessors
+# ============================================================================
+"""
+    wave_pde_gate(block)
+
+Return the Wave-PDE gate layer from a block.
+This provides a stable accessor for the gate path.
+"""
+wave_pde_gate(block::SwammaBlock) = block.WaveGateLayer
+wave_pde_gate(block::SwammaBlockDeep) = block.WaveGateLayer
+wave_pde_gate(block::SwammaDrafterBlock) = block.WaveGateLayer
+wave_pde_gate(block::SwammaDrafterBlockDeep) = block.WaveGateLayer
+
+"""
+    wave_gate(block)
+
+Alias for `wave_pde_gate(block)`.
+"""
+wave_gate(block) = wave_pde_gate(block)
+
+# ============================================================================
 # Exports
 # ============================================================================
 
 # Re-export submodules for callers who want direct access.
-export Dlinoss, DlinossParallel, Attention, LinearAttention, ossm, LLaDA, Classification, NER
+export Attention, LinearAttention, WavePDE, LLaDA, Classification, NER
 export CRF, NERDataset, Tokenizer, Augmentation, NERMetrics
 export Monitoring, InferenceServer
 
 # Main block
-export OssammaBlock, OssammaNERBlock, TimeConditionedLayerNorm, RMSNorm
+export SwammaBlock, SwammaNERBlock, TimeConditionedLayerNorm, RMSNorm
+export SwammaBlockConfig, validate_swamma_block_config
+export wave_pde_gate, wave_gate
 
 # LLaDA model and utilities
 export LLaDAModel, TimeMLPEmbedding, SinusoidalTimeEmbedding
@@ -859,21 +980,28 @@ export TrainingConfig, load_training_config, train!
 export load_checkpoint, save_checkpoint
 
 # Provide conventional aliases for the main layer types.
-export DLinOSS, DLinOSSParallel, SWAttention, OscSSM
+export SWAttention, WavePDELayer
 
 # Classification model
-export OssammaClassifier, ClassifierConfig
+export SwammaClassifier, ClassifierConfig
 export SequencePooling, FixedTimeEmbedding
 export tiny_classifier, small_classifier, base_classifier
 export load_pretrained_encoder
 
 # NER model
-export OssammaNER, NERConfig
+export SwammaNER, NERConfig
 export tiny_ner, small_ner, base_ner
 export ner_cross_entropy, predict_labels, extract_entities
 export RAG_LABELS, ENTITY_TYPES, LABEL_TO_ID, ID_TO_LABEL, NUM_LABELS
 export load_ner_config, estimate_parameters, print_config_summary
 export load_ner_training_config
+
+# Relation extraction model
+export RelationExtractionConfig, SwammaRelationExtractor
+export load_relation_extraction_config, print_relation_extraction_summary
+export entity_cross_entropy, boundary_bce, relation_cross_entropy, confidence_bce
+export load_rebel_jsonl, build_token_vocab, build_entity_label_space, build_relation_label_space
+export prepare_rebel_batch, DEFAULT_ENTITY_LABELS, DEFAULT_ENTITY_TYPES
 
 # CRF layer
 export LinearChainCRF, CRFTagger
@@ -881,7 +1009,7 @@ export crf_loss, viterbi_decode
 
 # Drafter model (TiDAR-style)
 export Drafter
-export OssammaDrafterBlock, OssammaDrafter
+export SwammaDrafterBlock, SwammaDrafter
 export GRANITE_VOCAB_SIZE, QWEN3_VOCAB_SIZE, LLAMA3_VOCAB_SIZE
 export DrafterConfig, load_drafter_config, default_granite_config, default_qwen3_config
 
@@ -901,14 +1029,14 @@ export HierarchicalFrequencyConfig, compute_layer_frequencies, frequency_summary
 export LayerScaleConfig, apply_layer_scale, init_layer_scale
 export StochasticDepthConfig, should_drop_layer, layer_drop_rate, drop_path
 export CheckpointConfig, should_checkpoint
-export OssammaBlockDeep
+export SwammaBlockDeep
 export DeepModelConfig, create_deep_blocks, print_model_summary
 export deep_48L_config, ultra_96L_config, long_context_config
 export BlockTypeSchedule, UNIFORM, PROGRESSIVE, SANDWICH, ALTERNATING, get_block_type
 
 # TiDAR (Speculative Decoding with Granite Models)
 export TiDAR
-export OssammaDrafterDeep, OssammaDrafterBlockDeep
+export SwammaDrafterDeep, SwammaDrafterBlockDeep
 export TiDARConfig
 export granite_2b_drafter_config, granite_3b_drafter_config, granite_4_3b_drafter_config, granite_8b_drafter_config
 export granite_drafter_deep_config, granite_3b_drafter_deep_config

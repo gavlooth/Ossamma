@@ -1,8 +1,8 @@
-# OSSAMMA-NER Production Training Plan
+# SWAMMA-NER Production Training Plan
 
 ## Overview
 
-This plan covers end-to-end training for a production-quality Named Entity Recognition system using the OSSAMMA architecture with dual-gating. The target is the RAG-optimized 9-label schema.
+This plan covers end-to-end training for a production-quality Named Entity Recognition system using the SWAMMA architecture with dual-gating. The target is the RAG-optimized 9-label schema.
 
 ---
 
@@ -502,7 +502,7 @@ const PRETRAIN_CORPORA = [
 
 ```julia
 # scripts/pretrain.jl
-using Ossamma
+using Swamma
 using Lux
 using Optimisers
 using Zygote
@@ -765,9 +765,9 @@ end # module
 
 ```julia
 # scripts/finetune_ner.jl
-using Ossamma
-using Ossamma.NER
-using Ossamma.CRF
+using Swamma
+using Swamma.NER
+using Swamma.CRF
 using Lux
 using Optimisers
 using Zygote
@@ -780,7 +780,7 @@ function finetune_ner(config)
     println("Loading pretrained model...")
     pretrained = load_checkpoint(config.pretrained_checkpoint)
 
-    # Create NER model with OssammaNERBlock
+    # Create NER model with SwammaNERBlock
     model = create_ner_model(config, pretrained)
 
     rng = Random.default_rng()
@@ -1069,7 +1069,7 @@ end # module
 
 ```julia
 # scripts/export_model.jl
-using Ossamma
+using Swamma
 using Serialization
 using SHA
 
@@ -1094,7 +1094,7 @@ function export_for_production(checkpoint_path::String, output_dir::String)
 
     # Save metadata
     metadata = Dict(
-        "model_type" => "OssammaNER",
+        "model_type" => "SwammaNER",
         "version" => "2.0.0",
         "num_labels" => 19,
         "label_schema" => RAG_LABELS,
@@ -1121,12 +1121,12 @@ module InferenceServer
 
 using HTTP
 using JSON3
-using Ossamma
-using Ossamma.NER
+using Swamma
+using Swamma.NER
 using CUDA
 
 struct NERServer
-    model::OssammaNER
+    model::SwammaNER
     params::NamedTuple
     state::NamedTuple
     tokenizer::NERTokenizer
@@ -1139,7 +1139,7 @@ function load_server(model_dir::String; device = :gpu)
     weights = deserialize(joinpath(model_dir, "model_weights.jls"))
     config = load_config(joinpath(model_dir, "config.json"))
 
-    model = OssammaNER(config)
+    model = SwammaNER(config)
     ps = weights.params
     st = weights.state
 

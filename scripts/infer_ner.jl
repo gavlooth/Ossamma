@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-OssammaNER Inference Script
+SwammaNER Inference Script
 
 Simple script for running NER inference on text using the trained model.
 
@@ -15,11 +15,11 @@ using Serialization
 using JSON3
 using ArgParse
 
-# Load Ossamma
+# Load Swamma
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma: OssammaNER, NERConfig
-using Ossamma.NER: ID_TO_LABEL, LABEL_TO_ID, extract_entities
+using Swamma
+using Swamma: SwammaNER, NERConfig
+using Swamma.NER: ID_TO_LABEL, LABEL_TO_ID, extract_entities
 
 using Lux
 
@@ -60,7 +60,7 @@ function load_model(checkpoint_path::String, vocab_path::String)
         ffn_expansion = config.ffn_expansion,
     )
 
-    model = OssammaNER(ner_config)
+    model = SwammaNER(ner_config)
     params = checkpoint[:params]
     state = Lux.testmode(checkpoint[:state])
 
@@ -201,7 +201,7 @@ end
 # =============================================================================
 
 function parse_args()
-    s = ArgParseSettings(description = "OssammaNER Inference")
+    s = ArgParseSettings(description = "SwammaNER Inference")
 
     @add_arg_table! s begin
         "text"
@@ -231,7 +231,7 @@ function main()
 
     # Load model
     println("=" ^ 60)
-    println("OssammaNER Inference")
+    println("SwammaNER Inference")
     println("=" ^ 60)
 
     model, params, state, vocab, id_to_token, config = load_model(

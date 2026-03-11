@@ -1,6 +1,6 @@
-# OssammaNER GPU-Optimized Configuration
+# SwammaNER GPU-Optimized Configuration
 # Maximizes RTX 5090 (32GB VRAM, Compute 12.0) utilization
-# Uses parallel scan for DLinOSS and larger batch sizes
+# Uses the WavePDE-based Swamma path with larger batch sizes
 
 # =============================================================================
 # Model Architecture (~75M Parameters)
@@ -10,7 +10,7 @@ vocab_size = 32000              # Standard BPE vocabulary
 max_sequence_length = 256       # Context length
 embedding_dimension = 640       # Production size
 number_of_heads = 10            # 64 dims per head
-number_of_layers = 10           # 10 Ossamma blocks
+number_of_layers = 10           # 10 Swamma blocks
 num_labels = 17                 # 8 entity types × 2 (B/I) + O
 
 [model.dimensions]
@@ -20,7 +20,7 @@ state_dimension = 640           # Match embedding dim
 [model.attention]
 window_size = 32                # Sliding window size
 
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.01            # Slow oscillations for long-range
 max_frequency = 5.0             # Fast for word-level patterns
 default_time_step = 0.05
@@ -59,7 +59,7 @@ push_every = 2000
 # Parallelization Settings
 # =============================================================================
 [parallelization]
-# DLinOSS parallel scan configuration
+# WavePDE compatibility configuration
 use_parallel_scan = true        # Enable parallel associative scan
 chunk_size = 64                 # Chunk size for scan (power of 2)
 use_cuda_graphs = true          # CUDA graph capture for reduced kernel launch overhead

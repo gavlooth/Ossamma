@@ -2,15 +2,14 @@ Module Driver
 
 
 try
-    include("src/Dlinoss.jl")
+    include("src/WavePDE.jl")
 catch e
     @warn"You didn't load from project folder"
     @warn "Loading local module directly..."
-    include("Dlinoss.jl")
+    include("WavePDE.jl")
 end
 
-
-using .Dlinoss
+using .WavePDE
 using Lux
 using Random
 using Optimisers
@@ -23,7 +22,7 @@ using Statistics
 # ==============================================================================
 const SEQUENCE_LENGTH = 50
 const BATCH_SIZE = 16
-const STATE_DIMENSION = 64
+const STATE_DIMENSION = 16
 const HIDDEN_DIMENSION = 16
 const LEARNING_RATE = 0.005
 const EPOCHS = 200 # Reduced slightly for quick testing
@@ -57,7 +56,7 @@ end
 function build_model()
     return Chain(
         Dense(INPUT_DIMENSION => HIDDEN_DIMENSION),
-        Dlinoss.DLinOSS(HIDDEN_DIMENSION, STATE_DIMENSION, HIDDEN_DIMENSION, 0.1f0, 5.0f0, 0.05f0),
+        WavePDE.WavePDELayer(HIDDEN_DIMENSION, STATE_DIMENSION, HIDDEN_DIMENSION, 0.1f0, 5.0f0, 0.05f0),
         Lux.gelu,
         Dense(HIDDEN_DIMENSION => OUTPUT_DIMENSION),
     )

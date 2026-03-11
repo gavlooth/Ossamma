@@ -12,9 +12,9 @@ import os
 os.environ['PATH'] = '/usr/local/julia/bin:' + os.environ['PATH']
 
 # Clone repo and run
-!git clone https://github.com/gavlooth/Ossamma.git
-!cd Ossamma && julia --project=. -e 'using Pkg; Pkg.instantiate()'
-!cd Ossamma && julia --project=. scripts/train_colab.jl
+!git clone https://github.com/gavlooth/Swamma.git
+!cd Swamma && julia --project=. -e 'using Pkg; Pkg.instantiate()'
+!cd Swamma && julia --project=. scripts/train_colab.jl
 ```
 """
 
@@ -22,7 +22,7 @@ using Pkg
 
 # Handle both script and REPL execution
 const SCRIPT_DIR = @__DIR__
-const PROJECT_ROOT = isempty(SCRIPT_DIR) ? get(ENV, "OSSAMMA_ROOT", "/content/Ossamma") : dirname(SCRIPT_DIR)
+const PROJECT_ROOT = isempty(SCRIPT_DIR) ? get(ENV, "SWAMMA_ROOT", "/content/Swamma") : dirname(SCRIPT_DIR)
 
 Pkg.activate(PROJECT_ROOT)
 Pkg.instantiate()

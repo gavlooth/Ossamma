@@ -7,9 +7,9 @@ using Dates
 using Serialization
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
-using Ossamma
-using Ossamma: OssammaNER, NERConfig
-using Ossamma.NER: ID_TO_LABEL
+using Swamma
+using Swamma: SwammaNER, NERConfig
+using Swamma.NER: ID_TO_LABEL
 
 using Lux
 

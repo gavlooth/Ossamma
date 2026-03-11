@@ -1,14 +1,14 @@
 #!/bin/bash
 #
-# Vast.ai Setup Script for Ossamma Training
+# Vast.ai Setup Script for Swamma Training
 #
 # Usage:
 #   1. Rent a GPU on vast.ai (RTX 4090 or A100 recommended)
 #   2. SSH into the instance
-#   3. Run: curl -fsSL https://raw.githubusercontent.com/gavlooth/Ossamma/master/scripts/setup_vastai.sh | bash
+#   3. Run: curl -fsSL https://raw.githubusercontent.com/gavlooth/Swamma/master/scripts/setup_vastai.sh | bash
 #
 # Or manually:
-#   wget https://raw.githubusercontent.com/gavlooth/Ossamma/master/scripts/setup_vastai.sh
+#   wget https://raw.githubusercontent.com/gavlooth/Swamma/master/scripts/setup_vastai.sh
 #   chmod +x setup_vastai.sh
 #   ./setup_vastai.sh
 #
@@ -16,7 +16,7 @@
 set -e
 
 echo "========================================"
-echo "Ossamma Training Setup for Vast.ai"
+echo "Swamma Training Setup for Vast.ai"
 echo "========================================"
 echo ""
 
@@ -36,11 +36,11 @@ rm julia-1.10.5-linux-x86_64.tar.gz
 
 echo "Julia version: $(julia --version)"
 
-# Clone Ossamma
-echo "[3/5] Cloning Ossamma..."
+# Clone Swamma
+echo "[3/5] Cloning Swamma..."
 cd /workspace
-git clone https://github.com/gavlooth/Ossamma.git
-cd Ossamma
+git clone https://github.com/gavlooth/Swamma.git
+cd Swamma
 
 # Install Julia dependencies
 echo "[4/5] Installing Julia dependencies..."
@@ -56,7 +56,7 @@ echo "Setup complete!"
 echo "========================================"
 echo ""
 echo "To start training:"
-echo "  cd /workspace/Ossamma"
+echo "  cd /workspace/Swamma"
 echo "  julia --project=. scripts/train_production.jl"
 echo ""
 echo "For long training, use tmux:"

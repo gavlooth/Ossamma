@@ -16,8 +16,8 @@ using Random
 using Lux
 
 # Load module
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
 
 println("LLaDA Quickstart Example")
 println("=" ^ 40)

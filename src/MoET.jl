@@ -4,7 +4,7 @@ using Lux
 using LuxCore
 using Random
 
-import ..Ossamma: OssammaBlock
+import ..Swamma: SwammaBlock
 import ..LogicGated: TokenRouter, GatedExperts
 
 # Helper to detect and transfer to GPU arrays without requiring CUDA at compile time
@@ -48,7 +48,7 @@ Base.@kwdef struct MoETConfig
     # Attention
     window_size::Int = 256
 
-    # Oscillator SSM
+    # Wave Gate (WavePDE)
     min_frequency::Float32 = 0.1f0
     max_frequency::Float32 = 10.0f0
     default_time_step::Float32 = 0.1f0
@@ -94,7 +94,7 @@ function ExpertTower(
     parallel_chunk_size::Int = 64,
 )
     blocks = Tuple([
-        OssammaBlock(
+        SwammaBlock(
             embedding_dimension,
             max_sequence_length,
             number_of_heads,

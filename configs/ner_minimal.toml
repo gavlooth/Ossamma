@@ -1,4 +1,4 @@
-# OssammaNER Minimal Configuration - Smoke Testing
+# SwammaNER Minimal Configuration - Smoke Testing
 # ~1.5M Parameters - For quick validation and CI/CD pipelines
 
 # =============================================================================
@@ -19,7 +19,7 @@ state_dimension = 64            # Match embedding dim
 [model.attention]
 window_size = 8                 # Small attention window
 
-[model.oscillator]
+[model.wave_gate]
 min_frequency = 0.1
 max_frequency = 10.0
 default_time_step = 0.1

@@ -1,6 +1,6 @@
-# Drafter.jl - Simplified Ossamma block for TiDAR-style drafting
+# Drafter.jl - Simplified Swamma block for TiDAR-style drafting
 #
-# This is Option C: LinearAttention + DLinOSS only, no SWAttention.
+# This is Option C: LinearAttention + WavePDE only, no SWAttention.
 # The hypothesis: AR verifier handles grammar, drafter needs global semantics.
 
 module Drafter
@@ -12,17 +12,16 @@ using Random
 using Statistics: mean
 import TOML
 
-# Import from parent module (will be included after Ossamma.jl)
+# Import from parent module (will be included after Swamma.jl)
 import ..TimeConditionedLayerNorm
 import ..LinearAttentionLayer
-import ..DLinOSS
-import ..DLinOSSParallel
+import ..WavePDELayer
 import ..SwiGLU
 
-export OssammaDrafterBlock
+export SwammaDrafterBlock
 
 # =============================================================================
-# OssammaDrafterBlock - Simplified block for language model drafting
+# SwammaDrafterBlock - Simplified block for language model drafting
 # =============================================================================
 #
 # Architecture (Transformer-style residuals):
@@ -33,7 +32,7 @@ export OssammaDrafterBlock
 #       ↓                                  │
 #   Dense(d → 2d) → split                  │
 #       ↓              ↓                   │
-#   LinearAttn      DLinOSS                │
+#   LinearAttn      WavePDE                │
 #       ↓              ↓                   │
 #       └─── ⊙ sigmoid ─┘                  │
 #              ↓                           │
@@ -47,12 +46,12 @@ export OssammaDrafterBlock
 #              ↓
 #           Output
 #
-# Key differences from OssammaNERBlock:
+# Key differences from SwammaNERBlock:
 #   - No SlidingWindowAttention (AR verifier handles local patterns)
 #   - No α-mixing gating - uses standard residual like transformers
 #   - Simpler: drafter proposes, AR verifier decides
 
-struct OssammaDrafterBlock <: LuxCore.AbstractLuxLayer
+struct SwammaDrafterBlock <: LuxCore.AbstractLuxLayer
     # Dimensions
     embedding_dimension::Int
     sequence_length::Int
@@ -67,18 +66,18 @@ struct OssammaDrafterBlock <: LuxCore.AbstractLuxLayer
     InputNorm::TimeConditionedLayerNorm
     GluProjection::Lux.Dense           # d → 2d
     LinearAttention::LinearAttentionLayer
-    OscillatorLayer::Union{DLinOSS, DLinOSSParallel}
+    WaveGateLayer::WavePDELayer
     Dropout::LuxCore.AbstractLuxLayer
     FFN::Union{SwiGLU, Nothing}
     OutputNorm::Lux.LayerNorm
 end
 
 """
-    OssammaDrafterBlock(embedding_dimension, sequence_length, number_of_heads, time_dimension; kwargs...)
+    SwammaDrafterBlock(embedding_dimension, sequence_length, number_of_heads, time_dimension; kwargs...)
 
-Create a simplified Ossamma block for TiDAR-style drafting.
+Create a simplified Swamma block for TiDAR-style drafting.
 
-This block uses only the GLU-Global branch (LinearAttention + DLinOSS),
+This block uses only the GLU-Global branch (LinearAttention + WavePDE),
 removing the Local-Sharp branch (SWAttention) and α-mixing.
 
 # Arguments
@@ -88,17 +87,17 @@ removing the Local-Sharp branch (SWAttention) and α-mixing.
 - `time_dimension::Int`: Dimension for time embeddings
 
 # Keyword Arguments
-- `state_dimension::Int`: Oscillator state dimension (default: embedding_dimension)
-- `min_frequency::Float32`: Minimum oscillator frequency (default: 0.1)
-- `max_frequency::Float32`: Maximum oscillator frequency (default: 10.0)
-- `default_time_step::Float32`: Default Δt for oscillators (default: 0.1)
+- `state_dimension::Int`: Wave-state dimension (default: embedding_dimension)
+- `min_frequency::Float32`: Minimum wave-speed initialisation (default: 0.1)
+- `max_frequency::Float32`: Maximum wave-speed initialisation (default: 10.0)
+- `default_time_step::Float32`: Default Δt for WavePDE integration (default: 0.1)
 - `dropout_rate::Float32`: Dropout rate (default: 0.1)
 - `use_ffn::Bool`: Enable SwiGLU FFN (default: true)
 - `ffn_expansion::Float32`: FFN expansion factor (default: 1.5)
-- `use_parallel_scan::Bool`: Use parallel scan for oscillators (default: false)
-- `parallel_chunk_size::Int`: Chunk size for parallel scan (default: 64)
+- `use_parallel_scan::Bool`: Retained for config compatibility; WavePDE is already parallel (default: false)
+- `parallel_chunk_size::Int`: Retained for config compatibility (default: 64)
 """
-function OssammaDrafterBlock(
+function SwammaDrafterBlock(
     embedding_dimension::Int,
     sequence_length::Int,
     number_of_heads::Int,
@@ -113,21 +112,13 @@ function OssammaDrafterBlock(
     use_parallel_scan::Bool = false,
     parallel_chunk_size::Int = 64,
 )
-    # Choose oscillator implementation
-    oscillator_layer = if use_parallel_scan
-        DLinOSSParallel(
-            embedding_dimension, state_dimension, embedding_dimension,
-            min_frequency, max_frequency, default_time_step;
-            chunk_size = parallel_chunk_size
-        )
-    else
-        DLinOSS(
-            embedding_dimension, state_dimension, embedding_dimension,
-            min_frequency, max_frequency, default_time_step
-        )
-    end
+    # WavePDE is the only supported structured gate path here.
+    oscillator_layer = WavePDELayer(
+        embedding_dimension, state_dimension, embedding_dimension,
+        min_frequency, max_frequency, default_time_step,
+    )
 
-    return OssammaDrafterBlock(
+    return SwammaDrafterBlock(
         embedding_dimension,
         sequence_length,
         number_of_heads,
@@ -151,7 +142,7 @@ end
 # Parameter and State Initialization
 # =============================================================================
 
-function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaDrafterBlock)
+function Lux.initialparameters(rng::Random.AbstractRNG, block::SwammaDrafterBlock)
     ffn_params = if block.use_ffn && block.FFN !== nothing
         Lux.initialparameters(rng, block.FFN)
     else
@@ -162,14 +153,14 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::OssammaDrafterBlo
         InputNorm = Lux.initialparameters(rng, block.InputNorm),
         GluProjection = Lux.initialparameters(rng, block.GluProjection),
         LinearAttention = Lux.initialparameters(rng, block.LinearAttention),
-        OscillatorLayer = Lux.initialparameters(rng, block.OscillatorLayer),
+        WaveGateLayer = Lux.initialparameters(rng, block.WaveGateLayer),
         Dropout = Lux.initialparameters(rng, block.Dropout),
         FFN = ffn_params,
         OutputNorm = Lux.initialparameters(rng, block.OutputNorm),
     )
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaDrafterBlock)
+function Lux.initialstates(rng::Random.AbstractRNG, block::SwammaDrafterBlock)
     ffn_state = if block.use_ffn && block.FFN !== nothing
         Lux.initialstates(rng, block.FFN)
     else
@@ -180,7 +171,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, block::OssammaDrafterBlock)
         InputNorm = Lux.initialstates(rng, block.InputNorm),
         GluProjection = Lux.initialstates(rng, block.GluProjection),
         LinearAttention = Lux.initialstates(rng, block.LinearAttention),
-        OscillatorLayer = Lux.initialstates(rng, block.OscillatorLayer),
+        WaveGateLayer = Lux.initialstates(rng, block.WaveGateLayer),
         Dropout = Lux.initialstates(rng, block.Dropout),
         FFN = ffn_state,
         OutputNorm = Lux.initialstates(rng, block.OutputNorm),
@@ -191,7 +182,7 @@ end
 # Forward Pass
 # =============================================================================
 
-function (block::OssammaDrafterBlock)(inputs::Tuple, params, state)
+function (block::SwammaDrafterBlock)(inputs::Tuple, params, state)
     input_tensor, time_input = inputs
     # input_tensor: (embedding_dim, seq_len, batch) or (embedding_dim, seq_len)
     # time_input: (time_dim, batch) or (time_dim,)
@@ -215,7 +206,7 @@ function (block::OssammaDrafterBlock)(inputs::Tuple, params, state)
         normalized, params.GluProjection, state.GluProjection
     )
 
-    # Split into path_a (LinearAttention) and path_b (Oscillator)
+    # Split into path_a (LinearAttention) and path_b (Wave Gate)
     dim = block.embedding_dimension
     path_a = copy(selectdim(glu_projected, 1, 1:dim))
     path_b = copy(selectdim(glu_projected, 1, (dim+1):size(glu_projected, 1)))
@@ -225,9 +216,9 @@ function (block::OssammaDrafterBlock)(inputs::Tuple, params, state)
         (path_a, time_input), params.LinearAttention, state.LinearAttention
     )
 
-    # path_b → Oscillator SSM (sequential memory)
-    osc_out, osc_state = block.OscillatorLayer(
-        path_b, params.OscillatorLayer, state.OscillatorLayer
+    # path_b → WavePDE gate
+    osc_out, osc_state = block.WaveGateLayer(
+        path_b, params.WaveGateLayer, state.WaveGateLayer
     )
 
     # GLU gating: attn_out ⊙ sigmoid(osc_out)
@@ -269,7 +260,7 @@ function (block::OssammaDrafterBlock)(inputs::Tuple, params, state)
         InputNorm = norm_state,
         GluProjection = glu_proj_state,
         LinearAttention = lin_attn_state,
-        OscillatorLayer = osc_state,
+        WaveGateLayer = osc_state,
         Dropout = dropout_state,
         FFN = ffn_state,
         OutputNorm = output_norm_state,
@@ -279,7 +270,7 @@ function (block::OssammaDrafterBlock)(inputs::Tuple, params, state)
 end
 
 # =============================================================================
-# OssammaDrafter - Full language model drafter for TiDAR-style generation
+# SwammaDrafter - Full language model drafter for TiDAR-style generation
 # =============================================================================
 #
 # Architecture:
@@ -289,7 +280,7 @@ end
 #       ↓
 #   TimeMLPEmbedding(t) → time_emb
 #       ↓
-#   N × OssammaDrafterBlock(hidden, time_emb)
+#   N × SwammaDrafterBlock(hidden, time_emb)
 #       ↓
 #   Final LayerNorm
 #       ↓
@@ -301,7 +292,7 @@ end
 #   - Drafter predicts [MASK] tokens in parallel (diffusion)
 #   - AR verifier validates via rejection sampling
 
-export OssammaDrafter
+export SwammaDrafter
 export GRANITE_VOCAB_SIZE, QWEN3_VOCAB_SIZE, LLAMA3_VOCAB_SIZE
 export DrafterConfig, load_drafter_config, default_granite_config, default_qwen3_config
 
@@ -410,9 +401,9 @@ function (layer::TimeMLPEmbedding)(t, params, state)
 end
 
 # -----------------------------------------------------------------------------
-# OssammaDrafter Model
+# SwammaDrafter Model
 # -----------------------------------------------------------------------------
-struct OssammaDrafter{E,P,T,B,N,L} <: LuxCore.AbstractLuxLayer
+struct SwammaDrafter{E,P,T,B,N,L} <: LuxCore.AbstractLuxLayer
     # Configuration
     vocab_size::Int
     max_sequence_length::Int
@@ -437,7 +428,7 @@ end
 """
     DrafterConfig
 
-Configuration for OssammaDrafter model.
+Configuration for SwammaDrafter model.
 
 # Fields
 - `ar_model::String`: AR verifier model name ("granite", "granite4", "qwen3", "llama3")
@@ -451,7 +442,7 @@ Configuration for OssammaDrafter model.
 - `dropout_rate::Float32`: Dropout rate
 - `use_ffn::Bool`: Enable SwiGLU FFN in blocks
 - `ffn_expansion::Float32`: FFN expansion factor
-- `use_parallel_scan::Bool`: Use parallel scan for oscillators
+- `use_parallel_scan::Bool`: Retained for config compatibility; WavePDE is already parallel
 """
 Base.@kwdef struct DrafterConfig
     # AR model selection
@@ -577,12 +568,12 @@ function load_drafter_config(path::String)
 end
 
 """
-    OssammaDrafter(config::DrafterConfig)
+    SwammaDrafter(config::DrafterConfig)
 
-Create an OssammaDrafter from a DrafterConfig.
+Create an SwammaDrafter from a DrafterConfig.
 """
-function OssammaDrafter(config::DrafterConfig)
-    return OssammaDrafter(;
+function SwammaDrafter(config::DrafterConfig)
+    return SwammaDrafter(;
         vocab_size = config.vocab_size,
         max_sequence_length = config.max_sequence_length,
         embedding_dimension = config.embedding_dimension,
@@ -598,9 +589,9 @@ function OssammaDrafter(config::DrafterConfig)
 end
 
 """
-    OssammaDrafter(; kwargs...)
+    SwammaDrafter(; kwargs...)
 
-Create a full Ossamma drafter model for TiDAR-style text generation.
+Create a full Swamma drafter model for TiDAR-style text generation.
 
 # Keyword Arguments
 - `vocab_size::Int = 100352`: Vocabulary size (default: Granite 4.0)
@@ -613,9 +604,9 @@ Create a full Ossamma drafter model for TiDAR-style text generation.
 - `dropout_rate::Float32 = 0.1`: Dropout rate
 - `use_ffn::Bool = true`: Enable SwiGLU FFN in blocks
 - `ffn_expansion::Float32 = 1.5`: FFN expansion factor
-- `use_parallel_scan::Bool = false`: Use parallel scan for oscillators
+- `use_parallel_scan::Bool = false`: Retained for config compatibility
 """
-function OssammaDrafter(;
+function SwammaDrafter(;
     vocab_size::Int = GRANITE_VOCAB_SIZE,
     max_sequence_length::Int = 2048,
     embedding_dimension::Int = 512,
@@ -630,7 +621,7 @@ function OssammaDrafter(;
 )
     # Create blocks
     blocks = [
-        OssammaDrafterBlock(
+        SwammaDrafterBlock(
             embedding_dimension,
             max_sequence_length,
             number_of_heads,
@@ -645,7 +636,7 @@ function OssammaDrafter(;
 
     actual_vocab_size = max(vocab_size, mask_token_id)
 
-    return OssammaDrafter(
+    return SwammaDrafter(
         actual_vocab_size,
         max_sequence_length,
         embedding_dimension,
@@ -663,7 +654,7 @@ function OssammaDrafter(;
     )
 end
 
-function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaDrafter)
+function Lux.initialparameters(rng::Random.AbstractRNG, model::SwammaDrafter)
     block_params = [Lux.initialparameters(rng, block) for block in model.Blocks]
 
     return (
@@ -676,7 +667,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, model::OssammaDrafter)
     )
 end
 
-function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaDrafter)
+function Lux.initialstates(rng::Random.AbstractRNG, model::SwammaDrafter)
     block_states = [Lux.initialstates(rng, block) for block in model.Blocks]
 
     return (
@@ -690,7 +681,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::OssammaDrafter)
 end
 
 """
-    (model::OssammaDrafter)(token_ids, t, params, state)
+    (model::SwammaDrafter)(token_ids, t, params, state)
 
 Forward pass of the drafter.
 
@@ -704,7 +695,7 @@ Forward pass of the drafter.
 - `logits`: (vocab_size, seq_len, batch) - predictions for all positions
 - `new_state`: Updated state
 """
-function (model::OssammaDrafter)(token_ids, t, params, state)
+function (model::SwammaDrafter)(token_ids, t, params, state)
     # Handle input dimensions
     if ndims(token_ids) == 1
         token_ids = reshape(token_ids, :, 1)  # (seq_len,) → (seq_len, 1)
@@ -814,7 +805,7 @@ end
 # -----------------------------------------------------------------------------
 # Utility: Count parameters
 # -----------------------------------------------------------------------------
-function count_parameters(model::OssammaDrafter)
+function count_parameters(model::SwammaDrafter)
     d = model.embedding_dimension
     V = model.vocab_size
     L = model.number_of_layers
@@ -827,7 +818,7 @@ function count_parameters(model::OssammaDrafter)
     time_emb = t_dim * d + d * d + d * d  # sinusoidal + MLP1 + MLP2 (approx)
 
     # Blocks (rough estimate per block)
-    # GLU: d→2d, LinearAttn, DLinOSS, d→d, SwiGLU, LayerNorm
+    # GLU: d→2d, LinearAttn, WavePDE, d→d, SwiGLU, LayerNorm
     per_block = 2d*d + d*d + d*d + d*d + Int(round(d * 1.5 * 2)) * d + d  # rough
     blocks_total = per_block * L
 

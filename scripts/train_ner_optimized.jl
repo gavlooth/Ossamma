@@ -20,8 +20,8 @@ using LinearAlgebra
 BLAS.set_num_threads(Threads.nthreads())
 
 # Load the main module
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
+using .Swamma
 
 using Lux
 using Optimisers
@@ -44,7 +44,7 @@ end
 
 function main()
     println("=" ^ 60)
-    println("OssammaNER Optimized CPU Training")
+    println("SwammaNER Optimized CPU Training")
     println("=" ^ 60)
     println("Time: ", Dates.now())
     println("Julia threads: ", Threads.nthreads())
@@ -73,7 +73,7 @@ function main()
     # Create model
     # =========================================================================
     println("\n[1/5] Creating model...")
-    model = OssammaNER(config)
+    model = SwammaNER(config)
 
     rng = Random.default_rng()
     Random.seed!(rng, 42)

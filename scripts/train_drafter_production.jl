@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Production training script for OssammaDrafter with HF tokenizer and optional Granite 4 teacher.
+Production training script for SwammaDrafter with HF tokenizer and optional Granite 4 teacher.
 
 Features:
 - HuggingFace dataset download
@@ -31,13 +31,13 @@ using Statistics
 using PyCall
 using TOML
 
-include(joinpath(@__DIR__, "..", "src", "Ossamma.jl"))
+include(joinpath(@__DIR__, "..", "src", "Swamma.jl"))
 include(joinpath(@__DIR__, "..", "src", "DataLoader.jl"))
 
-using .Ossamma
-using .Ossamma: OssammaDrafter, load_drafter_config
-using .Ossamma: combined_drafter_loss, save_drafter_checkpoint, load_drafter_checkpoint
-using .Ossamma.HFTokenizer: load_tokenizer, batch_encode, get_vocab_size, get_mask_token_id
+using .Swamma
+using .Swamma: SwammaDrafter, load_drafter_config
+using .Swamma: combined_drafter_loss, save_drafter_checkpoint, load_drafter_checkpoint
+using .Swamma.HFTokenizer: load_tokenizer, batch_encode, get_vocab_size, get_mask_token_id
 using .DataLoader: download_hf_dataset, get_texts
 
 using Lux
@@ -49,7 +49,7 @@ using Zygote
 # =============================================================================
 
 function parse_commandline()
-    s = ArgParseSettings(description = "Production training for OssammaDrafter")
+    s = ArgParseSettings(description = "Production training for SwammaDrafter")
 
     @add_arg_table! s begin
         "--train-config"
@@ -571,7 +571,7 @@ function main()
     rng = Random.default_rng()
 
     println("=" ^ 60)
-    println("OssammaDrafter Production Training")
+    println("SwammaDrafter Production Training")
     println("=" ^ 60)
 
     println("\nLoading config: $(args["config"]) ")
@@ -628,7 +628,7 @@ function main()
     end
 
     println("\nCreating model...")
-    model = OssammaDrafter(model_config)
+    model = SwammaDrafter(model_config)
 
     # Load data
     train_texts = load_jsonl_texts(args["data"])

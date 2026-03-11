@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-Production training script for Ossamma LLaDA model.
+Production training script for Swamma LLaDA model.
 
 Optimized for GPUs with 24GB+ VRAM (L4, A100, RTX 4090, etc.)
 
@@ -23,7 +23,7 @@ using Pkg
 const SCRIPT_DIR = @__DIR__
 const PROJECT_ROOT = if isempty(SCRIPT_DIR) || SCRIPT_DIR == "."
     # Running from REPL or include_string
-    get(ENV, "OSSAMMA_ROOT", pwd())
+    get(ENV, "SWAMMA_ROOT", pwd())
 else
     dirname(SCRIPT_DIR)
 end
@@ -31,7 +31,7 @@ end
 Pkg.activate(PROJECT_ROOT)
 
 println("=" ^ 70)
-println("OSSAMMA Production Training")
+println("SWAMMA Production Training")
 println("=" ^ 70)
 println()
 
@@ -45,8 +45,8 @@ using Zygote
 using Optimisers
 using Statistics: mean
 
-include(joinpath(PROJECT_ROOT, "src", "Ossamma.jl"))
-using .Ossamma
+include(joinpath(PROJECT_ROOT, "src", "Swamma.jl"))
+using .Swamma
 
 include(joinpath(PROJECT_ROOT, "src", "DataLoader.jl"))
 using .DataLoader
