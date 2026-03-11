@@ -1,7 +1,7 @@
 # Drafter.jl - Simplified Swamma block for TiDAR-style drafting
 #
-# This is Option C: LinearAttention + WavePDE only, no SWAttention.
-# The hypothesis: AR verifier handles grammar, drafter needs global semantics.
+# This is the verifier-backed global-only drafter:
+# LinearAttention + WavePDE, with no SWAttention branch.
 
 module Drafter
 
@@ -94,7 +94,7 @@ removing the Local-Sharp branch (SWAttention) and α-mixing.
 - `dropout_rate::Float32`: Dropout rate (default: 0.1)
 - `use_ffn::Bool`: Enable SwiGLU FFN (default: true)
 - `ffn_expansion::Float32`: FFN expansion factor (default: 1.5)
-- `use_parallel_scan::Bool`: Retained for config compatibility; WavePDE is already parallel (default: false)
+- `use_parallel_scan::Bool`: Retained for config compatibility; unused by the active WavePDE path (default: false)
 - `parallel_chunk_size::Int`: Retained for config compatibility (default: 64)
 """
 function SwammaDrafterBlock(
@@ -112,8 +112,8 @@ function SwammaDrafterBlock(
     use_parallel_scan::Bool = false,
     parallel_chunk_size::Int = 64,
 )
-    # WavePDE is the only supported structured gate path here.
-    oscillator_layer = WavePDELayer(
+    # The drafter keeps only the global structured gate path.
+    wave_gate_layer = WavePDELayer(
         embedding_dimension, state_dimension, embedding_dimension,
         min_frequency, max_frequency, default_time_step,
     )
@@ -131,7 +131,7 @@ function SwammaDrafterBlock(
         TimeConditionedLayerNorm(embedding_dimension, time_dimension),
         Lux.Dense(embedding_dimension => 2 * embedding_dimension),
         LinearAttentionLayer(embedding_dimension, sequence_length, number_of_heads, time_dimension),
-        oscillator_layer,
+        wave_gate_layer,
         Lux.Dropout(dropout_rate),
         use_ffn ? SwiGLU(embedding_dimension; expansion_factor = ffn_expansion) : nothing,
         Lux.LayerNorm((embedding_dimension,)),
@@ -216,14 +216,13 @@ function (block::SwammaDrafterBlock)(inputs::Tuple, params, state)
         (path_a, time_input), params.LinearAttention, state.LinearAttention
     )
 
-    # path_b → WavePDE gate
-    osc_out, osc_state = block.WaveGateLayer(
+    # path_b → structured wave gate
+    wave_gate_out, wave_gate_state = block.WaveGateLayer(
         path_b, params.WaveGateLayer, state.WaveGateLayer
     )
 
-    # GLU gating: attn_out ⊙ sigmoid(osc_out)
-    # No output projection needed - SwiGLU FFN will transform
-    output = attn_out .* NNlib.sigmoid.(osc_out)
+    # GLU gating: global content modulated by the Wave-PDE gate.
+    output = attn_out .* NNlib.sigmoid.(wave_gate_out)
 
     # =========================================================================
     # 3. Dropout
@@ -260,7 +259,7 @@ function (block::SwammaDrafterBlock)(inputs::Tuple, params, state)
         InputNorm = norm_state,
         GluProjection = glu_proj_state,
         LinearAttention = lin_attn_state,
-        WaveGateLayer = osc_state,
+        WaveGateLayer = wave_gate_state,
         Dropout = dropout_state,
         FFN = ffn_state,
         OutputNorm = output_norm_state,

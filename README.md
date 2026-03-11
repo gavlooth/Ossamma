@@ -104,6 +104,16 @@ The intended effect is not "more mechanisms". It is a hierarchy:
 global interpretation -> local conditioning -> local refinement -> adaptive merge
 ```
 
+## Main Model vs Drafter
+
+The repo intentionally keeps two different block roles:
+
+- `SwammaBlock` is the main-model block. It keeps both the global structured path
+  and the local corrective path because the main model must carry its own local precision.
+- `SwammaDrafterBlock` is the verifier-backed drafting block. It drops `SWAttention`
+  and `α`-mixing and keeps only `LinearAttention + WavePDE`, because the drafter's
+  job is to cheaply propose globally coherent token fields and let the verifier reject bad local structure.
+
 ## Core Components
 
 ### WavePDE Gate

@@ -12,7 +12,7 @@ Architecture:
 3. Accept: Tokens that match verifier's top prediction
 4. Reject: Re-draft from first rejection point
 
-Key insight: Drafter uses O(T) complexity with parallel scan, enabling
+Key insight: Drafter uses O(T) global operators, enabling
 deep (48-96L) narrow models that run fast on GPU.
 
 Reference: docs/DEPTH_SCALING_STRATEGY.md
@@ -82,7 +82,7 @@ Deep-optimized drafter block with:
 - Hierarchical frequency ranges
 - Layer scale initialization
 - Stochastic depth
-- Parallel scan (mandatory for speed)
+- A global-only `LinearAttention + WavePDE` proposer path
 
 This is the building block for TiDAR drafters.
 """
@@ -139,8 +139,8 @@ function SwammaDrafterBlockDeep(
     # Compute layer-specific frequencies
     min_freq, max_freq = compute_layer_frequencies(layer_idx, total_layers, freq_config)
 
-    # WavePDE is the structured gate path used by TiDAR.
-    oscillator = WavePDELayer(
+    # TiDAR uses the same global-only Wave-PDE-gated proposer block.
+    wave_gate_layer = WavePDELayer(
         embedding_dimension, state_dimension, embedding_dimension,
         min_freq, max_freq, 0.1f0,
     )
@@ -165,7 +165,7 @@ function SwammaDrafterBlockDeep(
         TimeConditionedLayerNorm(embedding_dimension, time_dimension),
         Lux.Dense(embedding_dimension => 2 * embedding_dimension),
         LinearAttentionLayer(embedding_dimension, sequence_length, number_of_heads, time_dimension),
-        oscillator,
+        wave_gate_layer,
         Lux.Dropout(dropout_rate),
         use_ffn ? SwiGLU(embedding_dimension; expansion_factor = ffn_expansion) : nothing,
         Lux.LayerNorm((embedding_dimension,)),
@@ -257,13 +257,13 @@ function (block::SwammaDrafterBlockDeep)(inputs::Tuple, params, state)
         (path_a, time_input), params.LinearAttention, state.LinearAttention
     )
 
-    # Wave Gate (WavePDE temporal memory)
-    osc_out, osc_state = block.WaveGateLayer(
+    # Structured wave gate over the global path
+    wave_gate_out, wave_gate_state = block.WaveGateLayer(
         path_b, params.WaveGateLayer, state.WaveGateLayer
     )
 
     # GLU gating
-    output = attn_out .* NNlib.sigmoid.(osc_out)
+    output = attn_out .* NNlib.sigmoid.(wave_gate_out)
 
     # 3. Dropout
     output, dropout_state = block.Dropout(output, params.Dropout, state.Dropout)
@@ -292,7 +292,7 @@ function (block::SwammaDrafterBlockDeep)(inputs::Tuple, params, state)
         InputNorm = norm_state,
         GluProjection = glu_proj_state,
         LinearAttention = lin_attn_state,
-        WaveGateLayer = osc_state,
+        WaveGateLayer = wave_gate_state,
         Dropout = dropout_state,
         FFN = ffn_state,
         OutputNorm = output_norm_state,

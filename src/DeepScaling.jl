@@ -350,7 +350,7 @@ A deep-network optimized variant of SwammaBlock with:
 
 # Architecture variants
 - `:full`: Full SwammaBlock (LinearAttn + WavePDE + SWAttention)
-- `:global_only`: LinearAttention + WavePDE only (like SwammaDrafterBlock)
+- `:global_only`: LinearAttention + WavePDE only (the verifier-backed drafter path)
 - `:local_only`: SWAttention only (lightweight local processing)
 """
 struct SwammaBlockDeep <: LuxCore.AbstractLuxLayer

@@ -23,6 +23,11 @@ In shorthand:
 global interpretation -> local conditioning -> local refinement -> adaptive merge
 ```
 
+This is specifically the `SwammaNER` / main-model story. The drafter path in
+`src/Drafter.jl` is intentionally simpler: it keeps only the global
+`LinearAttention + WavePDE` proposer block because local correctness is enforced
+later by verifier rejection rather than by an internal local branch.
+
 ```
 ╔═══════════════════════════════════════════════════════════════════════════════════════════════════╗
 ║                                    SWAMMA-NER ARCHITECTURE                                        ║
