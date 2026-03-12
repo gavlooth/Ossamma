@@ -783,6 +783,177 @@ function (block::SwammaBlock)(inputs::Tuple, params, state)
 end
 
 # ============================================================================
+# Lightweight Local-Wave Refinement Block
+# ============================================================================
+struct LocalWaveRefinementBlock <: LuxLayer
+    embedding_dimension::Int
+    sequence_length::Int
+    number_of_heads::Int
+    time_dimension::Int
+    state_dimension::Int
+    dropout_rate::Float32
+    InputNorm::TimeConditionedLayerNorm
+    SlidingWindowAttention::SWAttention
+    LocalNorm::RMSNorm
+    WaveLayer::WavePDELayer
+    WaveNorm::RMSNorm
+    GateProjection::Lux.Dense
+    AttentionDropout::LuxLayer
+    OutputNorm::Lux.LayerNorm
+end
+
+function LocalWaveRefinementBlock(
+    embedding_dimension::Int,
+    sequence_length::Int,
+    number_of_heads::Int,
+    time_dimension::Int;
+    state_dimension::Int = embedding_dimension,
+    window_size::Int = 256,
+    min_frequency::Float32 = 0.1f0,
+    max_frequency::Float32 = 10.0f0,
+    default_time_step::Float32 = 0.1f0,
+    dropout_rate::Float32 = 0.1f0,
+)
+    state_dimension == embedding_dimension || throw(ArgumentError(
+        "LocalWaveRefinementBlock requires state_dimension == embedding_dimension because WavePDELayer is projection-free."
+    ))
+    embedding_dimension % number_of_heads == 0 || throw(ArgumentError(
+        "embedding_dimension=$(embedding_dimension) must be divisible by number_of_heads=$(number_of_heads)."
+    ))
+
+    return LocalWaveRefinementBlock(
+        embedding_dimension,
+        sequence_length,
+        number_of_heads,
+        time_dimension,
+        state_dimension,
+        dropout_rate,
+        TimeConditionedLayerNorm(embedding_dimension, time_dimension),
+        SWAttention(
+            sequence_length,
+            embedding_dimension,
+            number_of_heads;
+            window_size = window_size,
+        ),
+        RMSNorm(embedding_dimension),
+        WavePDELayer(
+            embedding_dimension,
+            state_dimension,
+            embedding_dimension,
+            min_frequency,
+            max_frequency,
+            default_time_step,
+        ),
+        RMSNorm(embedding_dimension),
+        Lux.Dense(embedding_dimension => 1),
+        Lux.Dropout(dropout_rate),
+        Lux.LayerNorm((embedding_dimension,)),
+    )
+end
+
+function Lux.initialparameters(rng::Random.AbstractRNG, layer::LocalWaveRefinementBlock)
+    gate_params = Lux.initialparameters(rng, layer.GateProjection)
+
+    return (
+        InputNorm = Lux.initialparameters(rng, layer.InputNorm),
+        SlidingWindowAttention = Lux.initialparameters(rng, layer.SlidingWindowAttention),
+        LocalNorm = Lux.initialparameters(rng, layer.LocalNorm),
+        WaveLayer = Lux.initialparameters(rng, layer.WaveLayer),
+        WaveNorm = Lux.initialparameters(rng, layer.WaveNorm),
+        GateProjection = (
+            weight = gate_params.weight .* 0.02f0,
+            bias = gate_params.bias .- 1.5f0,
+        ),
+        LocalScale = fill(1.0f0, 1),
+        WaveScale = fill(0.25f0, 1),
+        AttentionDropout = Lux.initialparameters(rng, layer.AttentionDropout),
+        OutputNorm = Lux.initialparameters(rng, layer.OutputNorm),
+    )
+end
+
+function Lux.initialstates(rng::Random.AbstractRNG, layer::LocalWaveRefinementBlock)
+    return (
+        InputNorm = Lux.initialstates(rng, layer.InputNorm),
+        SlidingWindowAttention = Lux.initialstates(rng, layer.SlidingWindowAttention),
+        LocalNorm = Lux.initialstates(rng, layer.LocalNorm),
+        WaveLayer = Lux.initialstates(rng, layer.WaveLayer),
+        WaveNorm = Lux.initialstates(rng, layer.WaveNorm),
+        GateProjection = Lux.initialstates(rng, layer.GateProjection),
+        AttentionDropout = Lux.initialstates(rng, layer.AttentionDropout),
+        OutputNorm = Lux.initialstates(rng, layer.OutputNorm),
+    )
+end
+
+function (block::LocalWaveRefinementBlock)(inputs::Tuple, params, state)
+    input_tensor, time_input = inputs
+    residual = input_tensor
+
+    normalized, alpha_bias, norm_state = block.InputNorm(
+        input_tensor, time_input, params.InputNorm, state.InputNorm
+    )
+
+    local_output, sw_attn_state = block.SlidingWindowAttention(
+        normalized, params.SlidingWindowAttention, state.SlidingWindowAttention
+    )
+    local_output, local_norm_state = block.LocalNorm(
+        local_output, params.LocalNorm, state.LocalNorm
+    )
+
+    wave_output, wave_state = block.WaveLayer(
+        normalized, params.WaveLayer, state.WaveLayer
+    )
+    wave_output, wave_norm_state = block.WaveNorm(
+        wave_output, params.WaveNorm, state.WaveNorm
+    )
+
+    dim = block.embedding_dimension
+    original_size = size(normalized)
+    normalized_flat = reshape(normalized, dim, :)
+    gate_logits_flat, gate_state = block.GateProjection(
+        normalized_flat, params.GateProjection, state.GateProjection
+    )
+
+    if ndims(input_tensor) == 3
+        gate_logits = reshape(gate_logits_flat, 1, original_size[2], original_size[3])
+        gate_bias = reshape(alpha_bias, 1, 1, size(alpha_bias, 2))
+        scale_shape = (1, 1, 1)
+    else
+        gate_logits = reshape(gate_logits_flat, 1, original_size[2])
+        gate_bias = reshape(alpha_bias, 1, 1)
+        scale_shape = (1, 1)
+    end
+
+    gate = NNlib.sigmoid.(gate_logits .+ gate_bias)
+    local_scale = reshape(params.LocalScale, scale_shape...)
+    wave_scale = reshape(params.WaveScale, scale_shape...)
+    update = local_scale .* local_output .+ wave_scale .* (gate .* wave_output)
+
+    update, dropout_state = block.AttentionDropout(
+        update, params.AttentionDropout, state.AttentionDropout
+    )
+
+    output_pre_norm = residual .+ update
+    output_flat = reshape(output_pre_norm, dim, :)
+    output_norm_flat, output_norm_state = block.OutputNorm(
+        output_flat, params.OutputNorm, state.OutputNorm
+    )
+    output = reshape(output_norm_flat, size(output_pre_norm))
+
+    new_state = (
+        InputNorm = norm_state,
+        SlidingWindowAttention = sw_attn_state,
+        LocalNorm = local_norm_state,
+        WaveLayer = wave_state,
+        WaveNorm = wave_norm_state,
+        GateProjection = gate_state,
+        AttentionDropout = dropout_state,
+        OutputNorm = output_norm_state,
+    )
+
+    return output, new_state
+end
+
+# ============================================================================
 # SwammaNERBlock
 # ============================================================================
 """
@@ -981,6 +1152,7 @@ export load_checkpoint, save_checkpoint
 
 # Provide conventional aliases for the main layer types.
 export SWAttention, WavePDELayer
+export LocalWaveRefinementBlock
 
 # Classification model
 export SwammaClassifier, ClassifierConfig
