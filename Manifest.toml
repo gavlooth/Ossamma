@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.4"
+julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "312cfc75cc0458d37c20c899011c08c10703d05b"
+project_hash = "82cebd554764d2631b69bb23453078831f3f660e"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "8b2b045b22740e4be20654175cc38291d48539db"
@@ -1047,12 +1047,6 @@ git-tree-sha1 = "05868e21324cede2207c6f0f466b4bfef6d5e7ee"
 uuid = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
 version = "1.8.1"
 
-[[deps.Swamma]]
-deps = ["ArgParse", "CUDA", "Dates", "Downloads", "FFTW", "GPUArrays", "HTTP", "JSON3", "Lux", "LuxCUDA", "LuxCore", "MLStyle", "NNlib", "OpenCL", "Optimisers", "Printf", "ProgressMeter", "PyCall", "Random", "Revise", "Serialization", "Sockets", "Statistics", "TOML", "Zygote", "oneAPI"]
-path = "."
-uuid = "21ef6326-9699-446c-bc99-5de46acc82b6"
-version = "0.1.0"
-
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]
 git-tree-sha1 = "7d2f8f21da5db6a806faf7b9b292296da42b2810"
@@ -1351,6 +1345,12 @@ uuid = "4607b0f0-06f3-5cda-b6b1-a6196a1729e9"
 deps = ["Artifacts", "Libdl", "libblastrampoline_jll"]
 uuid = "bea87d4a-7f5b-5778-9afe-8cc45184846c"
 version = "7.8.3+2"
+
+[[deps.Swamma]]
+deps = ["ArgParse", "CUDA", "ChainRulesCore", "Dates", "Downloads", "FFTW", "GPUArrays", "HTTP", "JSON3", "Lux", "LuxCUDA", "LuxCore", "MLStyle", "NNlib", "OpenCL", "Optimisers", "Printf", "ProgressMeter", "PyCall", "Random", "Revise", "Serialization", "Sockets", "Statistics", "TOML", "Zygote", "oneAPI"]
+path = "."
+uuid = "21ef6326-9699-446c-bc99-5de46acc82b6"
+version = "0.1.0"
 
 [[deps.TOML]]
 deps = ["Dates"]

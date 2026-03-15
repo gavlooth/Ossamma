@@ -26,7 +26,7 @@ struct HuggingFaceTokenizer
     vocab_size::Int
     pad_token_id::Int
     mask_token_id::Int
-    eos_token_id::Int
+    eos_token_id::Union{Int, Nothing}
     bos_token_id::Union{Int, Nothing}
 end
 
@@ -59,8 +59,28 @@ function load_tokenizer(model_name::String; trust_remote_code::Bool = true)
 
     # Extract special token IDs
     vocab_size = py_tokenizer.vocab_size
-    pad_token_id = something(py_tokenizer.pad_token_id, py_tokenizer.eos_token_id)
-    eos_token_id = py_tokenizer.eos_token_id
+
+    pad_token_id = try
+        py_tokenizer.pad_token_id
+    catch
+        nothing
+    end
+
+    eos_token_id = try
+        py_tokenizer.eos_token_id
+    catch
+        nothing
+    end
+
+    if pad_token_id === nothing
+        sep_token_id = try
+            py_tokenizer.sep_token_id
+        catch
+            nothing
+        end
+        # Ensure we always have a valid pad token id for batching.
+        pad_token_id = something(eos_token_id, sep_token_id, 0)
+    end
 
     # Handle mask token (may not exist for all models)
     mask_token_id = try

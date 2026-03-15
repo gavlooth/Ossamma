@@ -246,6 +246,7 @@ Base.@kwdef struct SwammaBlockConfig
     use_ffn::Bool = true
     ffn_expansion::Float32 = 3f0 / 2f0
     use_glu_output_projection::Bool = false
+    use_output_projection::Bool = false
     use_parallel_scan::Bool = false
     parallel_chunk_size::Int = 64
     local_operator::Symbol = :swattention
@@ -292,6 +293,7 @@ struct SwammaBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
     dropout_rate::Float32
     use_ffn::Bool
     use_glu_output_projection::Bool    # Optional d→d Dense after GLU (disabled by default)
+    use_output_projection::Bool        # Optional d→d Dense after alpha mixing (disabled by default)
     use_parallel_scan::Bool            # GPU optimization: parallel associative scan
     local_operator::Symbol             # Currently :swattention
     residual_mode::Symbol              # Currently :plain, future: :mhc
@@ -325,6 +327,7 @@ struct SwammaBlock{OSC <: Lux.AbstractLuxLayer} <: LuxLayer
     # Branch projections for mixing (optional, expensive)
     GlobalProjection::Union{Lux.Dense, Nothing}  # d → d (ablation: use_branch_projections)
     LocalProjection::Union{Lux.Dense, Nothing}   # d → d (ablation: use_branch_projections)
+    OutputProjection::Union{Lux.Dense, Nothing}  # d → d after alpha mixing (ablation)
 
     # Dropout after mixing
     AttentionDropout::LuxLayer
@@ -357,6 +360,7 @@ function SwammaBlock(config::SwammaBlockConfig)
         config.dropout_rate,
         config.use_ffn,
         config.use_glu_output_projection,
+        config.use_output_projection,
         config.use_parallel_scan,
         config.local_operator,
         config.residual_mode,
@@ -392,6 +396,7 @@ function SwammaBlock(config::SwammaBlockConfig)
         # Branch projections (optional, expensive d→d)
         config.use_branch_projections ? Lux.Dense(config.embedding_dimension => config.embedding_dimension) : nothing,
         config.use_branch_projections ? Lux.Dense(config.embedding_dimension => config.embedding_dimension) : nothing,
+        config.use_output_projection ? Lux.Dense(config.embedding_dimension => config.embedding_dimension) : nothing,
         # Dropout after mixing
         Lux.Dropout(config.dropout_rate),
         # SwiGLU FFN + Output normalization
@@ -414,6 +419,7 @@ function SwammaBlock(
     use_ffn::Bool = true,
     ffn_expansion::Float32 = 3f0 / 2f0,
     use_glu_output_projection::Bool = false,
+    use_output_projection::Bool = false,
     use_parallel_scan::Bool = false,
     parallel_chunk_size::Int = 64,
     local_operator::Symbol = :swattention,
@@ -436,6 +442,7 @@ function SwammaBlock(
         use_ffn = use_ffn,
         ffn_expansion = ffn_expansion,
         use_glu_output_projection = use_glu_output_projection,
+        use_output_projection = use_output_projection,
         use_parallel_scan = use_parallel_scan,
         parallel_chunk_size = parallel_chunk_size,
         local_operator = local_operator,
@@ -455,6 +462,12 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::SwammaBlock)
 
     glu_out_params = if layer.use_glu_output_projection && layer.GluOutputProjection !== nothing
         Lux.initialparameters(rng, layer.GluOutputProjection)
+    else
+        NamedTuple()
+    end
+
+    output_proj_params = if layer.use_output_projection && layer.OutputProjection !== nothing
+        Lux.initialparameters(rng, layer.OutputProjection)
     else
         NamedTuple()
     end
@@ -503,6 +516,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::SwammaBlock)
         LocalGain = vector_gains.LocalGain,
         GlobalProjection = global_proj_params,
         LocalProjection = local_proj_params,
+        OutputProjection = output_proj_params,
         AttentionDropout = Lux.initialparameters(rng, layer.AttentionDropout),
         FFN = ffn_params,
         OutputNorm = Lux.initialparameters(rng, layer.OutputNorm),
@@ -518,6 +532,12 @@ function Lux.initialstates(rng::Random.AbstractRNG, layer::SwammaBlock)
 
     glu_out_state = if layer.use_glu_output_projection && layer.GluOutputProjection !== nothing
         Lux.initialstates(rng, layer.GluOutputProjection)
+    else
+        NamedTuple()
+    end
+
+    output_proj_state = if layer.use_output_projection && layer.OutputProjection !== nothing
+        Lux.initialstates(rng, layer.OutputProjection)
     else
         NamedTuple()
     end
@@ -548,6 +568,7 @@ function Lux.initialstates(rng::Random.AbstractRNG, layer::SwammaBlock)
         AlphaProjection = Lux.initialstates(rng, layer.AlphaProjection),
         GlobalProjection = global_proj_state,
         LocalProjection = local_proj_state,
+        OutputProjection = output_proj_state,
         AttentionDropout = Lux.initialstates(rng, layer.AttentionDropout),
         FFN = ffn_state,
         OutputNorm = Lux.initialstates(rng, layer.OutputNorm),
@@ -731,6 +752,12 @@ function (block::SwammaBlock)(inputs::Tuple, params, state)
         mixed_output = alpha .* global_branch .+ (1.0f0 .- alpha) .* local_branch
     end
 
+    mixed_output, output_proj_state = if block.use_output_projection && block.OutputProjection !== nothing
+        block.OutputProjection(mixed_output, params.OutputProjection, state.OutputProjection)
+    else
+        mixed_output, NamedTuple()
+    end
+
     # =========================================================================
     # 5. Dropout
     # =========================================================================
@@ -774,6 +801,7 @@ function (block::SwammaBlock)(inputs::Tuple, params, state)
         AlphaProjection = alpha_state,
         GlobalProjection = global_proj_state,
         LocalProjection = local_proj_state,
+        OutputProjection = output_proj_state,
         AttentionDropout = attn_dropout_state,
         FFN = ffn_state,
         OutputNorm = output_norm_state,
@@ -792,12 +820,32 @@ struct LocalWaveRefinementBlock <: LuxLayer
     time_dimension::Int
     state_dimension::Int
     dropout_rate::Float32
+    use_local_attention::Bool
+    use_wave_pde::Bool
     InputNorm::TimeConditionedLayerNorm
     SlidingWindowAttention::SWAttention
     LocalNorm::RMSNorm
     WaveLayer::WavePDELayer
     WaveNorm::RMSNorm
-    GateProjection::Lux.Dense
+    AlphaProjection::Lux.Dense
+    AttentionDropout::LuxLayer
+    OutputNorm::Lux.LayerNorm
+end
+
+struct LinearLocalRefinementBlock <: LuxLayer
+    embedding_dimension::Int
+    sequence_length::Int
+    number_of_heads::Int
+    time_dimension::Int
+    dropout_rate::Float32
+    InputNorm::TimeConditionedLayerNorm
+    LinearProjection::Lux.Dense
+    LinearAttention::LinearAttentionLayer
+    LinearNorm::RMSNorm
+    InputGate::Lux.Dense
+    SlidingWindowAttention::SWAttention
+    AlphaProjection::Lux.Dense
+    OutputProjection::Lux.Dense
     AttentionDropout::LuxLayer
     OutputNorm::Lux.LayerNorm
 end
@@ -813,6 +861,8 @@ function LocalWaveRefinementBlock(
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
     dropout_rate::Float32 = 0.1f0,
+    use_local_attention::Bool = true,
+    use_wave_pde::Bool = true,
 )
     state_dimension == embedding_dimension || throw(ArgumentError(
         "LocalWaveRefinementBlock requires state_dimension == embedding_dimension because WavePDELayer is projection-free."
@@ -828,6 +878,8 @@ function LocalWaveRefinementBlock(
         time_dimension,
         state_dimension,
         dropout_rate,
+        use_local_attention,
+        use_wave_pde,
         TimeConditionedLayerNorm(embedding_dimension, time_dimension),
         SWAttention(
             sequence_length,
@@ -851,8 +903,49 @@ function LocalWaveRefinementBlock(
     )
 end
 
+function LinearLocalRefinementBlock(
+    embedding_dimension::Int,
+    sequence_length::Int,
+    number_of_heads::Int,
+    time_dimension::Int;
+    window_size::Int = 256,
+    dropout_rate::Float32 = 0.1f0,
+)
+    embedding_dimension % number_of_heads == 0 || throw(ArgumentError(
+        "embedding_dimension=$(embedding_dimension) must be divisible by number_of_heads=$(number_of_heads)."
+    ))
+
+    return LinearLocalRefinementBlock(
+        embedding_dimension,
+        sequence_length,
+        number_of_heads,
+        time_dimension,
+        dropout_rate,
+        TimeConditionedLayerNorm(embedding_dimension, time_dimension),
+        Lux.Dense(embedding_dimension => embedding_dimension),
+        LinearAttentionLayer(
+            embedding_dimension,
+            sequence_length,
+            number_of_heads,
+            time_dimension,
+        ),
+        RMSNorm(embedding_dimension),
+        Lux.Dense(embedding_dimension => embedding_dimension; use_bias = false),
+        SWAttention(
+            sequence_length,
+            embedding_dimension,
+            number_of_heads;
+            window_size = window_size,
+        ),
+        Lux.Dense(embedding_dimension => 1),
+        Lux.Dense(embedding_dimension => embedding_dimension),
+        Lux.Dropout(dropout_rate),
+        Lux.LayerNorm((embedding_dimension,)),
+    )
+end
+
 function Lux.initialparameters(rng::Random.AbstractRNG, layer::LocalWaveRefinementBlock)
-    gate_params = Lux.initialparameters(rng, layer.GateProjection)
+    alpha_params = Lux.initialparameters(rng, layer.AlphaProjection)
 
     return (
         InputNorm = Lux.initialparameters(rng, layer.InputNorm),
@@ -860,12 +953,30 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::LocalWaveRefineme
         LocalNorm = Lux.initialparameters(rng, layer.LocalNorm),
         WaveLayer = Lux.initialparameters(rng, layer.WaveLayer),
         WaveNorm = Lux.initialparameters(rng, layer.WaveNorm),
-        GateProjection = (
-            weight = gate_params.weight .* 0.02f0,
-            bias = gate_params.bias .- 1.5f0,
+        AlphaProjection = (
+            weight = alpha_params.weight .* 0.02f0,
+            bias = alpha_params.bias,
         ),
-        LocalScale = fill(1.0f0, 1),
-        WaveScale = fill(0.25f0, 1),
+        AttentionDropout = Lux.initialparameters(rng, layer.AttentionDropout),
+        OutputNorm = Lux.initialparameters(rng, layer.OutputNorm),
+    )
+end
+
+function Lux.initialparameters(rng::Random.AbstractRNG, layer::LinearLocalRefinementBlock)
+    input_gate_params = Lux.initialparameters(rng, layer.InputGate)
+    if haskey(input_gate_params, :weight)
+        input_gate_params = (weight = input_gate_params.weight .* 0.02f0,)
+    end
+
+    return (
+        InputNorm = Lux.initialparameters(rng, layer.InputNorm),
+        LinearProjection = Lux.initialparameters(rng, layer.LinearProjection),
+        LinearAttention = Lux.initialparameters(rng, layer.LinearAttention),
+        LinearNorm = Lux.initialparameters(rng, layer.LinearNorm),
+        InputGate = input_gate_params,
+        SlidingWindowAttention = Lux.initialparameters(rng, layer.SlidingWindowAttention),
+        AlphaProjection = Lux.initialparameters(rng, layer.AlphaProjection),
+        OutputProjection = Lux.initialparameters(rng, layer.OutputProjection),
         AttentionDropout = Lux.initialparameters(rng, layer.AttentionDropout),
         OutputNorm = Lux.initialparameters(rng, layer.OutputNorm),
     )
@@ -878,7 +989,22 @@ function Lux.initialstates(rng::Random.AbstractRNG, layer::LocalWaveRefinementBl
         LocalNorm = Lux.initialstates(rng, layer.LocalNorm),
         WaveLayer = Lux.initialstates(rng, layer.WaveLayer),
         WaveNorm = Lux.initialstates(rng, layer.WaveNorm),
-        GateProjection = Lux.initialstates(rng, layer.GateProjection),
+        AlphaProjection = Lux.initialstates(rng, layer.AlphaProjection),
+        AttentionDropout = Lux.initialstates(rng, layer.AttentionDropout),
+        OutputNorm = Lux.initialstates(rng, layer.OutputNorm),
+    )
+end
+
+function Lux.initialstates(rng::Random.AbstractRNG, layer::LinearLocalRefinementBlock)
+    return (
+        InputNorm = Lux.initialstates(rng, layer.InputNorm),
+        LinearProjection = Lux.initialstates(rng, layer.LinearProjection),
+        LinearAttention = Lux.initialstates(rng, layer.LinearAttention),
+        LinearNorm = Lux.initialstates(rng, layer.LinearNorm),
+        InputGate = Lux.initialstates(rng, layer.InputGate),
+        SlidingWindowAttention = Lux.initialstates(rng, layer.SlidingWindowAttention),
+        AlphaProjection = Lux.initialstates(rng, layer.AlphaProjection),
+        OutputProjection = Lux.initialstates(rng, layer.OutputProjection),
         AttentionDropout = Lux.initialstates(rng, layer.AttentionDropout),
         OutputNorm = Lux.initialstates(rng, layer.OutputNorm),
     )
@@ -892,41 +1018,55 @@ function (block::LocalWaveRefinementBlock)(inputs::Tuple, params, state)
         input_tensor, time_input, params.InputNorm, state.InputNorm
     )
 
-    local_output, sw_attn_state = block.SlidingWindowAttention(
-        normalized, params.SlidingWindowAttention, state.SlidingWindowAttention
-    )
-    local_output, local_norm_state = block.LocalNorm(
-        local_output, params.LocalNorm, state.LocalNorm
-    )
+    if block.use_local_attention
+        local_output, sw_attn_state = block.SlidingWindowAttention(
+            normalized, params.SlidingWindowAttention, state.SlidingWindowAttention
+        )
+        local_output, local_norm_state = block.LocalNorm(
+            local_output, params.LocalNorm, state.LocalNorm
+        )
+    else
+        local_output = zero(normalized)
+        sw_attn_state = state.SlidingWindowAttention
+        local_norm_state = state.LocalNorm
+    end
 
-    wave_output, wave_state = block.WaveLayer(
-        normalized, params.WaveLayer, state.WaveLayer
-    )
-    wave_output, wave_norm_state = block.WaveNorm(
-        wave_output, params.WaveNorm, state.WaveNorm
-    )
+    if block.use_wave_pde
+        wave_output, wave_state = block.WaveLayer(
+            normalized, params.WaveLayer, state.WaveLayer
+        )
+        wave_output, wave_norm_state = block.WaveNorm(
+            wave_output, params.WaveNorm, state.WaveNorm
+        )
+    else
+        wave_output = zero(normalized)
+        wave_state = state.WaveLayer
+        wave_norm_state = state.WaveNorm
+    end
 
     dim = block.embedding_dimension
     original_size = size(normalized)
     normalized_flat = reshape(normalized, dim, :)
-    gate_logits_flat, gate_state = block.GateProjection(
-        normalized_flat, params.GateProjection, state.GateProjection
+    alpha_logits_flat, alpha_state = block.AlphaProjection(
+        normalized_flat, params.AlphaProjection, state.AlphaProjection
     )
 
     if ndims(input_tensor) == 3
-        gate_logits = reshape(gate_logits_flat, 1, original_size[2], original_size[3])
-        gate_bias = reshape(alpha_bias, 1, 1, size(alpha_bias, 2))
-        scale_shape = (1, 1, 1)
+        alpha_logits = reshape(alpha_logits_flat, 1, original_size[2], original_size[3])
+        alpha_bias_broadcast = reshape(alpha_bias, 1, 1, size(alpha_bias, 2))
     else
-        gate_logits = reshape(gate_logits_flat, 1, original_size[2])
-        gate_bias = reshape(alpha_bias, 1, 1)
-        scale_shape = (1, 1)
+        alpha_logits = reshape(alpha_logits_flat, 1, original_size[2])
+        alpha_bias_broadcast = reshape(alpha_bias, 1, 1)
     end
 
-    gate = NNlib.sigmoid.(gate_logits .+ gate_bias)
-    local_scale = reshape(params.LocalScale, scale_shape...)
-    wave_scale = reshape(params.WaveScale, scale_shape...)
-    update = local_scale .* local_output .+ wave_scale .* (gate .* wave_output)
+    alpha = NNlib.sigmoid.(alpha_logits .+ alpha_bias_broadcast)
+    if block.use_local_attention && block.use_wave_pde
+        update = alpha .* wave_output .+ (1.0f0 .- alpha) .* local_output
+    elseif block.use_wave_pde
+        update = alpha .* wave_output
+    else
+        update = local_output
+    end
 
     update, dropout_state = block.AttentionDropout(
         update, params.AttentionDropout, state.AttentionDropout
@@ -945,12 +1085,136 @@ function (block::LocalWaveRefinementBlock)(inputs::Tuple, params, state)
         LocalNorm = local_norm_state,
         WaveLayer = wave_state,
         WaveNorm = wave_norm_state,
-        GateProjection = gate_state,
+        AlphaProjection = alpha_state,
         AttentionDropout = dropout_state,
         OutputNorm = output_norm_state,
     )
 
     return output, new_state
+end
+
+function (block::LinearLocalRefinementBlock)(inputs::Tuple, params, state)
+    input_tensor, time_input = inputs
+    residual = input_tensor
+
+    normalized, alpha_bias, norm_state = block.InputNorm(
+        input_tensor, time_input, params.InputNorm, state.InputNorm
+    )
+
+    linear_input, linear_proj_state = block.LinearProjection(
+        normalized, params.LinearProjection, state.LinearProjection
+    )
+    global_output, linear_attn_state = block.LinearAttention(
+        (linear_input, time_input), params.LinearAttention, state.LinearAttention
+    )
+    global_output, linear_norm_state = block.LinearNorm(
+        global_output, params.LinearNorm, state.LinearNorm
+    )
+
+    input_gate_logits, input_gate_state = block.InputGate(
+        global_output, params.InputGate, state.InputGate
+    )
+    local_input = normalized .* NNlib.sigmoid.(input_gate_logits)
+    local_output, sw_attn_state = block.SlidingWindowAttention(
+        local_input, params.SlidingWindowAttention, state.SlidingWindowAttention
+    )
+
+    dim = block.embedding_dimension
+    original_size = size(normalized)
+    normalized_flat = reshape(normalized, dim, :)
+    alpha_logits_flat, alpha_state = block.AlphaProjection(
+        normalized_flat, params.AlphaProjection, state.AlphaProjection
+    )
+
+    if ndims(input_tensor) == 3
+        alpha_logits = reshape(alpha_logits_flat, 1, original_size[2], original_size[3])
+        alpha_bias_broadcast = reshape(alpha_bias, 1, 1, size(alpha_bias, 2))
+    else
+        alpha_logits = reshape(alpha_logits_flat, 1, original_size[2])
+        alpha_bias_broadcast = reshape(alpha_bias, 1, 1)
+    end
+
+    alpha = NNlib.sigmoid.(alpha_logits .+ alpha_bias_broadcast)
+    update = alpha .* global_output .+ (1.0f0 .- alpha) .* local_output
+    update, output_proj_state = block.OutputProjection(
+        update, params.OutputProjection, state.OutputProjection
+    )
+
+    update, dropout_state = block.AttentionDropout(
+        update, params.AttentionDropout, state.AttentionDropout
+    )
+
+    output_pre_norm = residual .+ update
+    output_flat = reshape(output_pre_norm, dim, :)
+    output_norm_flat, output_norm_state = block.OutputNorm(
+        output_flat, params.OutputNorm, state.OutputNorm
+    )
+    output = reshape(output_norm_flat, size(output_pre_norm))
+
+    new_state = (
+        InputNorm = norm_state,
+        LinearProjection = linear_proj_state,
+        LinearAttention = linear_attn_state,
+        LinearNorm = linear_norm_state,
+        InputGate = input_gate_state,
+        SlidingWindowAttention = sw_attn_state,
+        AlphaProjection = alpha_state,
+        OutputProjection = output_proj_state,
+        AttentionDropout = dropout_state,
+        OutputNorm = output_norm_state,
+    )
+
+    return output, new_state
+end
+
+function sinkhorn_bistochastic(logits, iterations::Int)
+    matrix = exp.(logits)
+    eps = 1f-6
+    for _ in 1:iterations
+        matrix = matrix ./ max.(sum(matrix, dims = 2), eps)
+        matrix = matrix ./ max.(sum(matrix, dims = 1), eps)
+    end
+    return matrix
+end
+
+struct ManifoldHyperConnection <: LuxLayer
+    width::Int
+    sinkhorn_iterations::Int
+end
+
+function ManifoldHyperConnection(width::Int; sinkhorn_iterations::Int = 4)
+    width >= 2 || throw(ArgumentError("ManifoldHyperConnection width must be at least 2."))
+    sinkhorn_iterations > 0 || throw(ArgumentError("sinkhorn_iterations must be positive."))
+    return ManifoldHyperConnection(width, sinkhorn_iterations)
+end
+
+function Lux.initialparameters(::Random.AbstractRNG, layer::ManifoldHyperConnection)
+    logits = fill(-2.0f0, layer.width, layer.width)
+    for i in 1:layer.width
+        logits[i, i] = 2.0f0
+    end
+    return (logits = logits,)
+end
+
+Lux.initialstates(::Random.AbstractRNG, ::ManifoldHyperConnection) = (;)
+
+function (layer::ManifoldHyperConnection)(streams::Tuple, params, state)
+    length(streams) == layer.width || throw(ArgumentError(
+        "Expected $(layer.width) streams, got $(length(streams))."
+    ))
+
+    mix = sinkhorn_bistochastic(params.logits, layer.sinkhorn_iterations)
+    stack_dim = ndims(streams[1]) + 1
+    stream_tensor = cat(streams...; dims = stack_dim)
+    mixed_shape = size(stream_tensor)
+    stream_matrix = reshape(stream_tensor, :, layer.width)
+    mixed_matrix = stream_matrix * transpose(mix)
+    mixed_tensor = reshape(mixed_matrix, mixed_shape)
+    mixed_streams = ntuple(layer.width) do i
+        copy(selectdim(mixed_tensor, stack_dim, i))
+    end
+
+    return mixed_streams, state
 end
 
 # ============================================================================
@@ -969,7 +1233,8 @@ include("LLaDA.jl")
 using .LLaDA: LLaDAModel, TimeMLPEmbedding, SinusoidalTimeEmbedding
 using .LLaDA: LLaDAConfig, load_config, save_config, config_from_dict
 using .LLaDA: default_config, small_config, base_config, large_config, production_config
-using .LLaDA: apply_mask, sample_mask_ratio, unmask_step, generate
+using .LLaDA: apply_subtoken_mask, sample_mask_ratio, unmask_subtoken_step, generate
+using .LLaDA: token_ids_to_subtokens
 
 # ============================================================================
 # Training Utilities
@@ -1057,7 +1322,7 @@ using .TiDAR: SwammaDrafterDeep, SwammaDrafterBlockDeep
 using .TiDAR: TiDARConfig
 using .TiDAR: granite_2b_drafter_config, granite_3b_drafter_config, granite_4_3b_drafter_config, granite_8b_drafter_config
 using .TiDAR: granite_drafter_deep_config, granite_3b_drafter_deep_config
-using .TiDAR: GRANITE_VOCAB_SIZE, GRANITE_MASK_TOKEN_ID
+using .TiDAR: GRANITE_MASK_TOKEN_ID
 using .TiDAR: GRANITE_3B_VOCAB_SIZE, GRANITE_3B_MASK_TOKEN_ID  # Legacy
 using .TiDAR: draft_tokens, verify_and_accept, tidar_generate_step, tidar_generate_step_cached
 using .TiDAR: estimate_drafter_params, print_tidar_config
@@ -1141,7 +1406,8 @@ export wave_pde_gate, wave_gate
 export LLaDAModel, TimeMLPEmbedding, SinusoidalTimeEmbedding
 export LLaDAConfig, load_config, save_config, config_from_dict
 export default_config, small_config, base_config, large_config, production_config
-export apply_mask, sample_mask_ratio, unmask_step, generate
+export apply_subtoken_mask, sample_mask_ratio, unmask_subtoken_step, generate
+export token_ids_to_subtokens
 
 # Training utilities
 export masked_cross_entropy, diffusion_loss
@@ -1153,6 +1419,8 @@ export load_checkpoint, save_checkpoint
 # Provide conventional aliases for the main layer types.
 export SWAttention, WavePDELayer
 export LocalWaveRefinementBlock
+export LinearLocalRefinementBlock
+export ManifoldHyperConnection
 
 # Classification model
 export SwammaClassifier, ClassifierConfig
@@ -1212,7 +1480,7 @@ export SwammaDrafterDeep, SwammaDrafterBlockDeep
 export TiDARConfig
 export granite_2b_drafter_config, granite_3b_drafter_config, granite_4_3b_drafter_config, granite_8b_drafter_config
 export granite_drafter_deep_config, granite_3b_drafter_deep_config
-export GRANITE_VOCAB_SIZE, GRANITE_MASK_TOKEN_ID
+export GRANITE_MASK_TOKEN_ID
 export GRANITE_3B_VOCAB_SIZE, GRANITE_3B_MASK_TOKEN_ID  # Legacy
 export draft_tokens, verify_and_accept, tidar_generate_step, tidar_generate_step_cached
 export estimate_drafter_params, print_tidar_config

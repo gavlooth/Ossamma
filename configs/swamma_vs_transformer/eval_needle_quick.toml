@@ -1,0 +1,31 @@
+# Eval config matching train_needle_quick checkpoints
+
+[common]
+vocab_size = 32000
+embedding_dimension = 256
+number_of_heads = 8
+number_of_layers = 6
+time_dimension = 128
+state_dimension = 256
+window_size = 128
+min_frequency = 0.1
+max_frequency = 10.0
+default_time_step = 0.1
+prime_subtoken_length = 4
+prime_subtoken_base = 16
+batch_size = 8
+
+[sweep]
+architectures = ["swamma", "transformer"]
+context_lengths = [1024]
+
+[eval]
+seed = 42
+mask_ratio = 0.5
+eval_batches = 16
+run_text_eval = false
+text_path = ""
+tokenizer_model = "ibm-granite/granite-4.0-micro"
+run_needle_eval = true
+needle_batches = 64
+

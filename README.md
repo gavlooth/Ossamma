@@ -1,9 +1,185 @@
 # SWAMMA (Spectral Wave-Attention Masked Mixer Architecture)
 
+[![test-lanes](https://github.com/gavlooth/Ossamma/actions/workflows/test-lanes.yml/badge.svg)](https://github.com/gavlooth/Ossamma/actions/workflows/test-lanes.yml)
+
 **Spectral Wave-PDE Attention Masked Mixer Architecture** - A Julia-based neural network framework for efficient many-layer sequence models built around `LinearAttention`, `WavePDE`, and sharp local attention.
 
 Canonical naming in this repo is now **SWAMMA/Wave-PDE-first**.
 Preferred API aliases include `SwammaBlock`, `SwammaClassifier`, `SwammaNER`, and `wave_gate(...)`.
+
+## Session Reporting Policy
+
+This repository uses a mandatory end-of-session report workflow.
+
+- Rule source: [`AGENTS.md`](/home/christos/code/julia/Swamma/AGENTS.md)
+- Report file: [`docs/SESSION_REPORT.md`](/home/christos/code/julia/Swamma/docs/SESSION_REPORT.md)
+
+Every coding session must save a dated report update before the session is considered complete.
+
+## Testing Lanes
+
+Run tests through the aggregated runner:
+
+```bash
+julia --project=. test/runtests.jl
+```
+
+Supported lanes:
+
+- Default (fast): always runs
+  - `test_attention.jl`
+  - `test_router.jl`
+  - `test_llada_training.jl`
+- Medium: default + relation extraction coverage
+  - enable with `SWAMMA_TEST_MEDIUM=1`
+- Full: medium + heavier model suites
+  - enable with `SWAMMA_TEST_FULL=1`
+  - adds `test_moet.jl` and `test_tidar.jl`
+
+Examples:
+
+```bash
+# Fast lane (default)
+julia --project=. test/runtests.jl
+
+# Medium lane
+SWAMMA_TEST_MEDIUM=1 julia --project=. test/runtests.jl
+
+# Full lane
+SWAMMA_TEST_FULL=1 julia --project=. test/runtests.jl
+
+# Package entrypoint (uses default lane)
+julia --project=. -e 'using Pkg; Pkg.test()'
+```
+
+CI policy (GitHub Actions):
+
+- pull requests / pushes to `main`: default lane
+- nightly schedule: medium lane
+- manual dispatch: selectable lane (`default`, `medium`, `full`)
+- branch-protection guidance: [`docs/CI.md`](/home/christos/code/julia/Swamma/docs/CI.md)
+
+## RE `v1_locked` Reproducible Eval
+
+Current locked relation-extraction baseline (English REDFM path):
+
+- Checkpoint: `checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4/checkpoint_last.jls`
+- Config: `configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4.toml`
+- Decoding:
+  - `threshold=0.70`
+  - `no_relation_margin=0.30`
+  - `per_relation_thresholds=P127=0.95,P155=0.90,P571=0.85`
+  - `decode_head_cap=0`, `decode_tail_cap=0`
+
+Reproducible command:
+
+```bash
+julia --project=. scripts/train_re_gpu.jl \
+  --config configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4.toml \
+  --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4/checkpoint_last.jls \
+  --threshold-sweep-values 0.70 \
+  --threshold-sweep-margin 0.30 \
+  --per-relation-thresholds P127=0.95,P155=0.90,P571=0.85 \
+  --max-eval-batches 8
+```
+
+Expected `pred spans + pred pairs` row (as of 2026-03-14):
+
+- `rel_p=0.0031`
+- `rel_r=0.0366`
+- `rel_f1=0.0057`
+- `oracle_rel=0.8293`
+- `pair_r=0.2073`
+- `pair_t16=0.0976`
+
+Auto-calibration proposal command (keeps global safety gate):
+
+```bash
+julia --project=. scripts/train_re_gpu.jl \
+  --config configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4.toml \
+  --auto-calibrate-checkpoint checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4/checkpoint_last.jls \
+  --auto-calibrate-threshold 0.70 \
+  --auto-calibrate-margin 0.30 \
+  --auto-calibrate-min-predictions 8 \
+  --auto-calibrate-thresholds 0.70,0.80,0.85,0.90,0.95 \
+  --max-eval-batches 8
+```
+
+Type-constraint ablation command (`hard` schema filter at decode):
+
+```bash
+julia --project=. scripts/train_re_gpu.jl \
+  --config configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4.toml \
+  --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4/checkpoint_last.jls \
+  --threshold-sweep-values 0.70 \
+  --threshold-sweep-margin 0.30 \
+  --per-relation-thresholds P127=0.95,P155=0.90,P571=0.85 \
+  --type-constraints-mode hard \
+  --type-constraints-min-count 1 \
+  --max-eval-batches 8
+```
+
+Latest sampled outcome (2026-03-14):
+- `hard` type constraints are implemented and active, but not promoted yet.
+- At the locked decode point, constrained `rel_f1=0.0050` vs `v1_locked=0.0057`.
+
+Inverse/symmetry consistency command (promoted decode-side rule):
+
+```bash
+julia --project=. scripts/train_re_gpu.jl \
+  --config configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4.toml \
+  --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4/checkpoint_last.jls \
+  --threshold-sweep-values 0.70 \
+  --threshold-sweep-margin 0.30 \
+  --per-relation-thresholds P127=0.95,P155=0.90,P571=0.85 \
+  --relation-consistency-mode resolve \
+  --relation-consistency-min-count 1 \
+  --max-eval-batches 8
+```
+
+Latest sampled outcome (2026-03-14, repeated twice):
+- `relation-consistency=resolve,min_count=1`: `rel_f1=0.0058` (`rel_p=0.0031`, `rel_r=0.0366`)
+- pair metrics unchanged vs `v1_locked` (`pair_r=0.2073`, `pair_t16=0.0976`).
+
+Evaluator now reports evidence diagnostics in checkpoint sweep mode:
+- `ev_ent` = mean evidence attention entropy
+- `ev_max` = mean max evidence attention weight
+- `ev_eff` = mean effective evidence tokens (`exp(entropy)`)
+- `ev_t1` = most frequent top evidence token index
+
+Evidence pooling ablation command:
+
+```bash
+julia --project=. scripts/train_re_gpu.jl \
+  --config configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_fusedevidence.toml \
+  --evidence-pooling-sweep-checkpoint checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_fusedevidence/checkpoint_last.jls \
+  --evidence-pooling-modes token,sentence,hybrid \
+  --max-eval-batches 8
+```
+
+Resume training command (example `+250` continuation on fused-evidence branch):
+
+```bash
+julia --project=. scripts/train_re_gpu.jl \
+  --config configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_fusedevidence.toml \
+  --resume checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_fusedevidence/checkpoint_last.jls \
+  --max-steps 1510
+```
+
+Runtime note:
+- Expect the first resumed update to be much slower due to compile/caching warmup.
+- Example from this run: first resumed update was `~147s`, while steady-state updates stabilized around `~0.6-0.7s`.
+
+Edge-ranking retrieval objective (Stage 5) is controlled from `[training]`:
+- `edge_ranking_loss_weight` (default `0.0`)
+- `edge_ranking_margin` (default `0.2`)
+- `edge_ranking_hard_negatives` (default `16`)
+- `edge_ranking_start_step` (default `0`)
+- `edge_ranking_warmup_steps` (default `0`)
+
+Example rank-loss config:
+- `configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_fusedevidence_rankloss.toml`
+- `configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_fusedevidence_rankloss_soft.toml`
 
 ## Architecture Overview
 

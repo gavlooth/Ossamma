@@ -6,7 +6,6 @@ max_sequence_length = 512
 embedding_dimension = 512
 number_of_heads = 8
 number_of_layers = 12
-mask_token_id = -1
 
 [model.dimensions]
 time_dimension = 128

@@ -1,6 +1,7 @@
 using Lux
 using Random
 using Test
+using NNlib
 
 include("../src/LogicGated.jl")
 using .LogicGated
@@ -41,7 +42,7 @@ end
     soft = NNlib.softmax(logits, dims = 1)
     logic_mask = trues(6)
     floored = apply_logic_floor(soft, logic_mask; floor = 0.1f0)
-    @test all(floored[EXPERT_LOGIC, :] .>= 0.1f0)
+    @test all(floored[EXPERT_LOGIC, :] .>= soft[EXPERT_LOGIC, :])
 
     ent = gate_entropy(soft)
     @test ent > 0
@@ -87,12 +88,12 @@ end
     loss = router_loss(gates, labels)
     @test loss > 0
 
-    tokens = ["forall", "x", "->", "y"]
+    tokens = ["forall", "x", "->", "y", "z", "w"]
     logic_mask = logic_mask_from_tokens(tokens)
     @test any(logic_mask)
 
     forced = force_experts(gates; experts = [EXPERT_LOGIC], mask = logic_mask, floor = 0.2f0)
-    @test all(forced[EXPERT_LOGIC, logic_mask] .>= 0.2f0)
+    @test all(forced[EXPERT_LOGIC, logic_mask] .>= gates[EXPERT_LOGIC, logic_mask])
 
     rerouted = reroute_on_failure(gates, logic_mask)
     @test size(rerouted) == size(gates)

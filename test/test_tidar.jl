@@ -1,7 +1,9 @@
 using Test
 
-include("../src/TiDAR.jl")
-using .TiDAR
+include("../src/Swamma.jl")
+using .Swamma
+
+const TD = Swamma.TiDAR
 
 @testset "TiDAR Verifier Alignment" begin
     vocab = 8
@@ -17,7 +19,7 @@ using .TiDAR
     verifier_logits[4, 3] = 10.0f0
     verifier_logits[5, 4] = 10.0f0
 
-    accepted, rejection_idx, replacement = verify_and_accept(
+    accepted, rejection_idx, replacement = TD.verify_and_accept(
         drafted_ids, prefix_len, verifier_logits;
         mode = :argmax,
         verifier_offset = 1

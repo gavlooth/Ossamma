@@ -4,7 +4,7 @@ using Lux
 using LuxCore
 using NNlib
 using Random
-using Zygote: @ignore
+using ChainRulesCore
 using Statistics: mean
 
 export TokenRouter, GatedExperts, top1_expert, build_spans
@@ -261,7 +261,9 @@ end
 Straight-through estimator: forward uses hard gates, backward uses soft gates.
 """
 function ste_gates(hard_gates::AbstractArray, soft_gates::AbstractArray)
-    soft_detached = @ignore soft_gates
+    soft_detached = ChainRulesCore.ignore_derivatives() do
+        soft_gates
+    end
     return hard_gates .+ (soft_gates .- soft_detached)
 end
 
@@ -275,23 +277,7 @@ function apply_logic_floor(
     logic_mask::AbstractArray;
     floor::Float32 = DEFAULT_LOGIC_FLOOR
 )
-    g = copy(gates)
-    if ndims(g) == 2
-        for t in 1:size(g, 2)
-            if logic_mask[t]
-                g[EXPERT_LOGIC, t] = max(g[EXPERT_LOGIC, t], floor)
-            end
-        end
-    else
-        for b in 1:size(g, 3), t in 1:size(g, 2)
-            if logic_mask[t, b]
-                g[EXPERT_LOGIC, t, b] = max(g[EXPERT_LOGIC, t, b], floor)
-            end
-        end
-    end
-    # Renormalize
-    norm = sum(g, dims = 1)
-    return g ./ norm
+    return force_experts(gates; experts = [EXPERT_LOGIC], mask = logic_mask, floor = floor)
 end
 
 """
@@ -421,25 +407,73 @@ function force_experts(
     floor::Float32 = 0.1f0
 )
     g = copy(gates)
+    forced = Int.(collect(experts))
+    forced_set = Set(forced)
+    eps = 1f-10
+
+    enforce_floors! = function (column)
+        # 1) Apply floors to forced experts.
+        for e in forced
+            column[e] = max(column[e], floor)
+        end
+
+        forced_sum = sum(column[e] for e in forced)
+        if forced_sum >= 1.0f0
+            # If forced mass saturates probability, keep only forced experts.
+            for i in eachindex(column)
+                column[i] = 0.0f0
+            end
+            denom = max(forced_sum, eps)
+            for e in forced
+                column[e] = max(column[e], floor) / denom
+            end
+            return
+        end
+
+        # 2) Renormalize only non-forced experts into remaining mass.
+        non_forced_sum = 0.0f0
+        for i in eachindex(column)
+            if !(i in forced_set)
+                non_forced_sum += column[i]
+            end
+        end
+
+        target_non_forced = 1.0f0 - forced_sum
+        if non_forced_sum <= eps
+            # Degenerate case: split remaining mass uniformly over non-forced experts.
+            non_count = length(column) - length(forced)
+            if non_count > 0
+                fill_val = target_non_forced / non_count
+                for i in eachindex(column)
+                    if !(i in forced_set)
+                        column[i] = fill_val
+                    end
+                end
+            end
+        else
+            scale = target_non_forced / non_forced_sum
+            for i in eachindex(column)
+                if !(i in forced_set)
+                    column[i] *= scale
+                end
+            end
+        end
+    end
+
     if ndims(g) == 2
         for t in 1:size(g, 2)
             if mask === nothing || mask[t]
-                for e in experts
-                    g[e, t] = max(g[e, t], floor)
-                end
+                @views enforce_floors!(g[:, t])
             end
         end
     else
         for b in 1:size(g, 3), t in 1:size(g, 2)
             if mask === nothing || mask[t, b]
-                for e in experts
-                    g[e, t, b] = max(g[e, t, b], floor)
-                end
+                @views enforce_floors!(g[:, t, b])
             end
         end
     end
-    norm = sum(g, dims = 1)
-    return g ./ (norm .+ 1f-10)
+    return g
 end
 
 """

@@ -87,17 +87,18 @@ println("[2/5] Testing forward pass...")
 batch_size = 2
 seq_len = min(config.max_sequence_length, 64)  # Use shorter seq for speed
 vocab_size = model.vocab_size
-mask_token_id = model.mask_token_id
 
 # Create dummy batch
-token_ids = rand(rng, 1:vocab_size-1, seq_len, batch_size)
+token_ids = rand(rng, 1:vocab_size, seq_len, batch_size)
 mask_ratio = Float32(0.5)
 
-# Apply masking
-mask = rand(rng, Float32, size(token_ids)) .< mask_ratio
-masked_ids = ifelse.(mask, mask_token_id, token_ids)
+# PRIME sub-token masking
+subtoken_state = token_ids_to_subtokens(token_ids, model.prime_code_table)
+masked_subtokens, _, token_mask = apply_subtoken_mask(
+    subtoken_state, mask_ratio, model.prime_mask_subtoken_id; rng = rng
+)
 
-inputs = (token_ids = masked_ids, mask_ratio = mask_ratio)
+inputs = (subtoken_state = masked_subtokens, mask_ratio = mask_ratio)
 
 forward_time = @elapsed begin
     logits, new_st = model(inputs, ps, st)
@@ -120,7 +121,7 @@ println()
 
 println("[3/5] Testing backward pass (gradient computation)...")
 
-function compute_loss(ps, model, inputs, targets, mask, st)
+function compute_loss(ps, model, inputs, targets, token_mask, st)
     logits, _ = model(inputs, ps, st)
 
     # Cross-entropy on masked positions (Zygote-compatible)
@@ -144,7 +145,7 @@ function compute_loss(ps, model, inputs, targets, mask, st)
     # Differentiable part: multiply and sum
     target_log_probs = dropdims(sum(log_probs .* targets_onehot, dims=1), dims=1)
 
-    mask_float = Float32.(mask)
+    mask_float = Float32.(token_mask)
     n_masked = sum(mask_float)
     loss = n_masked > 0 ? -sum(target_log_probs .* mask_float) / n_masked : Float32(0.0)
     return loss
@@ -152,7 +153,7 @@ end
 
 backward_time = @elapsed begin
     loss, grads = Zygote.withgradient(
-        p -> compute_loss(p, model, inputs, token_ids, mask, st),
+        p -> compute_loss(p, model, inputs, token_ids, token_mask, st),
         ps
     )
 end
@@ -206,7 +207,7 @@ train_state = create_train_state(model, optimizer; rng=rng)
 
 full_step_time = @elapsed begin
     step_loss = train_step!(
-        train_state, model, token_ids, mask_token_id;
+        train_state, model, token_ids;
         rng=rng, schedule=:cosine
     )
 end

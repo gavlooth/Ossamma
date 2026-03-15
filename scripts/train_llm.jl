@@ -426,7 +426,6 @@ model_config = LLaDAConfig(
     embedding_dimension = CONFIG.embedding_dim,
     number_of_heads = CONFIG.num_heads,
     number_of_layers = CONFIG.num_layers,
-    mask_token_id = tokenizer.mask_id,
     time_dimension = 128,
     state_dimension = CONFIG.embedding_dim,
     window_size = 64,  # Window for 256 seq length

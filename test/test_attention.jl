@@ -18,9 +18,10 @@ using .Attention
     println("Initial State keys: ", keys(st))
 
     # Check 1: State Composition
-    # New implementation should have child states + window_mask
+    # True banded attention only needs the offset schedule, not a quadratic mask.
     @test haskey(st, :QueryProjection)
-    @test haskey(st, :window_mask)
+    @test haskey(st, :window_offsets)
+    @test st.window_offsets == collect(-Window:Window)
     println("Check 1: State Composition - PASSED")
 
     # Check 2: Sequence Length Mismatch (Dynamic Masking)
@@ -33,8 +34,7 @@ using .Attention
     
     y_short, st_short = model(x_short, ps, st)
     @test size(y_short) == (D, 5, 1)
-    # Check that the mask in the new state is 5x5
-    @test size(st_short.window_mask) == (5, 5)
+    @test st_short.window_offsets == collect(-Window:Window)
     
     println("Check 2: Dynamic Length T=5 - PASSED")
 
@@ -44,7 +44,7 @@ using .Attention
     
     y_long, st_long = model(x_correct, ps, st)
     @test size(y_long) == (D, 10, 1)
-    @test size(st_long.window_mask) == (10, 10)
+    @test st_long.window_offsets == collect(-Window:Window)
 
     println("Check 3: Correct Length T=10 - PASSED")
     
@@ -52,7 +52,28 @@ using .Attention
     x_unbatched = randn(Float32, D, 8)
     y_unb, st_unb = model(x_unbatched, ps, st)
     @test size(y_unb) == (D, 8)
-    @test size(st_unb.window_mask) == (8, 8)
+    @test st_unb.window_offsets == collect(-Window:Window)
     println("Check 4: Unbatched Input - PASSED")
 
+end
+
+@testset "SWAttention Locality" begin
+    D = 12
+    T = 8
+    Heads = 3
+    Window = 1
+
+    model = Attention.SWAttention(T, D, Heads; window_size = Window)
+    rng = Random.default_rng()
+    ps, st = Lux.setup(rng, model)
+
+    x_base = randn(Float32, D, T, 1)
+    x_perturbed = copy(x_base)
+    x_perturbed[:, end, 1] .+= 50.0f0
+
+    y_base, _ = model(x_base, ps, st)
+    y_perturbed, _ = model(x_perturbed, ps, st)
+
+    @test y_base[:, 1:6, 1] ≈ y_perturbed[:, 1:6, 1]
+    @test !(y_base[:, end - 1, 1] ≈ y_perturbed[:, end - 1, 1])
 end

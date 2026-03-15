@@ -230,7 +230,6 @@ final_config = LLaDAConfig(
     embedding_dimension = model_config.embedding_dimension,
     number_of_heads = model_config.number_of_heads,
     number_of_layers = model_config.number_of_layers,
-    mask_token_id = mask_token_id,
     time_dimension = model_config.time_dimension,
     state_dimension = model_config.state_dimension,
     window_size = model_config.window_size,

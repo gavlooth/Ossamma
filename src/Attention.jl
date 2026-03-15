@@ -3,6 +3,11 @@ module Attention
 using Lux
 using Random
 using NNlib
+using Zygote
+import ChainRulesCore
+using ChainRulesCore: NoTangent
+import CUDA
+using CUDA: @cuda, blockIdx, blockDim, threadIdx
 
 const LuxAttentionSupertype = isdefined(Lux, :AbstractExplicitLayer) ?
                               Lux.AbstractExplicitLayer :
@@ -22,20 +27,296 @@ struct SWAttention <: LuxAttentionSupertype
     OutputProjection::Lux.Dense
 end
 
-@inline function build_sliding_window_mask(sequence_length::Int, window_size::Int)
-    time_indices = collect(1:sequence_length)
-    distance_matrix = abs.(time_indices' .- time_indices)
-    return distance_matrix .> window_size
-end
-
-@inline function apply_sliding_window_mask(attention_scores, window_mask)
-    negative_infinity = typemin(eltype(attention_scores))
-    return ifelse.(window_mask, negative_infinity, attention_scores)
-end
-
 @inline function sigsoftmax(logits; dims = 1)
     transformed_logits = logits .+ NNlib.logsigmoid.(logits)
     return NNlib.softmax(transformed_logits; dims = dims)
+end
+
+@inline function valid_band_range(sequence_length::Int, offset::Int)
+    if offset >= 0
+        length = sequence_length - offset
+        return length <= 0 ? nothing : ((1:length), ((1 + offset):sequence_length))
+    else
+        length = sequence_length + offset
+        return length <= 0 ? nothing : (((1 - offset):sequence_length), (1:length))
+    end
+end
+
+function build_banded_index_map(sequence_length::Int, window_size::Int)
+    offsets = reshape(collect(-window_size:window_size), :, 1)
+    positions = reshape(collect(1:sequence_length), 1, :)
+    source_positions = positions .+ offsets
+    valid_mask = (source_positions .>= 1) .& (source_positions .<= sequence_length)
+    source_indices = Int32.(clamp.(source_positions, 1, sequence_length))
+    return source_indices, valid_mask
+end
+
+function band_index_map_for_input(state, sequence_length::Int, on_gpu::Bool)
+    if size(state.window_indices, 2) == sequence_length
+        return state.window_indices, state.window_valid
+    end
+
+    source_indices, valid_mask = build_banded_index_map(sequence_length, length(state.window_offsets) ÷ 2)
+    if on_gpu
+        return CUDA.CuArray(source_indices), CUDA.CuArray(valid_mask)
+    end
+    return source_indices, valid_mask
+end
+
+function banded_attention_weights_cpu(query_sequence, key_sequence, window_size::Int, head_dimension::Int)
+    (_, sequence_length, batch_heads) = size(query_sequence)
+    band_size = 2 * window_size + 1
+    element_type = eltype(query_sequence)
+    attention_scores = Zygote.Buffer(similar(query_sequence, element_type, band_size, sequence_length, batch_heads))
+    negative_infinity = typemin(element_type)
+    scale = sqrt(Float32(head_dimension))
+
+    @views for bh in 1:batch_heads
+        for target_idx in 1:sequence_length
+            for band_idx in 1:band_size
+                offset = band_idx - window_size - 1
+                source_idx = target_idx + offset
+
+                if 1 <= source_idx <= sequence_length
+                    acc = zero(element_type)
+                    for d in 1:head_dimension
+                        acc += key_sequence[d, source_idx, bh] * query_sequence[d, target_idx, bh]
+                    end
+                    attention_scores[band_idx, target_idx, bh] = acc / scale
+                else
+                    attention_scores[band_idx, target_idx, bh] = negative_infinity
+                end
+            end
+        end
+    end
+
+    return sigsoftmax(copy(attention_scores); dims = 1)
+end
+
+function apply_banded_attention_cpu(value_sequence, attention_weights, window_size::Int)
+    (head_dimension, sequence_length, batch_heads) = size(value_sequence)
+    output = Zygote.Buffer(similar(value_sequence, eltype(value_sequence), head_dimension, sequence_length, batch_heads))
+
+    @views for bh in 1:batch_heads
+        for target_idx in 1:sequence_length
+            for d in 1:head_dimension
+                acc = zero(eltype(value_sequence))
+                for offset in (-window_size):window_size
+                    source_idx = target_idx + offset
+                    if 1 <= source_idx <= sequence_length
+                        band_idx = offset + window_size + 1
+                        weight = attention_weights[band_idx, target_idx, bh]
+                        acc += value_sequence[d, source_idx, bh] * weight
+                    end
+                end
+                output[d, target_idx, bh] = acc
+            end
+        end
+    end
+
+    return copy(output)
+end
+
+function banded_score_kernel!(scores, query_sequence, key_sequence, window_size::Int32, scale::Float32)
+    idx = (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x) + Int32(threadIdx().x)
+    band_size = Int32(size(scores, 1))
+    sequence_length = Int32(size(scores, 2))
+    batch_heads = Int32(size(scores, 3))
+    total = band_size * sequence_length * batch_heads
+    idx > total && return
+
+    band_idx = Int32(mod(idx - Int32(1), band_size) + Int32(1))
+    tmp = Int32(div(idx - Int32(1), band_size))
+    target_idx = Int32(mod(tmp, sequence_length) + Int32(1))
+    batch_head_idx = Int32(div(tmp, sequence_length) + Int32(1))
+
+    offset = band_idx - window_size - Int32(1)
+    source_idx = target_idx + offset
+
+    if source_idx >= Int32(1) && source_idx <= sequence_length
+        acc = zero(eltype(scores))
+        @inbounds for dim_idx in 1:Int32(size(query_sequence, 1))
+            acc += key_sequence[dim_idx, source_idx, batch_head_idx] * query_sequence[dim_idx, target_idx, batch_head_idx]
+        end
+        scores[band_idx, target_idx, batch_head_idx] = acc / scale
+    else
+        scores[band_idx, target_idx, batch_head_idx] = typemin(eltype(scores))
+    end
+    return
+end
+
+function banded_value_kernel!(output, value_sequence, attention_weights, window_size::Int32)
+    idx = (Int32(blockIdx().x) - Int32(1)) * Int32(blockDim().x) + Int32(threadIdx().x)
+    head_dimension = Int32(size(output, 1))
+    sequence_length = Int32(size(output, 2))
+    batch_heads = Int32(size(output, 3))
+    band_size = Int32(size(attention_weights, 1))
+    total = head_dimension * sequence_length * batch_heads
+    idx > total && return
+
+    dim_idx = Int32(mod(idx - Int32(1), head_dimension) + Int32(1))
+    tmp = Int32(div(idx - Int32(1), head_dimension))
+    target_idx = Int32(mod(tmp, sequence_length) + Int32(1))
+    batch_head_idx = Int32(div(tmp, sequence_length) + Int32(1))
+
+    acc = zero(eltype(output))
+    @inbounds for band_idx in 1:band_size
+        source_idx = target_idx + band_idx - window_size - Int32(1)
+        if source_idx >= Int32(1) && source_idx <= sequence_length
+            acc += value_sequence[dim_idx, source_idx, batch_head_idx] * attention_weights[band_idx, target_idx, batch_head_idx]
+        end
+    end
+    output[dim_idx, target_idx, batch_head_idx] = acc
+    return
+end
+
+function banded_attention_scores_gpu(query_sequence, key_sequence, window_size::Int, head_dimension::Int)
+    band_size = 2 * window_size + 1
+    sequence_length = size(query_sequence, 2)
+    batch_heads = size(query_sequence, 3)
+    scores = similar(query_sequence, eltype(query_sequence), band_size, sequence_length, batch_heads)
+    threads = 256
+    blocks = cld(length(scores), threads)
+    @cuda threads = threads blocks = blocks banded_score_kernel!(
+        scores,
+        query_sequence,
+        key_sequence,
+        Int32(window_size),
+        sqrt(Float32(head_dimension)),
+    )
+    return scores
+end
+
+function banded_attention_weights_gpu(query_sequence, key_sequence, window_size::Int, head_dimension::Int)
+    scores = banded_attention_scores_gpu(query_sequence, key_sequence, window_size, head_dimension)
+    return sigsoftmax(scores; dims = 1)
+end
+
+function apply_banded_attention_gpu(value_sequence, attention_weights, window_size::Int)
+    output = similar(value_sequence)
+    threads = 256
+    blocks = cld(length(output), threads)
+    @cuda threads = threads blocks = blocks banded_value_kernel!(
+        output,
+        value_sequence,
+        attention_weights,
+        Int32(window_size),
+    )
+    return output
+end
+
+function banded_attention_gpu(query_sequence, key_sequence, value_sequence, window_size::Int, head_dimension::Int)
+    attention_weights = banded_attention_weights_gpu(
+        query_sequence,
+        key_sequence,
+        window_size,
+        head_dimension,
+    )
+    return apply_banded_attention_gpu(value_sequence, attention_weights, window_size)
+end
+
+function banded_attention_pullback_gpu(
+    query_sequence,
+    key_sequence,
+    value_sequence,
+    scores,
+    attention_weights,
+    output_bar,
+    window_size::Int,
+    head_dimension::Int,
+)
+    (_, sequence_length, batch_heads) = size(query_sequence)
+    scale = convert(eltype(query_sequence), sqrt(Float32(head_dimension)))
+
+    query_bar = zero(eltype(query_sequence)) .* query_sequence
+    key_bar = zero(eltype(key_sequence)) .* key_sequence
+    value_bar = zero(eltype(value_sequence)) .* value_sequence
+    weight_bar = zero(eltype(attention_weights)) .* attention_weights
+
+    @views for offset in (-window_size):window_size
+        ranges = valid_band_range(sequence_length, offset)
+        ranges === nothing && continue
+        target_range, source_range = ranges
+        band_idx = offset + window_size + 1
+        weights_slice = reshape(
+            attention_weights[band_idx, target_range, :],
+            1,
+            length(target_range),
+            batch_heads,
+        )
+        value_bar[:, source_range, :] .+= output_bar[:, target_range, :] .* weights_slice
+        weight_grad_slice = sum(
+            output_bar[:, target_range, :] .* value_sequence[:, source_range, :],
+            dims = 1,
+        )
+        weight_bar[band_idx, target_range, :] .= reshape(
+            weight_grad_slice,
+            length(target_range),
+            batch_heads,
+        )
+    end
+
+    transformed_grad = 1 .+ NNlib.sigmoid.(-scores)
+    softmax_dot = sum(weight_bar .* attention_weights, dims = 1)
+    score_bar = attention_weights .* (weight_bar .- softmax_dot) .* transformed_grad
+
+    @views for offset in (-window_size):window_size
+        ranges = valid_band_range(sequence_length, offset)
+        ranges === nothing && continue
+        target_range, source_range = ranges
+        band_idx = offset + window_size + 1
+        score_slice = reshape(
+            score_bar[band_idx, target_range, :],
+            1,
+            length(target_range),
+            batch_heads,
+        )
+        query_bar[:, target_range, :] .+= key_sequence[:, source_range, :] .* score_slice ./ scale
+        key_bar[:, source_range, :] .+= query_sequence[:, target_range, :] .* score_slice ./ scale
+    end
+
+    return query_bar, key_bar, value_bar
+end
+
+function ChainRulesCore.rrule(
+    ::typeof(banded_attention_gpu),
+    query_sequence,
+    key_sequence,
+    value_sequence,
+    window_size::Int,
+    head_dimension::Int,
+)
+    scores = banded_attention_scores_gpu(
+        query_sequence,
+        key_sequence,
+        window_size,
+        head_dimension,
+    )
+    attention_weights = sigsoftmax(scores; dims = 1)
+    output = apply_banded_attention_gpu(value_sequence, attention_weights, window_size)
+
+    function banded_attention_gpu_pullback(output_bar)
+        query_bar, key_bar, value_bar = banded_attention_pullback_gpu(
+            query_sequence,
+            key_sequence,
+            value_sequence,
+            scores,
+            attention_weights,
+            output_bar,
+            window_size,
+            head_dimension,
+        )
+        return (
+            NoTangent(),
+            query_bar,
+            key_bar,
+            value_bar,
+            NoTangent(),
+            NoTangent(),
+        )
+    end
+
+    return output, banded_attention_gpu_pullback
 end
 
 # 1. CONSTRUCTOR
@@ -76,9 +357,6 @@ end
 # 3. STATE INITIALIZATION
 # We need a custom initialstates to include both child states and our mask
 function Lux.initialstates(rng::Random.AbstractRNG, layer::SWAttention)
-    # Initialize mask based on the hint sequence_length
-    mask = build_sliding_window_mask(layer.sequence_length, layer.window_size)
-    
     # recursively initialize child states
     child_states = (
         QueryProjection = Lux.initialstates(rng, layer.QueryProjection),
@@ -86,8 +364,10 @@ function Lux.initialstates(rng::Random.AbstractRNG, layer::SWAttention)
         ValueProjection = Lux.initialstates(rng, layer.ValueProjection),
         OutputProjection = Lux.initialstates(rng, layer.OutputProjection),
     )
-    
-    return merge(child_states, (; window_mask = mask))
+
+    window_offsets = collect(-layer.window_size:layer.window_size)
+    window_indices, window_valid = build_banded_index_map(layer.sequence_length, layer.window_size)
+    return merge(child_states, (; window_offsets, window_indices, window_valid))
 end
 
 # 4. FORWARD PASS
@@ -98,25 +378,13 @@ function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
     # Expected Input: (Features, Time) or (Features, Time, Batch)
     is_input_batched = ndims(input_tensor) == 3
     
-    # Get current sequence length T
-    current_T = is_input_batched ? size(input_tensor, 2) : size(input_tensor, 2)
-    
-    # Dynamic Masking Check
-    cached_mask = state.window_mask
-    # Check if cached mask is valid for current input T. 
-    # Assuming square mask (T, T).
-    active_mask = if size(cached_mask, 1) == current_T
-        cached_mask
-    else
-        build_sliding_window_mask(current_T, layer.window_size)
-    end
-
     # Standardize to 3D Tensor: (Features, Time, Batch)
     input_3d_tensor =
         is_input_batched ? input_tensor :
         reshape(input_tensor, size(input_tensor, 1), size(input_tensor, 2), 1)
 
     (feature_dimension, sequence_length, batch_size) = size(input_3d_tensor)
+    on_gpu = input_3d_tensor isa CUDA.CuArray
 
     # ---------------------------------------------------------
     # B. Projections (Q, K, V)
@@ -152,39 +420,42 @@ function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
     value_permuted = reshape_and_permute(value_tensor)
 
     # ---------------------------------------------------------
-    # D. Attention Score Calculation
+    # D. True Banded Attention
     # ---------------------------------------------------------
-    # K^T * Q
-    # Key Transposed: (Time, Head_Dim, Heads, Batch)
-    key_transposed_for_score = permutedims(key_permuted, (2, 1, 3, 4))
-
-    # Compute raw scores scaled by sqrt(d_k)
-    scaling_factor = sqrt(Float32(layer.head_dimension))
-    attention_scores_raw =
-        NNlib.batched_mul(key_transposed_for_score, query_permuted) ./ scaling_factor
-
-    # ---------------------------------------------------------
-    # E. Sliding Window Masking
-    # ---------------------------------------------------------
-    masked_attention_scores =
-        apply_sliding_window_mask(attention_scores_raw, active_mask)
-    
-    # ---------------------------------------------------------
-    # F. Normalization (SigSoftmax Attention)
-    # ---------------------------------------------------------
-    normalized_attention_weights = sigsoftmax(masked_attention_scores; dims = 1)
-
-    # ---------------------------------------------------------
-    # G. Weighted Aggregation
-    # ---------------------------------------------------------
-    # Value * Weights
-    weighted_values = NNlib.batched_mul(value_permuted, normalized_attention_weights)
+    merge_batch_dimensions(tensor) = reshape(tensor, layer.head_dimension, sequence_length, :)
+    query_sequence = merge_batch_dimensions(query_permuted)
+    key_sequence = merge_batch_dimensions(key_permuted)
+    value_sequence = merge_batch_dimensions(value_permuted)
+    weighted_values = if on_gpu
+        banded_attention_gpu(
+            query_sequence,
+            key_sequence,
+            value_sequence,
+            layer.window_size,
+            layer.head_dimension,
+        )
+    else
+        normalized_attention_weights = banded_attention_weights_cpu(
+            query_sequence,
+            key_sequence,
+            layer.window_size,
+            layer.head_dimension,
+        )
+        apply_banded_attention_cpu(
+            value_sequence,
+            normalized_attention_weights,
+            layer.window_size,
+        )
+    end
 
     # ---------------------------------------------------------
     # H. Output Projection
     # ---------------------------------------------------------
     # Permute back: (Head_Dim, Heads, Time, Batch)
-    weighted_values_permuted = permutedims(weighted_values, (1, 3, 2, 4))
+    weighted_values_permuted = permutedims(
+        reshape(weighted_values, layer.head_dimension, sequence_length, layer.number_of_heads, batch_size),
+        (1, 3, 2, 4),
+    )
 
     # Merge Heads: (Feature_Dim, Time, Batch)
     output_merged_heads =
@@ -212,7 +483,9 @@ function (layer::SWAttention)(input_tensor::AbstractArray, params, state)
         KeyProjection = k_st,
         ValueProjection = v_st,
         OutputProjection = o_st,
-        window_mask = active_mask
+        window_offsets = state.window_offsets,
+        window_indices = state.window_indices,
+        window_valid = state.window_valid,
     )
 
     return final_output, new_state

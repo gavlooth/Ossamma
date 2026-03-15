@@ -1,0 +1,32 @@
+# Synthetic needle training config for paired Swamma vs Transformer checkpoints
+
+[common]
+vocab_size = 32000
+context_length = 1024
+embedding_dimension = 256
+number_of_heads = 8
+number_of_layers = 6
+time_dimension = 128
+state_dimension = 256
+window_size = 128
+min_frequency = 0.1
+max_frequency = 10.0
+default_time_step = 0.1
+prime_subtoken_length = 4
+prime_subtoken_base = 16
+
+[sweep]
+architectures = ["swamma", "transformer"]
+
+[train]
+seed = 42
+steps = 300
+batch_size = 8
+learning_rate = 0.001
+weight_decay = 0.0
+log_every = 20
+eval_every = 50
+eval_batches = 16
+save_every = 100
+output_dir = "checkpoints/long_context_needle_quick"
+

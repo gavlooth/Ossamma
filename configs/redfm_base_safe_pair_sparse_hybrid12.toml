@@ -1,0 +1,86 @@
+# Plain baseline with sparse routed pair proposer plus local neighbors and top-12 global reserve.
+
+[model]
+vocab_size = 32000
+max_sequence_length = 256
+embedding_dimension = 512
+number_of_heads = 8
+number_of_layers = 8
+num_entity_labels = 17
+num_relations = 32
+
+[model.dimensions]
+time_dimension = 128
+state_dimension = 512
+
+[model.attention]
+window_size = 24
+
+[model.wave_gate]
+min_frequency = 0.02
+max_frequency = 6.0
+default_time_step = 0.05
+
+[model.regularization]
+dropout_rate = 0.1
+
+[model.ablation]
+use_ffn = true
+ffn_expansion = 1.333333
+use_vector_gains = false
+use_per_head_alpha = false
+use_branch_projections = false
+
+[parallelization]
+use_parallel_scan = true
+chunk_size = 64
+
+[relation_extraction]
+max_candidate_spans = 48
+max_candidate_pairs = 96
+max_span_width = 8
+span_context_layers = 0
+span_context_neighbor_radius = 1
+span_context_topk = 4
+biaffine_rank = 64
+pair_neighbor_radius = 3
+pair_proposer_mode = "sparse_hybrid"
+pair_global_top_spans = 12
+pair_router_dimension = 64
+pair_router_buckets = 8
+pair_router_topk = 6
+pair_router_routes_per_span = 2
+pair_router_score_scale = 0.5
+pair_overgenerate_factor = 2
+pair_retrieval_dimension = 64
+pair_distance_buckets = 16
+pair_retrieval_loss_weight = 0.25
+relation_decoder_mode = "biaffine"
+mention_score_mode = "hybrid"
+mention_score_learned_weight = 0.25
+
+[training]
+batch_size = 4
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+min_learning_rate = 1e-6
+warmup_steps = 1000
+total_steps = 50000
+gradient_clip = 1.0
+weight_decay = 0.01
+
+[training.checkpoints]
+eval_every = 250
+log_every = 1
+save_every = 1000
+
+[data]
+train_path = "data/rebel/train.jsonl"
+val_path = "data/rebel/validation.jsonl"
+test_path = "data/rebel/test.jsonl"
+max_len = 256
+
+[hardware]
+device = "gpu"
+mixed_precision = true
+num_workers = 4

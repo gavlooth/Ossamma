@@ -15,11 +15,13 @@ using Random
 using NNlib
 using Optimisers
 using Zygote
+using ChainRulesCore
 using Statistics: mean
 using TOML
 using Serialization
 
-using ..LLaDA: LLaDAModel, LLaDAConfig, apply_mask, sample_mask_ratio
+using ..LLaDA: LLaDAModel, LLaDAConfig, apply_subtoken_mask, sample_mask_ratio
+using ..LLaDA: token_ids_to_subtokens
 
 # ============================================================================
 # Loss Functions
@@ -76,9 +78,8 @@ function masked_cross_entropy_vectorized(logits, targets, mask)
     # Log softmax
     log_probs = NNlib.logsoftmax(logits, dims=1)
 
-    # Create one-hot encoding outside gradient computation
-    # Zygote.@ignore prevents differentiation through this block
-    targets_onehot = Zygote.@ignore begin
+    # Create one-hot encoding outside gradient computation.
+    targets_onehot = ChainRulesCore.ignore_derivatives() do
         oh = zeros(Float32, vocab_size, seq_len, batch_size)
         for b in 1:batch_size
             for s in 1:seq_len
@@ -107,7 +108,7 @@ function masked_cross_entropy_vectorized(logits, targets, mask)
 end
 
 """
-    diffusion_loss(model, params, state, token_ids, mask_token_id; rng, schedule)
+    diffusion_loss(model, params, state, token_ids; rng, schedule)
 
 Compute diffusion training loss:
 1. Sample mask ratio t
@@ -119,23 +120,23 @@ function diffusion_loss(
     model::LLaDAModel,
     params,
     state,
-    token_ids::AbstractArray,
-    mask_token_id::Int;
+    token_ids::AbstractArray;
     rng::Random.AbstractRNG = Random.default_rng(),
     schedule::Symbol = :uniform,
 )
     # Sample mask ratio
     t = sample_mask_ratio(rng; schedule=schedule)
 
-    # Apply masking
-    masked_ids, mask = apply_mask(token_ids, t, mask_token_id; rng=rng)
-
-    # Forward pass
-    inputs = (token_ids = masked_ids, mask_ratio = t)
+    masked_subtokens, token_mask = ChainRulesCore.ignore_derivatives() do
+        subtoken_state = token_ids_to_subtokens(token_ids, model.prime_code_table)
+        masked_subtokens, _, token_mask = apply_subtoken_mask(
+            subtoken_state, t, model.prime_mask_subtoken_id; rng = rng
+        )
+        (masked_subtokens, token_mask)
+    end
+    inputs = (subtoken_state = masked_subtokens, mask_ratio = t)
     logits, new_state = model(inputs, params, state)
-
-    # Compute loss on masked positions only
-    loss = masked_cross_entropy_vectorized(logits, token_ids, mask)
+    loss = masked_cross_entropy_vectorized(logits, token_ids, token_mask)
 
     return loss, new_state
 end
@@ -175,7 +176,7 @@ function create_train_state(
 end
 
 """
-    train_step!(train_state, model, batch, mask_token_id; rng, schedule)
+    train_step!(train_state, model, batch; rng, schedule)
 
 Perform a single training step. Updates train_state in place.
 Returns the loss value.
@@ -183,24 +184,73 @@ Returns the loss value.
 function train_step!(
     train_state::TrainState,
     model::LLaDAModel,
-    batch::AbstractArray,
-    mask_token_id::Int;
+    batch::AbstractArray;
     rng::Random.AbstractRNG = Random.default_rng(),
     schedule::Symbol = :uniform,
+    gradient_clip::Float32 = 1.0f0,
 )
-    loss, grads = Zygote.withgradient(train_state.params) do params
-        l, _ = diffusion_loss(model, params, train_state.state, batch, mask_token_id; rng=rng, schedule=schedule)
-        l
+    (loss, new_state), grads = Zygote.withgradient(train_state.params) do params
+        diffusion_loss(model, params, train_state.state, batch; rng=rng, schedule=schedule)
+    end
+
+    # Keep model state in sync (e.g., dropout/rng state).
+    train_state.state = new_state
+
+    grads_to_apply = grads[1]
+    if gradient_clip > 0.0f0
+        grads_to_apply = clip_gradients(grads_to_apply, gradient_clip)
     end
 
     # Update parameters
     train_state.optimizer_state, train_state.params = Optimisers.update(
-        train_state.optimizer_state, train_state.params, grads[1]
+        train_state.optimizer_state, train_state.params, grads_to_apply
     )
 
     train_state.step += 1
 
     return loss
+end
+
+function gradient_norm_sq(grad)
+    if grad === nothing
+        return 0.0f0
+    elseif grad isa AbstractArray
+        return Float32(sum(abs2, grad))
+    elseif grad isa NamedTuple
+        return mapreduce(gradient_norm_sq, +, values(grad); init = 0.0f0)
+    elseif grad isa Tuple
+        return mapreduce(gradient_norm_sq, +, grad; init = 0.0f0)
+    else
+        return 0.0f0
+    end
+end
+
+function scale_gradients(grad, scale::Float32)
+    if grad === nothing
+        return nothing
+    elseif grad isa AbstractArray
+        return grad .* scale
+    elseif grad isa NamedTuple
+        vals = map(g -> scale_gradients(g, scale), values(grad))
+        return NamedTuple{keys(grad)}(vals)
+    elseif grad isa Tuple
+        return tuple((scale_gradients(g, scale) for g in grad)...)
+    else
+        return grad
+    end
+end
+
+function clip_gradients(grads, max_norm::Float32)
+    max_norm <= 0.0f0 && return grads
+
+    norm_sq = gradient_norm_sq(grads)
+    if norm_sq <= max_norm * max_norm
+        return grads
+    end
+
+    norm = sqrt(norm_sq)
+    scale = max_norm / (norm + 1f-8)
+    return scale_gradients(grads, scale)
 end
 
 # ============================================================================
@@ -244,7 +294,7 @@ end
 # ============================================================================
 
 """
-    evaluate(model, params, state, dataloader, mask_token_id; num_batches)
+    evaluate(model, params, state, dataloader; num_batches)
 
 Evaluate model on validation data.
 """
@@ -252,11 +302,11 @@ function evaluate(
     model::LLaDAModel,
     params,
     state,
-    data_iterator,
-    mask_token_id::Int;
+    data_iterator;
     num_batches::Int = 10,
     rng::Random.AbstractRNG = Random.default_rng(),
 )
+    eval_state = Lux.testmode(state)
     total_loss = 0.0f0
     count = 0
 
@@ -265,7 +315,7 @@ function evaluate(
             break
         end
 
-        loss, _ = diffusion_loss(model, params, state, batch, mask_token_id; rng=rng)
+        loss, _ = diffusion_loss(model, params, eval_state, batch; rng=rng)
         total_loss += loss
         count += 1
     end
@@ -298,8 +348,8 @@ Configuration for training loop.
 """
 Base.@kwdef struct TrainingConfig
     batch_size::Int = 32
-    learning_rate::Float32 = 1e-4f0
-    min_learning_rate::Float32 = 1e-6f0
+    learning_rate::Float32 = 1f-4
+    min_learning_rate::Float32 = 1f-6
     warmup_steps::Int = 1000
     total_steps::Int = 100000
     eval_every::Int = 1000
@@ -374,8 +424,6 @@ function train!(
     callbacks = Dict{Symbol, Function}(),
     rng::Random.AbstractRNG = Random.default_rng(),
 )
-    mask_token_id = model.mask_token_id
-
     println("Starting training...")
     println("  Total steps: $(config.total_steps)")
     println("  Batch size: $(config.batch_size)")
@@ -386,67 +434,76 @@ function train!(
     running_loss = 0.0f0
     loss_count = 0
 
-    for (step, batch) in enumerate(train_data)
-        if train_state.step >= config.total_steps
-            break
-        end
+    while train_state.step < config.total_steps
+        start_step = train_state.step
 
-        # Update learning rate
-        lr = warmup_cosine_schedule(
-            train_state.step,
-            config.warmup_steps,
-            config.total_steps,
-            config.learning_rate,
-            config.min_learning_rate,
-        )
-        Optimisers.adjust!(train_state.optimizer_state, lr)
-
-        # Training step
-        loss = train_step!(
-            train_state, model, batch, mask_token_id;
-            rng=rng, schedule=config.mask_schedule
-        )
-
-        running_loss += loss
-        loss_count += 1
-
-        # Logging
-        if train_state.step % config.log_every == 0
-            avg_loss = running_loss / loss_count
-            println("Step $(train_state.step) | Loss: $(round(avg_loss, digits=4)) | LR: $(round(lr, sigdigits=3))")
-            flush(stdout)
-            running_loss = 0.0f0
-            loss_count = 0
-
-            if haskey(callbacks, :on_log)
-                callbacks[:on_log](train_state, avg_loss, lr)
+        for batch in train_data
+            if train_state.step >= config.total_steps
+                break
             end
-        end
 
-        # Evaluation
-        if val_data !== nothing && train_state.step % config.eval_every == 0
-            val_loss = evaluate(model, train_state.params, train_state.state, val_data, mask_token_id; rng=rng)
-            println("  Validation Loss: $(round(val_loss, digits=4))")
+            # Update learning rate
+            lr = warmup_cosine_schedule(
+                train_state.step,
+                config.warmup_steps,
+                config.total_steps,
+                config.learning_rate,
+                config.min_learning_rate,
+            )
+            Optimisers.adjust!(train_state.optimizer_state, lr)
 
-            if val_loss < train_state.best_loss
-                train_state.best_loss = val_loss
-                println("  New best!")
+            # Training step
+            loss = train_step!(
+                train_state, model, batch;
+                rng=rng, schedule=config.mask_schedule, gradient_clip=config.gradient_clip
+            )
 
-                if haskey(callbacks, :on_best)
-                    callbacks[:on_best](train_state)
+            running_loss += loss
+            loss_count += 1
+
+            # Logging
+            if train_state.step % config.log_every == 0
+                avg_loss = running_loss / max(loss_count, 1)
+                println("Step $(train_state.step) | Loss: $(round(avg_loss, digits=4)) | LR: $(round(lr, sigdigits=3))")
+                flush(stdout)
+                running_loss = 0.0f0
+                loss_count = 0
+
+                if haskey(callbacks, :on_log)
+                    callbacks[:on_log](train_state, avg_loss, lr)
                 end
             end
 
-            if haskey(callbacks, :on_eval)
-                callbacks[:on_eval](train_state, val_loss)
+            # Evaluation
+            if val_data !== nothing && train_state.step % config.eval_every == 0
+                val_loss = evaluate(model, train_state.params, train_state.state, val_data; rng=rng)
+                println("  Validation Loss: $(round(val_loss, digits=4))")
+
+                if val_loss < train_state.best_loss
+                    train_state.best_loss = val_loss
+                    println("  New best!")
+
+                    if haskey(callbacks, :on_best)
+                        callbacks[:on_best](train_state)
+                    end
+                end
+
+                if haskey(callbacks, :on_eval)
+                    callbacks[:on_eval](train_state, val_loss)
+                end
+            end
+
+            # Saving
+            if train_state.step % config.save_every == 0
+                if haskey(callbacks, :on_save)
+                    callbacks[:on_save](train_state)
+                end
             end
         end
 
-        # Saving
-        if train_state.step % config.save_every == 0
-            if haskey(callbacks, :on_save)
-                callbacks[:on_save](train_state)
-            end
+        if train_state.step == start_step
+            println("No training batches were produced by the iterator; stopping early.")
+            break
         end
     end
 
@@ -535,6 +592,7 @@ end
 
 export masked_cross_entropy, masked_cross_entropy_vectorized, diffusion_loss
 export TrainState, create_train_state, train_step!
+export clip_gradients
 export warmup_cosine_schedule, create_scheduled_optimizer
 export evaluate, compute_accuracy
 export TrainingConfig, load_training_config, training_config_from_dict, train!

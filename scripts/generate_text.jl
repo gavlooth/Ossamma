@@ -56,7 +56,6 @@ config = LLaDAConfig(
     embedding_dimension = 256,
     number_of_heads = 4,
     number_of_layers = 6,
-    mask_token_id = mask_token_id,
     time_dimension = 64,
     state_dimension = 256,
     window_size = 16,

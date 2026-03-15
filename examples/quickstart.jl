@@ -65,13 +65,16 @@ mask_ratio = 0.5f0  # 50% masked
 println("   Input shape: (seq=$seq_len, batch=$batch_size)")
 println("   Mask ratio: $mask_ratio")
 
-# Apply masking
-mask_token_id = config.vocab_size  # Last token is [MASK]
-masked_ids, mask = apply_mask(token_ids, mask_ratio, mask_token_id; rng=rng)
-println("   Tokens masked: $(sum(mask)) / $(length(mask))")
+# PRIME sub-token masking
+subtoken_state = token_ids_to_subtokens(token_ids, model.prime_code_table)
+masked_subtokens, subtoken_mask, token_mask = apply_subtoken_mask(
+    subtoken_state, mask_ratio, model.prime_mask_subtoken_id; rng = rng
+)
+println("   Masked subtokens: $(sum(subtoken_mask)) / $(length(subtoken_mask))")
+println("   Masked tokens: $(sum(token_mask)) / $(length(token_mask))")
 
 # Forward pass
-inputs = (token_ids = masked_ids, mask_ratio = mask_ratio)
+inputs = (subtoken_state = masked_subtokens, mask_ratio = mask_ratio)
 logits, new_state = model(inputs, params, state)
 println("   Output logits shape: $(size(logits))")
 
@@ -80,7 +83,7 @@ println("   Output logits shape: $(size(logits))")
 # ============================================================================
 println("\n3. Computing loss...")
 
-loss, _ = diffusion_loss(model, params, state, token_ids, mask_token_id; rng=rng)
+loss, _ = diffusion_loss(model, params, state, token_ids; rng=rng)
 println("   Diffusion loss: $(round(loss, digits=4))")
 
 # ============================================================================
@@ -103,22 +106,26 @@ println("   $generated")
 # ============================================================================
 println("\n5. Manual unmasking demo...")
 
-# Start fully masked
-current_ids = fill(mask_token_id, 8, 1)
-current_mask = trues(8, 1)
-println("   Start: $([current_ids[i, 1] == mask_token_id ? "[M]" : string(current_ids[i, 1]) for i in 1:8])")
+# Start with fully masked subtokens for 8 positions.
+current_subtokens = fill(model.prime_mask_subtoken_id, model.prime_subtoken_length, 8, 1)
+remaining_masks() = [
+    count(==(model.prime_mask_subtoken_id), @view current_subtokens[:, i, 1]) for i in 1:8
+]
+println("   Start masked-subtokens-per-position: $(remaining_masks())")
 
 # Unmask in steps
 for step in 1:4
     t = 1.0f0 - (step - 1) / 4
-    inputs = (token_ids = current_ids, mask_ratio = t)
+    inputs = (subtoken_state = current_subtokens, mask_ratio = t)
     logits, state = model(inputs, params, state)
 
-    # Unmask 2 tokens per step
-    current_ids, current_mask = unmask_step(logits, current_ids, current_mask, 2, mask_token_id)
+    # Reveal 2 subtokens per step.
+    current_subtokens = unmask_subtoken_step(
+        logits, current_subtokens, 2,
+        model.prime_code_table, model.prime_mask_subtoken_id
+    )
 
-    display_ids = [current_ids[i, 1] == mask_token_id ? "[M]" : string(current_ids[i, 1]) for i in 1:8]
-    println("   Step $step: $display_ids")
+    println("   Step $step masked-subtokens-per-position: $(remaining_masks())")
 end
 
 # ============================================================================

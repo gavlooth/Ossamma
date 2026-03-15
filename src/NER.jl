@@ -17,14 +17,18 @@ using NNlib
 using Statistics: mean
 using TOML
 import CUDA
-using Zygote: @ignore
+using ChainRulesCore
 
 # Import parent module components
 import ..SwammaNERBlock
 import ..TimeConditionedLayerNorm
-import ..LinearChainCRF
 
 const LuxLayer = Lux.AbstractLuxLayer
+
+function _linear_chain_crf_ctor()
+    # Resolve lazily to avoid circular import timing issues with CRF <-> NER.
+    return getfield(parentmodule(@__MODULE__), :LinearChainCRF)
+end
 
 # =============================================================================
 # NER Label Schema
@@ -506,7 +510,7 @@ function SwammaNER(;
             Lux.Dense(embedding_dimension => num_labels),
         ),
         # CRF Layer
-        LinearChainCRF(num_labels),
+        _linear_chain_crf_ctor()(num_labels),
         # Boundary prediction head
         Lux.Chain(
             Lux.LayerNorm((embedding_dimension,)),
@@ -732,51 +736,51 @@ function ner_cross_entropy(logits, labels; ignore_index::Int = -100)
     # Flatten
     logits_flat = reshape(logits, num_labels, :)  # (num_labels, n_positions)
     labels_flat = vec(labels)  # (n_positions,)
-    n_positions = @ignore length(labels_flat)
 
-    # Create mask for valid positions (use @ignore for non-differentiable comparison)
-    valid_mask = @ignore labels_flat .!= ignore_index
-    valid_count = @ignore Float32(sum(valid_mask))
+    constants = ChainRulesCore.ignore_derivatives() do
+        valid_mask = labels_flat .!= ignore_index
+        valid_count = Float32(sum(valid_mask))
+        safe_labels = ifelse.(valid_mask, labels_flat, 1)
 
-    if @ignore valid_count < 1
-        return sum(logits_flat) * 0.0f0  # Differentiable zero
+        label_indices = if logits_flat isa CUDA.CuArray
+            CUDA.cu(collect(1:num_labels))
+        else
+            collect(1:num_labels)
+        end
+
+        # Broadcast: (num_labels, 1) == (1, n_positions) -> (num_labels, n_positions)
+        one_hot_bool = reshape(label_indices, num_labels, 1) .== reshape(safe_labels, 1, :)
+
+        one_hot = if logits_flat isa CUDA.CuArray
+            CUDA.cu(Float32.(Array(one_hot_bool)))
+        else
+            Float32.(one_hot_bool)
+        end
+
+        mask_float = if logits_flat isa CUDA.CuArray
+            CUDA.cu(Float32.(valid_mask))
+        else
+            Float32.(valid_mask)
+        end
+
+        (valid_count = valid_count, one_hot = one_hot, mask_float = mask_float)
     end
 
-    # Create safe labels on same device (replace ignore_index with 1)
-    safe_labels = @ignore ifelse.(valid_mask, labels_flat, 1)
+    valid_count = constants.valid_count
+    if valid_count < 1
+        return sum(logits_flat) * 0.0f0  # Differentiable zero
+    end
 
     # Compute log softmax - this is the differentiable part
     log_probs = NNlib.logsoftmax(logits_flat, dims=1)  # (num_labels, n_positions)
 
-    # Create one-hot matrix using broadcasting: (num_labels, n_positions)
-    # one_hot[j, i] = 1.0 if safe_labels[i] == j, else 0.0
-    # This must be done on the same device as logits
-    label_indices = @ignore if logits_flat isa CUDA.CuArray
-        CUDA.cu(collect(1:num_labels))
-    else
-        collect(1:num_labels)
-    end
-
-    # Broadcast: (num_labels, 1) == (1, n_positions) -> (num_labels, n_positions)
-    one_hot_bool = @ignore reshape(label_indices, num_labels, 1) .== reshape(safe_labels, 1, n_positions)
-
-    # Convert to Float32 on same device - this is a constant for backprop
-    one_hot = @ignore if logits_flat isa CUDA.CuArray
-        CUDA.cu(Float32.(Array(one_hot_bool)))
-    else
-        Float32.(one_hot_bool)
-    end
-
     # Compute cross-entropy: -sum(one_hot .* log_probs, dims=1)
     # Gradients flow through log_probs, one_hot is treated as constant
+    one_hot = constants.one_hot
     per_pos_ce = -sum(one_hot .* log_probs, dims=1)  # (1, n_positions)
 
     # Create mask for valid positions
-    mask_float = @ignore if logits_flat isa CUDA.CuArray
-        CUDA.cu(Float32.(valid_mask))
-    else
-        Float32.(valid_mask)
-    end
+    mask_float = constants.mask_float
 
     # Apply mask and compute mean
     masked_ce = vec(per_pos_ce) .* mask_float

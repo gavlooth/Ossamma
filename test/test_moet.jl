@@ -5,8 +5,10 @@ using Test
 include("../src/Swamma.jl")
 using .Swamma
 
+const SW = Swamma
+
 @testset "MoETModel Shapes" begin
-    config = MoETConfig(
+    config = SW.MoETConfig(
         vocab_size = 64,
         max_sequence_length = 16,
         embedding_dimension = 32,
@@ -19,7 +21,7 @@ using .Swamma
         dropout_rate = 0.0f0,
     )
 
-    model = MoETModel(config)
+    model = SW.MoETModel(config)
     rng = Random.default_rng()
     ps, st = Lux.setup(rng, model)
 

@@ -45,7 +45,7 @@ const CONFIG = (
     # Training
     seq_length = 128,
     batch_size = 16,
-    learning_rate = 1e-4f0,
+    learning_rate = 1f-4,
     warmup_steps = 500,
     total_steps = 5000,
     eval_every = 500,
@@ -148,7 +148,6 @@ model_config = LLaDAConfig(
     number_of_layers = base_config.number_of_layers,
     time_embedding_dimension = base_config.time_embedding_dimension,
     state_dimension = base_config.state_dimension,
-    mask_token_id = mask_token_id,
 )
 
 model = LLaDAModel(model_config)

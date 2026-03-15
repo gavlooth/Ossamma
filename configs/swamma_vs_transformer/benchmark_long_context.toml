@@ -1,0 +1,26 @@
+# Long-context complexity benchmark config
+
+[common]
+vocab_size = 32000
+embedding_dimension = 512
+number_of_heads = 8
+number_of_layers = 12
+time_dimension = 128
+state_dimension = 512
+window_size = 128
+min_frequency = 0.1
+max_frequency = 10.0
+default_time_step = 0.1
+prime_subtoken_length = 4
+prime_subtoken_base = 16
+batch_size = 1
+
+[sweep]
+architectures = ["swamma", "transformer"]
+context_lengths = [1024, 2048, 4096, 8192, 16384]
+warmup = 2
+iterations = 5
+
+[benchmark]
+mask_ratio = 0.5
+seed = 42

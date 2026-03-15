@@ -1,0 +1,97 @@
+name: test-lanes
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: "Test lane to run"
+        type: choice
+        required: true
+        default: medium
+        options:
+          - default
+          - medium
+          - full
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  default-fast:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.12"
+
+      - name: Cache Julia Artifacts
+        uses: julia-actions/cache@v2
+
+      - name: Run Default Lane
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
+
+  medium-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.12"
+
+      - name: Cache Julia Artifacts
+        uses: julia-actions/cache@v2
+
+      - name: Run Medium Lane
+        run: |
+          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          SWAMMA_TEST_MEDIUM=1 julia --project=. test/runtests.jl
+
+  lane-dispatch:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      LANE: ${{ github.event.inputs.lane }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.12"
+
+      - name: Cache Julia Artifacts
+        uses: julia-actions/cache@v2
+
+      - name: Run Requested Lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          case "$LANE" in
+            default)
+              julia --project=. test/runtests.jl
+              ;;
+            medium)
+              SWAMMA_TEST_MEDIUM=1 julia --project=. test/runtests.jl
+              ;;
+            full)
+              SWAMMA_TEST_FULL=1 julia --project=. test/runtests.jl
+              ;;
+            *)
+              echo "Unsupported lane: $LANE" >&2
+              exit 1
+              ;;
+          esac

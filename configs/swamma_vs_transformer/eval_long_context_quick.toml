@@ -1,0 +1,35 @@
+# Long-context quality evaluation config (quick seed sweeps)
+
+[common]
+vocab_size = 32000
+embedding_dimension = 512
+number_of_heads = 8
+number_of_layers = 12
+time_dimension = 128
+state_dimension = 512
+window_size = 128
+min_frequency = 0.1
+max_frequency = 10.0
+default_time_step = 0.1
+prime_subtoken_length = 4
+prime_subtoken_base = 16
+batch_size = 2
+
+[sweep]
+architectures = ["swamma", "transformer"]
+context_lengths = [1024, 2048, 4096, 8192, 16384]
+
+[eval]
+seed = 42
+mask_ratio = 0.5
+eval_batches = 16
+
+# Optional text evaluation (requires HF tokenizer + corpus path)
+run_text_eval = false
+text_path = ""
+tokenizer_model = "ibm-granite/granite-4.0-micro"
+
+# Synthetic long-range key/value retrieval test
+run_needle_eval = true
+needle_batches = 8
+

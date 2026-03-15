@@ -13,6 +13,7 @@ using Lux
 using Random
 using NNlib
 using TOML
+using ChainRulesCore
 
 # Import parent module components
 using ..Swamma: SwammaBlock, LuxLayer
@@ -39,6 +40,68 @@ function is_gpu_array(x)
     return occursin("CuArray", string(typeof(x)))
 end
 
+function required_subtoken_base(vocab_size::Int, subtoken_length::Int)
+    subtoken_length >= 1 || throw(ArgumentError("subtoken_length must be >= 1"))
+    base = 2
+    while base^subtoken_length < vocab_size
+        base += 1
+    end
+    return base
+end
+
+function build_vocab_code_table(vocab_size::Int, base::Int, subtoken_length::Int)
+    table = Matrix{Int}(undef, subtoken_length, vocab_size)
+    for token_id in 1:vocab_size
+        value = token_id - 1
+        for j in 1:subtoken_length
+            table[j, token_id] = (value % base) + 1
+            value ÷= base
+        end
+    end
+    return table
+end
+
+function build_subtoken_value_masks(code_table::AbstractMatrix{<:Integer}, base::Int)
+    subtoken_length, vocab_size = size(code_table)
+    masks = [ [falses(vocab_size) for _ in 1:base] for _ in 1:subtoken_length ]
+    for token_id in 1:vocab_size
+        for j in 1:subtoken_length
+            digit = Int(code_table[j, token_id])
+            masks[j][digit][token_id] = true
+        end
+    end
+    return masks
+end
+
+function token_ids_to_subtokens(token_ids::AbstractArray{<:Integer}, code_table::AbstractMatrix{<:Integer})
+    subtoken_length, vocab_size = size(code_table)
+    if ndims(token_ids) == 1
+        seq_len = size(token_ids, 1)
+        out = Matrix{Int}(undef, subtoken_length, seq_len)
+        for s in 1:seq_len
+            tid = clamp(Int(token_ids[s]), 1, vocab_size)
+            for j in 1:subtoken_length
+                out[j, s] = code_table[j, tid]
+            end
+        end
+        return out
+    elseif ndims(token_ids) == 2
+        seq_len, batch_size = size(token_ids)
+        out = Array{Int}(undef, subtoken_length, seq_len, batch_size)
+        for b in 1:batch_size
+            for s in 1:seq_len
+                tid = clamp(Int(token_ids[s, b]), 1, vocab_size)
+                for j in 1:subtoken_length
+                    out[j, s, b] = code_table[j, tid]
+                end
+            end
+        end
+        return out
+    else
+        throw(ArgumentError("token_ids_to_subtokens expects 1D or 2D token ids, got ndims=$(ndims(token_ids))"))
+    end
+end
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -53,7 +116,6 @@ Base.@kwdef struct LLaDAConfig
     embedding_dimension::Int = 256
     number_of_heads::Int = 4
     number_of_layers::Int = 6
-    mask_token_id::Int = -1  # -1 means use vocab_size (append [MASK])
 
     # Internal dimensions
     time_dimension::Int = 128
@@ -73,6 +135,10 @@ Base.@kwdef struct LLaDAConfig
 
     # Training defaults
     mask_schedule::Symbol = :uniform  # :uniform, :cosine
+
+    # MDM-Prime style sub-token parameterization
+    prime_subtoken_length::Int = 4
+    prime_subtoken_base::Int = 16
 end
 
 """
@@ -110,7 +176,7 @@ function config_from_dict(data::Dict)
                 # Recurse into nested dicts
                 flatten!(val, prefix * key * "_")
             else
-                # Use the key directly (ignoring prefix for backward compatibility)
+                # Use flattened key-values directly.
                 flat[Symbol(key)] = val
             end
         end
@@ -130,7 +196,6 @@ function config_from_dict(data::Dict)
         embedding_dimension = get(flat, :embedding_dimension, 256),
         number_of_heads = get(flat, :number_of_heads, 4),
         number_of_layers = get(flat, :number_of_layers, 6),
-        mask_token_id = get(flat, :mask_token_id, -1),
         time_dimension = get(flat, :time_dimension, 128),
         state_dimension = get(flat, :state_dimension, -1),
         window_size = get(flat, :window_size, 5),
@@ -140,6 +205,8 @@ function config_from_dict(data::Dict)
         default_num_steps = get(flat, :default_num_steps, 10),
         default_temperature = Float32(get(flat, :default_temperature, 1.0)),
         mask_schedule = get(flat, :mask_schedule, :uniform),
+        prime_subtoken_length = Int(get(flat, :prime_subtoken_length, 4)),
+        prime_subtoken_base = Int(get(flat, :prime_subtoken_base, 16)),
     )
 end
 
@@ -169,7 +236,11 @@ function save_config(config::LLaDAConfig, io::IO)
     println(io, "embedding_dimension = ", config.embedding_dimension)
     println(io, "number_of_heads = ", config.number_of_heads)
     println(io, "number_of_layers = ", config.number_of_layers)
-    println(io, "mask_token_id = ", config.mask_token_id)
+    println(io)
+
+    println(io, "[model.prime]")
+    println(io, "prime_subtoken_length = ", config.prime_subtoken_length)
+    println(io, "prime_subtoken_base = ", config.prime_subtoken_base)
     println(io)
 
     println(io, "[model.dimensions]")
@@ -376,16 +447,21 @@ end
 # ============================================================================
 # LLaDA Model: Full text diffusion architecture
 # ============================================================================
-struct LLaDAModel{E,P,T,B,N,O} <: LuxLayer
+struct LLaDAModel{S,P,T,B,N,O,M,V} <: LuxLayer
     vocab_size::Int
     max_sequence_length::Int
     embedding_dimension::Int
     number_of_heads::Int
     number_of_layers::Int
-    mask_token_id::Int
+    prime_subtoken_base::Int
+    prime_subtoken_length::Int
+    prime_mask_subtoken_id::Int
+    prime_subtoken_embedding_dimension::Int
+    prime_code_table::M
+    prime_value_masks::V
 
     # Embeddings
-    TokenEmbedding::E
+    SubtokenEmbeddings::S
     PositionEmbedding::P
     TimeEmbedding::T
 
@@ -403,8 +479,6 @@ end
 Create a LLaDA model from a configuration struct.
 """
 function LLaDAModel(config::LLaDAConfig)
-    # Resolve -1 sentinel values
-    mask_token_id = config.mask_token_id == -1 ? config.vocab_size : config.mask_token_id
     state_dimension = config.state_dimension == -1 ? config.embedding_dimension : config.state_dimension
 
     return LLaDAModel(;
@@ -413,13 +487,14 @@ function LLaDAModel(config::LLaDAConfig)
         embedding_dimension = config.embedding_dimension,
         number_of_heads = config.number_of_heads,
         number_of_layers = config.number_of_layers,
-        mask_token_id = mask_token_id,
         time_dimension = config.time_dimension,
         state_dimension = state_dimension,
         window_size = config.window_size,
         min_frequency = config.min_frequency,
         max_frequency = config.max_frequency,
         default_time_step = config.default_time_step,
+        prime_subtoken_length = config.prime_subtoken_length,
+        prime_subtoken_base = config.prime_subtoken_base,
     )
 end
 
@@ -439,16 +514,41 @@ function LLaDAModel(;
     embedding_dimension::Int,
     number_of_heads::Int,
     number_of_layers::Int,
-    mask_token_id::Int = vocab_size,  # Default: last token is [MASK]
     time_dimension::Int = 128,
     state_dimension::Int = embedding_dimension,
     window_size::Int = 5,
     min_frequency::Float32 = 0.1f0,
     max_frequency::Float32 = 10.0f0,
     default_time_step::Float32 = 0.1f0,
+    prime_subtoken_length::Int = 4,
+    prime_subtoken_base::Int = 16,
 )
-    # Token embedding includes mask token
-    actual_vocab_size = mask_token_id < vocab_size ? vocab_size : vocab_size + 1
+    resolved_subtoken_base = 0
+    resolved_subtoken_length = 0
+    resolved_mask_subtoken_id = 0
+    resolved_subtoken_embedding_dimension = 0
+    code_table = zeros(Int, 0, 0)
+    value_masks = Vector{Vector{BitVector}}()
+    subtoken_embeddings = nothing
+
+    prime_subtoken_length >= 1 || throw(ArgumentError("prime_subtoken_length must be >= 1"))
+    resolved_subtoken_length = prime_subtoken_length
+    resolved_subtoken_base = max(prime_subtoken_base, 2)
+    if resolved_subtoken_base^resolved_subtoken_length < vocab_size
+        resolved_subtoken_base = required_subtoken_base(vocab_size, resolved_subtoken_length)
+    end
+    embedding_dimension % resolved_subtoken_length == 0 || throw(ArgumentError(
+        "embedding_dimension=$(embedding_dimension) must be divisible by prime_subtoken_length=$(resolved_subtoken_length)"
+    ))
+
+    resolved_mask_subtoken_id = resolved_subtoken_base + 1
+    resolved_subtoken_embedding_dimension = embedding_dimension ÷ resolved_subtoken_length
+    code_table = build_vocab_code_table(vocab_size, resolved_subtoken_base, resolved_subtoken_length)
+    value_masks = build_subtoken_value_masks(code_table, resolved_subtoken_base)
+    subtoken_embeddings = Tuple(
+        Lux.Embedding((resolved_subtoken_base + 1) => resolved_subtoken_embedding_dimension)
+        for _ in 1:resolved_subtoken_length
+    )
 
     # Build stack of SwammaBlocks
     blocks = Tuple([
@@ -467,21 +567,26 @@ function LLaDAModel(;
     ])
 
     return LLaDAModel(
-        actual_vocab_size,
+        vocab_size,
         max_sequence_length,
         embedding_dimension,
         number_of_heads,
         number_of_layers,
-        mask_token_id,
+        resolved_subtoken_base,
+        resolved_subtoken_length,
+        resolved_mask_subtoken_id,
+        resolved_subtoken_embedding_dimension,
+        code_table,
+        value_masks,
         # Embeddings
-        Lux.Embedding(actual_vocab_size => embedding_dimension),
+        subtoken_embeddings,
         Lux.Embedding(max_sequence_length => embedding_dimension),
         TimeMLPEmbedding(time_dimension, time_dimension),
         # Blocks
         blocks,
         # Output
         Lux.LayerNorm((embedding_dimension,)),
-        Lux.Dense(embedding_dimension => actual_vocab_size; use_bias = false),
+        Lux.Dense(embedding_dimension => vocab_size; use_bias = false),
     )
 end
 
@@ -489,9 +594,15 @@ function Lux.initialparameters(rng::Random.AbstractRNG, model::LLaDAModel)
     block_params = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         Tuple(Lux.initialparameters(rng, block) for block in model.Blocks)
     )
+    keys = ntuple(i -> Symbol("Subtoken_$i"), model.prime_subtoken_length)
+    vals = Tuple(
+        Lux.initialparameters(rng, model.SubtokenEmbeddings[i])
+        for i in 1:model.prime_subtoken_length
+    )
+    subtoken_params = NamedTuple{keys}(vals)
 
     return (
-        TokenEmbedding = Lux.initialparameters(rng, model.TokenEmbedding),
+        SubtokenEmbeddings = subtoken_params,
         PositionEmbedding = Lux.initialparameters(rng, model.PositionEmbedding),
         TimeEmbedding = Lux.initialparameters(rng, model.TimeEmbedding),
         Blocks = block_params,
@@ -504,9 +615,15 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::LLaDAModel)
     block_states = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         Tuple(Lux.initialstates(rng, block) for block in model.Blocks)
     )
+    keys = ntuple(i -> Symbol("Subtoken_$i"), model.prime_subtoken_length)
+    vals = Tuple(
+        Lux.initialstates(rng, model.SubtokenEmbeddings[i])
+        for i in 1:model.prime_subtoken_length
+    )
+    subtoken_states = NamedTuple{keys}(vals)
 
     return (
-        TokenEmbedding = Lux.initialstates(rng, model.TokenEmbedding),
+        SubtokenEmbeddings = subtoken_states,
         PositionEmbedding = Lux.initialstates(rng, model.PositionEmbedding),
         TimeEmbedding = Lux.initialstates(rng, model.TimeEmbedding),
         Blocks = block_states,
@@ -515,35 +632,100 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::LLaDAModel)
     )
 end
 
+function prime_compatibility_mask(model::LLaDAModel, subtoken_state_cpu::Array{<:Integer,3})
+    subtoken_length, seq_len, batch_size = size(subtoken_state_cpu)
+    subtoken_length == model.prime_subtoken_length || throw(ArgumentError(
+        "Expected subtoken_state first dim $(model.prime_subtoken_length), got $(subtoken_length)"
+    ))
+    vocab_size = model.vocab_size
+    compat = trues(vocab_size, seq_len, batch_size)
+
+    for b in 1:batch_size
+        for s in 1:seq_len
+            allowed = trues(vocab_size)
+            for j in 1:model.prime_subtoken_length
+                digit = Int(subtoken_state_cpu[j, s, b])
+                if digit != model.prime_mask_subtoken_id
+                    if 1 <= digit <= model.prime_subtoken_base
+                        allowed .&= model.prime_value_masks[j][digit]
+                    else
+                        # Invalid digits should not zero out support and create NaNs.
+                        fill!(allowed, true)
+                        break
+                    end
+                end
+            end
+            if !any(allowed)
+                # Keep at least one finite logit per position for stable softmax.
+                fill!(allowed, true)
+            end
+            compat[:, s, b] .= allowed
+        end
+    end
+
+    return compat
+end
+
+function apply_prime_carryover_filter(model::LLaDAModel, logits, subtoken_state_batched)
+    compat_cpu = ChainRulesCore.ignore_derivatives() do
+        subtoken_state_cpu = Array(subtoken_state_batched)
+        prime_compatibility_mask(model, subtoken_state_cpu)
+    end
+    compat = to_device_like(logits, compat_cpu)
+    neg_large = convert(eltype(logits), -1.0f9)
+    return ifelse.(compat, logits, neg_large)
+end
+
 function (model::LLaDAModel)(inputs::NamedTuple, params, state)
-    # inputs: (token_ids = (seq_len, batch), mask_ratio = (1, batch) or scalar)
-    (; token_ids, mask_ratio) = inputs
+    has_subtoken_state = haskey(inputs, :subtoken_state)
+    mask_ratio = inputs.mask_ratio
 
-    seq_len = size(token_ids, 1)
-    is_batched = ndims(token_ids) == 2
-    batch_size = is_batched ? size(token_ids, 2) : 1
+    has_subtoken_state || throw(ArgumentError("LLaDA PRIME expects `subtoken_state` in inputs."))
 
-    # Standardize to batched format
-    token_ids_batched = is_batched ? token_ids : reshape(token_ids, :, 1)
+    subtoken_state = inputs.subtoken_state
+    subtoken_state_batched = if ndims(subtoken_state) == 2
+        size(subtoken_state, 1) == model.prime_subtoken_length || throw(ArgumentError(
+            "Prime input must have first dim = $(model.prime_subtoken_length), got $(size(subtoken_state, 1))."
+        ))
+        reshape(subtoken_state, model.prime_subtoken_length, size(subtoken_state, 2), 1)
+    elseif ndims(subtoken_state) == 3
+        size(subtoken_state, 1) == model.prime_subtoken_length || throw(ArgumentError(
+            "Prime input must have first dim = $(model.prime_subtoken_length), got $(size(subtoken_state, 1))."
+        ))
+        subtoken_state
+    else
+        throw(ArgumentError("Prime input expects 2D or 3D subtoken_state, got ndims=$(ndims(subtoken_state))."))
+    end
+    was_unbatched = ndims(subtoken_state) == 2
 
-    # =========================================================================
-    # 1. Token Embedding
-    # =========================================================================
-    # Flatten for embedding lookup, then reshape back
-    token_flat = vec(token_ids_batched)  # (seq_len * batch,)
-    token_emb_flat, tok_state = model.TokenEmbedding(token_flat, params.TokenEmbedding, state.TokenEmbedding)
-    # token_emb_flat: (embedding_dim, seq_len * batch)
-    token_emb = reshape(token_emb_flat, model.embedding_dimension, seq_len, batch_size)
+    seq_len = size(subtoken_state_batched, 2)
+    batch_size = size(subtoken_state_batched, 3)
+    source_for_device = subtoken_state_batched
+
+    subtoken_pairs = ntuple(j -> begin
+        key = Symbol("Subtoken_$j")
+        subtoken_flat = vec(subtoken_state_batched[j, :, :])
+        emb_flat, emb_state = model.SubtokenEmbeddings[j](
+            subtoken_flat, params.SubtokenEmbeddings[key], state.SubtokenEmbeddings[key]
+        )
+        emb = reshape(emb_flat, model.prime_subtoken_embedding_dimension, seq_len, batch_size)
+        (emb, emb_state)
+    end, model.prime_subtoken_length)
+
+    sub_embs = map(p -> p[1], subtoken_pairs)
+    token_emb = cat(sub_embs...; dims = 1)
+    sub_states = map(p -> p[2], subtoken_pairs)
+    subtoken_states_out = NamedTuple{ntuple(i -> Symbol("Subtoken_$i"), model.prime_subtoken_length)}(
+        sub_states
+    )
 
     # =========================================================================
     # 2. Position Embedding (ensure same device as input)
     # =========================================================================
-    # Create position indices on same device as token_ids
     position_indices_cpu = collect(1:seq_len)
-    position_indices = to_device_like(token_ids, position_indices_cpu)
+    position_indices = to_device_like(source_for_device, position_indices_cpu)
     pos_emb_raw, pos_state = model.PositionEmbedding(position_indices, params.PositionEmbedding, state.PositionEmbedding)
-    # pos_emb_raw: (embedding_dim, seq_len)
-    pos_emb = reshape(pos_emb_raw, model.embedding_dimension, seq_len, 1)  # Broadcast over batch
+    pos_emb = reshape(pos_emb_raw, model.embedding_dimension, seq_len, 1)
 
     # =========================================================================
     # 3. Combine Embeddings
@@ -561,10 +743,9 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     else
         Float32.(mask_ratio)
     end
-    t_input = to_device_like(token_ids, t_input_cpu)
+    t_input = to_device_like(source_for_device, t_input_cpu)
 
     time_emb, time_state = model.TimeEmbedding(t_input, params.TimeEmbedding, state.TimeEmbedding)
-    # time_emb: (time_dim, batch)
 
     # =========================================================================
     # 5. Process through SwammaBlocks (Zygote-compatible using foldl)
@@ -596,10 +777,9 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # =========================================================================
     # Dense layer can handle 3D input directly
     logits, out_state = model.OutputHead(normalized, params.OutputHead, state.OutputHead)
-    # logits: (vocab_size, seq_len, batch)
+    logits = apply_prime_carryover_filter(model, logits, subtoken_state_batched)
 
-    # Remove batch dim if input wasn't batched
-    final_logits = is_batched ? logits : dropdims(logits, dims = 3)
+    final_logits = was_unbatched ? dropdims(logits, dims = 3) : logits
 
     # =========================================================================
     # 8. Update State
@@ -610,7 +790,7 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     )
 
     new_state = (
-        TokenEmbedding = tok_state,
+        SubtokenEmbeddings = subtoken_states_out,
         PositionEmbedding = pos_state,
         TimeEmbedding = time_state,
         Blocks = new_block_states,
@@ -626,15 +806,33 @@ end
 # ============================================================================
 
 """
-    apply_mask(token_ids, mask_ratio, mask_token_id; rng)
+    apply_subtoken_mask(subtoken_state, mask_ratio, mask_subtoken_id; rng)
 
-Apply random masking to token_ids based on mask_ratio.
-Returns (masked_ids, mask) where mask is true for masked positions.
+Apply random masking at the sub-token level.
+Returns `(masked_subtokens, subtoken_mask, token_mask)` where:
+- `subtoken_mask` marks masked sub-token cells.
+- `token_mask` marks positions with at least one masked sub-token.
 """
-function apply_mask(token_ids::AbstractArray, mask_ratio::Real, mask_token_id::Int; rng = Random.default_rng())
-    mask = rand(rng, Float32, size(token_ids)) .< mask_ratio
-    masked_ids = ifelse.(mask, mask_token_id, token_ids)
-    return masked_ids, mask
+function apply_subtoken_mask(
+    subtoken_state::AbstractArray,
+    mask_ratio::Real,
+    mask_subtoken_id::Int;
+    rng = Random.default_rng()
+)
+    ndims(subtoken_state) in (2, 3) || throw(ArgumentError(
+        "apply_subtoken_mask expects 2D or 3D subtoken state, got ndims=$(ndims(subtoken_state))."
+    ))
+
+    subtoken_mask = rand(rng, Float32, size(subtoken_state)) .< mask_ratio
+    masked_subtokens = ifelse.(subtoken_mask, mask_subtoken_id, subtoken_state)
+
+    token_mask = if ndims(subtoken_state) == 2
+        vec(dropdims(any(subtoken_mask, dims = 1), dims = 1))
+    else
+        dropdims(any(subtoken_mask, dims = 1), dims = 1)
+    end
+
+    return masked_subtokens, subtoken_mask, token_mask
 end
 
 """
@@ -655,69 +853,63 @@ function sample_mask_ratio(rng::Random.AbstractRNG; schedule::Symbol = :uniform)
 end
 
 """
-    unmask_step(logits, current_ids, mask, num_to_unmask, mask_token_id)
+    unmask_subtoken_step(logits, current_subtokens, num_to_unmask, code_table, mask_subtoken_id)
 
-Select positions to unmask based on model confidence.
-Returns new token_ids with some positions unmasked.
+Reveal masked sub-tokens using predicted token codewords and token confidence.
 """
-function unmask_step(
+function unmask_subtoken_step(
     logits::AbstractArray,
-    current_ids::AbstractArray,
-    mask::AbstractArray{Bool},
+    current_subtokens::AbstractArray,
     num_to_unmask::Int,
-    mask_token_id::Int,
+    code_table::AbstractMatrix{<:Integer},
+    mask_subtoken_id::Int,
 )
-    # logits: (vocab_size, seq_len, batch) or (vocab_size, seq_len)
+    num_to_unmask <= 0 && return current_subtokens
 
-    # Get predictions - extract the vocab index (first dimension)
-    # argmax returns CartesianIndex for 3D, so we extract just the vocab index
-    predictions_raw = argmax(logits, dims = 1)
-    # Extract just the first index (vocab position) from each CartesianIndex
+    logits_batched = ndims(logits) == 2 ? reshape(logits, size(logits, 1), size(logits, 2), 1) : logits
+    was_unbatched = ndims(current_subtokens) == 2
+    state_batched = was_unbatched ?
+        reshape(current_subtokens, size(current_subtokens, 1), size(current_subtokens, 2), 1) :
+        current_subtokens
+
+    predictions_raw = argmax(logits_batched, dims = 1)
     predictions = map(ci -> ci[1], predictions_raw)
-    predictions = dropdims(predictions, dims = 1)  # (seq_len, batch) or (seq_len,)
+    predictions = dropdims(predictions, dims = 1)  # (seq, batch)
 
-    # Get confidence (max probability)
-    probs = NNlib.softmax(logits, dims = 1)
+    probs = NNlib.softmax(logits_batched, dims = 1)
     confidence = maximum(probs, dims = 1)
-    confidence = dropdims(confidence, dims = 1)
+    confidence = dropdims(confidence, dims = 1)    # (seq, batch)
 
-    # Only consider masked positions
-    confidence_masked = ifelse.(mask, confidence, -Inf32)
+    subtoken_length, seq_len, batch_size = size(state_batched)
+    new_state = copy(state_batched)
+    quota_per_batch = max(1, ceil(Int, num_to_unmask / batch_size))
 
-    # Find top-k most confident masked positions
-    if ndims(current_ids) == 1
-        # Unbatched case
-        sorted_indices = sortperm(vec(confidence_masked), rev = true)
-        to_unmask = sorted_indices[1:min(num_to_unmask, sum(mask))]
+    for b in 1:batch_size
+        remaining = quota_per_batch
+        sorted_indices = sortperm(vec(confidence[:, b]), rev = true)
 
-        new_ids = copy(current_ids)
-        new_mask = copy(mask)
-        for idx in to_unmask
-            new_ids[idx] = predictions[idx]
-            new_mask[idx] = false
-        end
-    else
-        # Batched case - process each batch independently
-        new_ids = copy(current_ids)
-        new_mask = copy(mask)
-        for b in axes(current_ids, 2)
-            conf_b = confidence_masked[:, b]
-            sorted_indices = sortperm(vec(conf_b), rev = true)
-            n_masked = sum(mask[:, b])
-            to_unmask = sorted_indices[1:min(num_to_unmask, n_masked)]
+        for idx in sorted_indices
+            remaining <= 0 && break
+            if !any(@view(new_state[:, idx, b]) .== mask_subtoken_id)
+                continue
+            end
 
-            for idx in to_unmask
-                new_ids[idx, b] = predictions[idx, b]
-                new_mask[idx, b] = false
+            pred_id = clamp(Int(predictions[idx, b]), 1, size(code_table, 2))
+            for j in 1:subtoken_length
+                if new_state[j, idx, b] == mask_subtoken_id
+                    new_state[j, idx, b] = code_table[j, pred_id]
+                    remaining -= 1
+                    break
+                end
             end
         end
     end
 
-    return new_ids, new_mask
+    return was_unbatched ? dropdims(new_state, dims = 3) : new_state
 end
 
 """
-    generate(model, params, state, seq_len, mask_token_id;
+    generate(model, params, state, seq_len;
              num_steps, batch_size, rng)
 
 Generate text by iterative denoising from fully masked sequence.
@@ -731,46 +923,35 @@ function generate(
     batch_size::Int = 1,
     rng::Random.AbstractRNG = Random.default_rng(),
 )
-    # Start with fully masked sequence
-    current_ids = fill(model.mask_token_id, seq_len, batch_size)
-    mask = trues(seq_len, batch_size)
-
-    # Number of tokens to unmask per step
-    tokens_per_step = ceil(Int, seq_len / num_steps)
+    current_subtokens = fill(
+        model.prime_mask_subtoken_id, model.prime_subtoken_length, seq_len, batch_size
+    )
+    subtokens_per_step = max(1, ceil(Int, (seq_len * model.prime_subtoken_length) / num_steps))
 
     for step in 1:num_steps
-        # Current mask ratio (decreasing) - ensure Float32
         mask_ratio = Float32(1.0 - (step - 1) / num_steps)
-
-        # Forward pass
-        inputs = (token_ids = current_ids, mask_ratio = mask_ratio)
+        inputs = (subtoken_state = current_subtokens, mask_ratio = mask_ratio)
         logits, state = model(inputs, params, state)
 
-        # Unmask most confident positions
-        remaining_masked = sum(mask)
-        num_to_unmask = min(tokens_per_step, remaining_masked)
-
+        remaining_masked = count(==(model.prime_mask_subtoken_id), current_subtokens)
+        num_to_unmask = min(subtokens_per_step, remaining_masked)
         if num_to_unmask > 0
-            current_ids, mask = unmask_step(
-                logits, current_ids, mask, num_to_unmask, model.mask_token_id
+            current_subtokens = unmask_subtoken_step(
+                logits, current_subtokens, num_to_unmask,
+                model.prime_code_table, model.prime_mask_subtoken_id
             )
         end
 
-        # Early exit if fully unmasked
-        if !any(mask)
+        if count(==(model.prime_mask_subtoken_id), current_subtokens) == 0
             break
         end
     end
 
-    # Final pass with mask_ratio = 0 to refine any remaining
-    if any(mask)
-        inputs = (token_ids = current_ids, mask_ratio = 0.0f0)
-        logits, state = model(inputs, params, state)
-        predictions = dropdims(argmax(logits, dims = 1), dims = 1)
-        current_ids = ifelse.(mask, predictions, current_ids)
-    end
-
-    return batch_size == 1 ? vec(current_ids) : current_ids
+    inputs = (subtoken_state = current_subtokens, mask_ratio = 0.0f0)
+    logits, state = model(inputs, params, state)
+    predictions = map(ci -> ci[1], argmax(logits, dims = 1))
+    predictions = dropdims(predictions, dims = 1)
+    return batch_size == 1 ? vec(predictions) : predictions
 end
 
 # ============================================================================
@@ -785,6 +966,7 @@ export LLaDAConfig, load_config, save_config, config_from_dict
 export default_config, small_config, base_config, large_config, production_config
 
 # Diffusion utilities
-export apply_mask, sample_mask_ratio, unmask_step, generate
+export apply_subtoken_mask, sample_mask_ratio, unmask_subtoken_step, generate
+export token_ids_to_subtokens
 
 end # module

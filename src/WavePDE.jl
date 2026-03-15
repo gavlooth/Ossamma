@@ -39,7 +39,8 @@ using Lux
 using Random
 using NNlib
 using FFTW
-using Zygote: @ignore
+import CUDA
+using ChainRulesCore
 
 # ============================================================================
 # Layer Definition
@@ -201,14 +202,11 @@ function (layer::WavePDELayer)(input_sequence::AbstractArray, parameters, state)
 
     # Run PDE on each column independently (columns = sequence*batch).
     u = reshape(standardized, N, :)
-    v = similar(u)
-    fill!(v, zero(eltype(v)))
+    v = zero(eltype(u)) .* u
 
     # Put λ on the same device/container as parameters.
-    λ = @ignore let
-        buf = similar(c, N)
-        buf .= layer.lambda
-        buf
+    λ = ChainRulesCore.ignore_derivatives() do
+        c isa CUDA.CuArray ? CUDA.CuArray(layer.lambda) : copy(layer.lambda)
     end
 
     for _ in 1:layer.integration_steps

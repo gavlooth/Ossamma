@@ -10,7 +10,6 @@ max_sequence_length = 1024  # Good for most text generation tasks
 embedding_dimension = 768   # BERT-base sized, well-tested dimension
 number_of_heads = 12        # 64 dims per head (standard attention head size)
 number_of_layers = 12       # Substantial depth for complex patterns
-mask_token_id = -1          # -1 = append [MASK] to vocab
 
 [model.dimensions]
 time_dimension = 256        # Rich time/mask-ratio conditioning
