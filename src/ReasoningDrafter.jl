@@ -29,6 +29,7 @@ Design choices for drafting:
 using Lux
 using Random
 using NNlib
+using LinearAlgebra
 
 using ..Swamma: LuxLayer, RMSNorm, to_device_like
 using ..LinearAttention: LinearAttentionLayer
@@ -63,6 +64,9 @@ Base.@kwdef struct ReasoningDrafterConfig
     circuit_product_arity::Int = 2
     circuit_num_sums::Int = 8
     circuit_num_circuits::Int = 4
+
+    # Adapter headers (Phase 3 domain transfer)
+    use_adapters::Bool = false
 end
 
 # ============================================================================
@@ -71,6 +75,7 @@ end
 
 struct ReasoningDrafterBlock{N,RC,GP,LA,WG,CN,GN,CL,ON} <: LuxLayer
     embedding_dimension::Int
+    use_adapters::Bool
 
     Norm::N
     RuleWave::RC
@@ -87,8 +92,10 @@ function ReasoningDrafterBlock(config::ReasoningDrafterConfig)
     dim = config.embedding_dimension
     return ReasoningDrafterBlock(
         dim,
+        config.use_adapters,
         RMSNorm(dim),
         RuleConditionedWavePDE(dim;
+            use_adapters = config.use_adapters,
             code_dim = config.rc_code_dim,
             codebook_size = config.rc_codebook_size,
             default_time_step = config.default_time_step,
@@ -112,6 +119,23 @@ function ReasoningDrafterBlock(config::ReasoningDrafterConfig)
 end
 
 function Lux.initialparameters(rng::Random.AbstractRNG, block::ReasoningDrafterBlock)
+    dim = block.embedding_dimension
+
+    # Circuit adapter headers (identity init for domain transfer)
+    circuit_adapters = if block.use_adapters
+        (
+            CircuitLeafHeaderWeight = Matrix{Float32}(LinearAlgebra.I, dim, dim),
+            CircuitLeafHeaderBias = zeros(Float32, dim),
+            CircuitGateBiasShift = zeros(Float32, dim),
+        )
+    else
+        (
+            CircuitLeafHeaderWeight = nothing,
+            CircuitLeafHeaderBias = nothing,
+            CircuitGateBiasShift = nothing,
+        )
+    end
+
     return (
         Norm = Lux.initialparameters(rng, block.Norm),
         RuleWave = Lux.initialparameters(rng, block.RuleWave),
@@ -122,6 +146,7 @@ function Lux.initialparameters(rng::Random.AbstractRNG, block::ReasoningDrafterB
         GateNorm = Lux.initialparameters(rng, block.GateNorm),
         Circuit = Lux.initialparameters(rng, block.Circuit),
         OutputNorm = Lux.initialparameters(rng, block.OutputNorm),
+        circuit_adapters...,
     )
 end
 
@@ -182,7 +207,30 @@ function (block::ReasoningDrafterBlock)(inputs::Tuple, ps, st)
     hidden = residual .+ glu_out
 
     # 5. AlgebraicCircuit: SPN consistency verification
-    hidden, cl_st = block.Circuit(hidden, ps.Circuit, st.Circuit)
+    #    Apply leaf input header if adapters are active (transforms what leaves see)
+    circuit_input = if block.use_adapters && ps.CircuitLeafHeaderWeight !== nothing
+        h_flat = reshape(hidden, dim, :)
+        adapted = ps.CircuitLeafHeaderWeight * h_flat .+ ps.CircuitLeafHeaderBias
+        reshape(adapted, size(hidden))
+    else
+        hidden
+    end
+
+    circuit_out, cl_st = block.Circuit(circuit_input, ps.Circuit, st.Circuit)
+
+    # Apply circuit gate bias shift if adapters are active
+    hidden = if block.use_adapters && ps.CircuitGateBiasShift !== nothing
+        # The circuit already applied its internal gate. We add a post-hoc
+        # bias shift to adjust injection strength for the new domain.
+        # circuit_out = hidden_in + gate * projected (from inside Circuit)
+        # We modulate the residual: hidden + shift * (circuit_out - hidden)
+        delta = circuit_out .- hidden
+        shift = NNlib.sigmoid.(ps.CircuitGateBiasShift)
+        shift_broadcast = reshape(shift, dim, ntuple(_ -> 1, ndims(hidden) - 1)...)
+        hidden .+ shift_broadcast .* delta
+    else
+        circuit_out
+    end
 
     # 6. Output normalization
     hidden_flat = reshape(hidden, dim, :)

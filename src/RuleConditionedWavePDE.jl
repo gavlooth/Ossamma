@@ -33,6 +33,7 @@ using FFTW
 import CUDA
 using ChainRulesCore
 using Statistics: mean
+using LinearAlgebra: I
 
 using ..Swamma: LuxLayer
 
@@ -46,6 +47,7 @@ struct RuleConditionedWavePDE <: LuxLayer
     codebook_size::Int          # number of discrete reasoning situations
     default_time_step::Float32
     integration_steps::Int
+    use_adapters::Bool          # Phase 3: thin adapter headers for domain transfer
     lambda::Vector{Float32}     # fixed spectral operator (same as WavePDELayer)
 end
 
@@ -55,6 +57,7 @@ function RuleConditionedWavePDE(
     codebook_size::Int = 512,
     default_time_step::Float32 = 0.1f0,
     integration_steps::Int = 8,
+    use_adapters::Bool = false,
 )
     state_dimension > 0 || throw(ArgumentError("state_dimension must be positive"))
     code_dim > 0 || throw(ArgumentError("code_dim must be positive"))
@@ -66,7 +69,7 @@ function RuleConditionedWavePDE(
 
     return RuleConditionedWavePDE(
         state_dimension, code_dim, codebook_size,
-        default_time_step, integration_steps, lambda,
+        default_time_step, integration_steps, use_adapters, lambda,
     )
 end
 
@@ -75,6 +78,25 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::RuleConditionedWa
     cd = layer.code_dim
     cs = layer.codebook_size
     he = Float32(sqrt(2.0 / (cd + N)))
+
+    # Adapter headers: identity-initialized for domain transfer (Phase 3)
+    adapters = if layer.use_adapters
+        (
+            EncoderHeaderWeight = Matrix{Float32}(I, cd, cd),  # identity init
+            EncoderHeaderBias = zeros(Float32, cd),
+            RuleBankHeaderWeight = Matrix{Float32}(I, cd, cd),
+            RuleBankHeaderBias = zeros(Float32, cd),
+            GateBiasShift = zeros(Float32, N),  # additive shift on gate bias
+        )
+    else
+        (
+            EncoderHeaderWeight = nothing,
+            EncoderHeaderBias = nothing,
+            RuleBankHeaderWeight = nothing,
+            RuleBankHeaderBias = nothing,
+            GateBiasShift = nothing,
+        )
+    end
 
     return (
         # VQ-VAE codebook: (code_dim, codebook_size)
@@ -85,7 +107,6 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::RuleConditionedWa
         # Rule bank: each code → rule vector of size code_dim
         RuleBank = randn(rng, Float32, cd, cs) .* 0.1f0,
         # Modulation projections: rule_vector → wave speed/damping shifts
-        # Low-rank: (code_dim → N) via code_dim × N matrix
         SpeedModWeight = randn(rng, Float32, N, cd) .* Float32(sqrt(2.0 / (N + cd))) .* 0.1f0,
         DampingModWeight = randn(rng, Float32, N, cd) .* Float32(sqrt(2.0 / (N + cd))) .* 0.1f0,
         # Base WavePDE parameters (same as WavePDELayer)
@@ -94,6 +115,8 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::RuleConditionedWa
         # Output gate (starts near-closed)
         GateWeight = randn(rng, Float32, N, N) .* Float32(sqrt(2.0 / (2N))),
         GateBias = fill(Float32(-2.0), N),
+        # Adapter headers
+        adapters...,
     )
 end
 
@@ -173,12 +196,23 @@ function (layer::RuleConditionedWavePDE)(hidden_state, ps, st)
     # 1. VQ encode: hidden → discrete reasoning situation code
     # ==================================================================
     query = ps.EncoderWeight * hidden_flat .+ ps.EncoderBias  # (code_dim, M)
+
+    # Adapter header: domain-specific correction on encoder output
+    if layer.use_adapters && ps.EncoderHeaderWeight !== nothing
+        query = ps.EncoderHeaderWeight * query .+ ps.EncoderHeaderBias
+    end
+
     _quantized, indices = vq_quantize_rc(query, ps.Codebook)
 
     # ==================================================================
     # 2. Retrieve rule vectors from bank
     # ==================================================================
     rule_vectors = ps.RuleBank[:, indices]  # (code_dim, M)
+
+    # Adapter header: domain-specific correction on rule vectors
+    if layer.use_adapters && ps.RuleBankHeaderWeight !== nothing
+        rule_vectors = ps.RuleBankHeaderWeight * rule_vectors .+ ps.RuleBankHeaderBias
+    end
 
     # ==================================================================
     # 3. Modulate WavePDE parameters per position
@@ -223,7 +257,11 @@ function (layer::RuleConditionedWavePDE)(hidden_state, ps, st)
     # ==================================================================
     # 5. Gate and residual inject
     # ==================================================================
-    gate = NNlib.sigmoid.(ps.GateWeight * hidden_flat .+ ps.GateBias)
+    gate_bias = ps.GateBias
+    if layer.use_adapters && ps.GateBiasShift !== nothing
+        gate_bias = gate_bias .+ ps.GateBiasShift
+    end
+    gate = NNlib.sigmoid.(ps.GateWeight * hidden_flat .+ gate_bias)
     output_flat = hidden_flat .+ gate .* u
 
     output = reshape(output_flat, N, seq_len, batch_size)
