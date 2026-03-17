@@ -29,12 +29,12 @@ python3 -c "import datasets" 2>/dev/null || {
     exit 1
 }
 
+export REASONING_OUTPUT_DIR="$OUTPUT_DIR"
 python3 << 'PYEOF'
 import json
 import os
-import sys
 
-output_dir = sys.argv[1] if len(sys.argv) > 1 else "data/reasoning"
+output_dir = os.environ.get("REASONING_OUTPUT_DIR", "data/reasoning")
 os.makedirs(output_dir, exist_ok=True)
 
 from datasets import load_dataset
@@ -174,7 +174,7 @@ for fname in sorted(os.listdir(output_dir)):
         print(f"  {fname}: {count:,} examples")
 print(f"  TOTAL: {total:,} examples")
 
-PYEOF "$OUTPUT_DIR"
+PYEOF
 
 echo ""
 echo "Done. All datasets in: $OUTPUT_DIR"

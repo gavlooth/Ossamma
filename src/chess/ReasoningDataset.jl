@@ -129,6 +129,28 @@ function format_logiqa(data)
     return "Context: $ctx\nQuestion: $q\n$opts_str"
 end
 
+function format_logicnli(data)
+    ctx = get(data, :context, get(data, "context", ""))
+    q = get(data, :question, get(data, "question", ""))
+    a = get(data, :answer, get(data, "answer", ""))
+    return "Premise: $ctx\nHypothesis: $q\nEntailment: $a"
+end
+
+function format_arc_challenge(data)
+    q = get(data, :question, get(data, "question", ""))
+    opts = get(data, :options, get(data, "options", String[]))
+    a = get(data, :answer, get(data, "answer", ""))
+    opts_str = join(opts, "\n")
+    return "Question: $q\n$opts_str\nAnswer: $a"
+end
+
+function format_babi(data)
+    ctx = get(data, :context, get(data, "context", ""))
+    q = get(data, :question, get(data, "question", ""))
+    a = get(data, :answer, get(data, "answer", ""))
+    return "Facts: $ctx\nStatement: $q\nValid: $a"
+end
+
 const FORMATTERS = Dict{String, Function}(
     "prontoqa" => format_prontoqa,
     "reclor" => format_reclor,
@@ -136,6 +158,10 @@ const FORMATTERS = Dict{String, Function}(
     "boardgameqa" => format_boardgameqa,
     "folio" => format_folio,
     "logiqa" => format_logiqa,
+    "logicnli" => format_logicnli,
+    "arc_challenge" => format_arc_challenge,
+    "babi_deduction" => format_babi,
+    "babi_induction" => format_babi,
 )
 
 # ============================================================================
