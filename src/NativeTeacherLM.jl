@@ -4,10 +4,30 @@ using JSON3
 using Lux
 using LuxCore
 using NNlib
-using PyCall
 using Random
 
-import ..RMSNorm
+# PyCall is loaded lazily — only when HF weight loading functions are called
+function _pyimport(name::String)
+    PyCall = Base.require(Base.PkgId(Base.UUID("438e738f-606a-5dbb-bf0a-cddfbfd45ab0"), "PyCall"))
+    return PyCall.pyimport(name)
+end
+
+function _PyDict()
+    PyCall = Base.require(Base.PkgId(Base.UUID("438e738f-606a-5dbb-bf0a-cddfbfd45ab0"), "PyCall"))
+    return PyCall.PyDict()
+end
+
+function _PyArray(x)
+    PyCall = Base.require(Base.PkgId(Base.UUID("438e738f-606a-5dbb-bf0a-cddfbfd45ab0"), "PyCall"))
+    return PyCall.PyArray(x)
+end
+
+function _PyObject_check(x)
+    PyCall = Base.require(Base.PkgId(Base.UUID("438e738f-606a-5dbb-bf0a-cddfbfd45ab0"), "PyCall"))
+    return x isa PyCall.PyObject
+end
+
+using ..Swamma: RMSNorm, LuxLayer
 
 export NativeTeacherConfig
 export RotaryEmbedding, CausalSelfAttention, GatedMLP, DecoderBlock, NativeCausalLM
@@ -15,10 +35,6 @@ export build_causal_attention_bias, next_token_logits, greedy_generate
 export AttentionKVCache, NativeDecoderCache, init_decoder_cache, cache_sequence_length
 export forward_with_cache, next_token_logits_cached, greedy_generate_cached
 export resolve_hf_model_dir, granite_config_from_hf, load_granite_weights, load_granite_model
-
-const LuxLayer =
-    isdefined(Lux, :AbstractExplicitLayer) ? Lux.AbstractExplicitLayer :
-    Lux.AbstractLuxLayer
 
 Base.@kwdef struct NativeTeacherConfig
     vocab_size::Int = 49160
@@ -87,30 +103,17 @@ function apply_rotary_embedding(layer::RotaryEmbedding, x; position_offset::Int 
     head_dimension, head_count, sequence_length, batch_size = size(x)
     pair_count = head_dimension ÷ 2
     angles = rope_frequencies(layer, sequence_length; position_offset = position_offset)
-    cos_angles = cos.(angles)
-    sin_angles = sin.(angles)
+    # Broadcast-friendly: (pair_count, 1, seq, 1)
+    cos_a = reshape(cos.(angles), pair_count, 1, sequence_length, 1)
+    sin_a = reshape(sin.(angles), pair_count, 1, sequence_length, 1)
 
-    output = similar(x)
-    @inbounds for batch_index in 1:batch_size
-        for head_index in 1:head_count
-            for position in 1:sequence_length
-                for pair_index in 1:pair_count
-                    first_index = pair_index
-                    second_index = pair_count + pair_index
-                    cos_value = cos_angles[pair_index, position]
-                    sin_value = sin_angles[pair_index, position]
-                    first_value = x[first_index, head_index, position, batch_index]
-                    second_value = x[second_index, head_index, position, batch_index]
-                    output[first_index, head_index, position, batch_index] =
-                        first_value * cos_value - second_value * sin_value
-                    output[second_index, head_index, position, batch_index] =
-                        second_value * cos_value + first_value * sin_value
-                end
-            end
-        end
-    end
+    x_first  = x[1:pair_count, :, :, :]
+    x_second = x[(pair_count + 1):head_dimension, :, :, :]
 
-    return output
+    rotated_first  = x_first .* cos_a .- x_second .* sin_a
+    rotated_second = x_second .* cos_a .+ x_first .* sin_a
+
+    return vcat(rotated_first, rotated_second)
 end
 
 function (layer::RotaryEmbedding)(x, ps, st)
@@ -213,14 +216,10 @@ function Lux.initialstates(rng::Random.AbstractRNG, layer::CausalSelfAttention)
 end
 
 function build_causal_attention_bias(query_length::Int, key_length::Int = query_length; query_offset::Int = 0)
-    bias = fill(-1f9, query_length, key_length)
-    @inbounds for query_index in 1:query_length
-        max_key_index = min(key_length, query_offset + query_index)
-        for key_index in 1:max_key_index
-            bias[query_index, key_index] = 0f0
-        end
-    end
-    return bias
+    # Vectorized: query position q can attend to key position k iff k <= query_offset + q
+    q_pos = reshape(Float32.(1:query_length), query_length, 1) .+ Float32(query_offset)
+    k_pos = reshape(Float32.(1:key_length), 1, key_length)
+    return ifelse.(k_pos .<= q_pos, 0f0, -1f9)
 end
 
 function reshape_heads(x, head_dimension::Int, head_count::Int)
@@ -232,16 +231,10 @@ end
 function expand_kv_heads(x, expand_factor::Int)
     expand_factor == 1 && return x
     head_dimension, kv_head_count, sequence_length, batch_size = size(x)
-    expanded = similar(x, head_dimension, kv_head_count * expand_factor, sequence_length, batch_size)
-    @inbounds for batch_index in 1:batch_size
-        for kv_head_index in 1:kv_head_count
-            for replica_index in 1:expand_factor
-                target_head = (kv_head_index - 1) * expand_factor + replica_index
-                expanded[:, target_head, :, batch_index] .= x[:, kv_head_index, :, batch_index]
-            end
-        end
-    end
-    return expanded
+    # Insert a repeat dimension: (head_dim, kv_heads, 1, seq, batch) → repeat along dim 3
+    x5 = reshape(x, head_dimension, kv_head_count, 1, sequence_length, batch_size)
+    repeated = repeat(x5, 1, 1, expand_factor, 1, 1)  # (hd, kv, factor, seq, batch)
+    return reshape(repeated, head_dimension, kv_head_count * expand_factor, sequence_length, batch_size)
 end
 
 function append_attention_cache(cache::AttentionKVCache, keys, values)
@@ -284,22 +277,38 @@ function causal_attention_forward(
     full_keys = updated_cache === nothing ? keys : updated_cache.keys
     full_values = updated_cache === nothing ? values : updated_cache.values
 
-    bias = build_causal_attention_bias(sequence_length, size(full_keys, 3); query_offset = position_offset)
-    attended = similar(queries)
+    key_length = size(full_keys, 3)
+    bias = build_causal_attention_bias(sequence_length, key_length; query_offset = position_offset)
 
-    @inbounds for batch_index in 1:batch_size
-        for head_index in 1:layer.number_of_heads
-            query_matrix = permutedims(queries[:, head_index, :, batch_index], (2, 1))
-            key_matrix = permutedims(full_keys[:, head_index, :, batch_index], (2, 1))
-            value_matrix = permutedims(full_values[:, head_index, :, batch_index], (2, 1))
+    # Input shape: (head_dim, num_heads, seq, batch)
+    # Permute to (head_dim, seq, num_heads, batch) then flatten heads*batch
+    nh = layer.number_of_heads
+    q_perm = permutedims(queries, (1, 3, 2, 4))      # (head_dim, seq_q, nh, batch)
+    k_perm = permutedims(full_keys, (1, 3, 2, 4))    # (head_dim, key_len, nh, batch)
+    v_perm = permutedims(full_values, (1, 3, 2, 4))  # (head_dim, key_len, nh, batch)
 
-            scores = (query_matrix * key_matrix') .* layer.attention_multiplier
-            weights = NNlib.softmax(scores .+ bias; dims = 2)
-            context = weights * value_matrix
-            attended[:, head_index, :, batch_index] .= permutedims(context, (2, 1))
-        end
-    end
+    q_flat = reshape(q_perm, layer.head_dimension, sequence_length, nh * batch_size)
+    k_flat = reshape(k_perm, layer.head_dimension, key_length, nh * batch_size)
+    v_flat = reshape(v_perm, layer.head_dimension, key_length, nh * batch_size)
 
+    # scores = Q^T K * scale → (seq_q, key_len, nh*batch)
+    scores = NNlib.batched_mul(
+        permutedims(q_flat, (2, 1, 3)),  # (seq_q, head_dim, nh*batch)
+        k_flat,                           # (head_dim, key_len, nh*batch)
+    ) .* layer.attention_multiplier
+
+    # Add causal bias and softmax
+    weights = NNlib.softmax(scores .+ bias; dims = 2)
+
+    # context = weights * V^T → (seq_q, head_dim, nh*batch)
+    context = NNlib.batched_mul(
+        weights,                           # (seq_q, key_len, nh*batch)
+        permutedims(v_flat, (2, 1, 3)),    # (key_len, head_dim, nh*batch)
+    )
+
+    # Reshape back: (seq_q, head_dim, nh*batch) → (head_dim, seq, nh, batch) → (head_dim, nh, seq, batch)
+    context_4d = reshape(permutedims(context, (2, 1, 3)), layer.head_dimension, sequence_length, nh, batch_size)
+    attended = permutedims(context_4d, (1, 3, 2, 4))  # (head_dim, nh, seq, batch)
     merged = reshape(attended, layer.embedding_dimension, sequence_length, batch_size)
     projected, output_state = layer.OutputProjection(merged, ps.OutputProjection, st.OutputProjection)
     projected, dropout_state = layer.Dropout(projected, ps.Dropout, st.Dropout)
@@ -548,7 +557,7 @@ function (model::NativeCausalLM)(token_ids::AbstractArray{<:Integer}, ps, st)
 
     hidden, final_norm_state = model.FinalNorm(hidden, ps.FinalNorm, st.FinalNorm)
     logits, output_state = model.OutputHead(hidden, ps.OutputHead, st.OutputHead)
-    logits ./= model.config.logits_scaling
+    logits = logits ./ model.config.logits_scaling
 
     return logits, (
         TokenEmbedding = embedding_state,
@@ -591,7 +600,7 @@ function forward_with_cache(
 
     hidden, final_norm_state = model.FinalNorm(hidden, ps.FinalNorm, st.FinalNorm)
     logits, output_state = model.OutputHead(hidden, ps.OutputHead, st.OutputHead)
-    logits ./= model.config.logits_scaling
+    logits = logits ./ model.config.logits_scaling
 
     return logits, (
         TokenEmbedding = embedding_state,
@@ -610,7 +619,7 @@ function resolve_hf_model_dir(
         return abspath(model_ref)
     end
 
-    huggingface_hub = pyimport("huggingface_hub")
+    huggingface_hub = _pyimport("huggingface_hub")
     kwargs = Dict{Symbol,Any}(
         :repo_id => model_ref,
         :local_files_only => local_files_only,
@@ -691,10 +700,10 @@ function torch_dtype_for(::Type{Float16})
 end
 
 function py_tensor_to_julia(py_tensor, dtype::Type{T}) where {T <: AbstractFloat}
-    torch = pyimport("torch")
+    torch = _pyimport("torch")
     np_array = py_tensor.to(getproperty(torch, Symbol(torch_dtype_for(dtype)))).cpu().numpy()
-    if np_array isa PyObject
-        return Array{dtype}(PyArray(np_array))
+    if _PyObject_check(np_array)
+        return Array{dtype}(_PyArray(np_array))
     end
     return Array{dtype}(np_array)
 end
@@ -703,7 +712,7 @@ function load_shard_tensors(model_dir::String, shard_name::String, tensor_names:
     shard_path = joinpath(model_dir, shard_name)
     isfile(shard_path) || error("Granite shard missing at $(shard_path)")
 
-    safetensors = pyimport("safetensors")
+    safetensors = _pyimport("safetensors")
     loaded = Dict{String,Array{T}}()
     safe_handle = safetensors.safe_open(shard_path; framework = "pt", device = "cpu")
     for tensor_name in tensor_names
@@ -863,26 +872,11 @@ function greedy_generate(
     max_new_tokens::Int,
     eos_token_id::Union{Int, Nothing} = nothing,
 )
-    tokens = ensure_token_batch(token_ids)
-    batch_size = size(tokens, 2)
-    finished = falses(batch_size)
-    generation_state = st
-
-    for _ in 1:max_new_tokens
-        current_logits, generation_state = next_token_logits(model, tokens, ps, generation_state)
-        next_tokens = similar(tokens, 1, batch_size)
-        @inbounds for batch_index in 1:batch_size
-            next_tokens[1, batch_index] = finished[batch_index] && eos_token_id !== nothing ?
-                eos_token_id : argmax(view(current_logits, :, batch_index))
-        end
-        tokens = vcat(tokens, next_tokens)
-        if eos_token_id !== nothing
-            finished .|= vec(next_tokens[1, :] .== eos_token_id)
-            all(finished) && break
-        end
-        size(tokens, 1) < model.config.max_sequence_length || break
-    end
-
+    tokens, generation_state, _ = greedy_generate_cached(
+        model, token_ids, ps, st;
+        max_new_tokens = max_new_tokens,
+        eos_token_id = eos_token_id,
+    )
     return tokens, generation_state
 end
 

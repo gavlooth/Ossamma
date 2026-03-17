@@ -16,30 +16,8 @@ using TOML
 using ChainRulesCore
 
 # Import parent module components
-using ..Swamma: SwammaBlock, LuxLayer
+using ..Swamma: SwammaBlock, LuxLayer, to_device_like, is_gpu_array
 using ..EngramMod: EngramModule, subtokens_to_token_ids
-
-# Helper to detect and transfer to GPU arrays without requiring CUDA at compile time
-function to_device_like(target, x::AbstractArray)
-    # Check if target is a CUDA array by inspecting type name
-    target_type = string(typeof(target))
-    if occursin("CuArray", target_type)
-        # Get the CUDA module from the target's type
-        cuda_mod = parentmodule(typeof(target))
-        # Use the CuArray constructor from the same module
-        while cuda_mod !== Main && !isdefined(cuda_mod, :CuArray)
-            cuda_mod = parentmodule(cuda_mod)
-        end
-        if isdefined(cuda_mod, :CuArray)
-            return cuda_mod.CuArray(x)
-        end
-    end
-    return x
-end
-
-function is_gpu_array(x)
-    return occursin("CuArray", string(typeof(x)))
-end
 
 function required_subtoken_base(vocab_size::Int, subtoken_length::Int)
     subtoken_length >= 1 || throw(ArgumentError("subtoken_length must be >= 1"))

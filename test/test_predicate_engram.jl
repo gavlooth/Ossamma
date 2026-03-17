@@ -88,6 +88,48 @@ using Test
         relative_diff = sum(abs.(out .- hidden)) / sum(abs.(hidden))
         @test relative_diff < 0.5  # less than 50% relative change
     end
+
+    @testset "EMA state tracking" begin
+        pe = PredicateEngram(64; code_dim=32, codebook_size=128, num_roles=4)
+        ps = Lux.initialparameters(rng, pe)
+        st = Lux.initialstates(rng, pe)
+
+        # EMA state should be initialized
+        @test size(st.ema_cluster_size) == (128,)
+        @test size(st.ema_embed_sum) == (32, 128)
+        @test all(st.ema_cluster_size .== 1.0f0)  # initialized to ones
+
+        # Forward pass should update EMA state
+        hidden = randn(rng, Float32, 64, 8, 2)
+        _, st2 = pe(hidden, ps, st)
+        @test st2.ema_cluster_size !== st.ema_cluster_size  # state was updated
+    end
+
+    @testset "EMA codebook application" begin
+        pe = PredicateEngram(64; code_dim=32, codebook_size=128, num_roles=4)
+        ps = Lux.initialparameters(rng, pe)
+        st = Lux.initialstates(rng, pe)
+
+        # Run a forward pass to accumulate EMA stats
+        hidden = randn(rng, Float32, 64, 16, 4)
+        _, st2 = pe(hidden, ps, st)
+
+        codebook_before = copy(ps.Codebook)
+        apply_ema_codebook!(ps, st2, pe)
+        # Codebook should have changed
+        @test ps.Codebook != codebook_before
+    end
+
+    @testset "EMA disabled" begin
+        pe = PredicateEngram(64; code_dim=32, codebook_size=128, num_roles=4, ema_decay=0.0f0)
+        ps = Lux.initialparameters(rng, pe)
+        st = Lux.initialstates(rng, pe)
+
+        hidden = randn(rng, Float32, 64, 8, 2)
+        _, st2 = pe(hidden, ps, st)
+        # With ema_decay=0, state should pass through unchanged
+        @test st2.ema_cluster_size == st.ema_cluster_size
+    end
 end
 
 println("All PredicateEngram tests passed!")

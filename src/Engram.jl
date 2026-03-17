@@ -21,9 +21,8 @@ using Random
 using NNlib
 using ChainRulesCore
 
-const LuxLayer =
-    isdefined(Lux, :AbstractExplicitLayer) ? Lux.AbstractExplicitLayer :
-    Lux.AbstractLuxLayer
+# Import shared helpers from parent Swamma module
+using ..Swamma: to_device_like, LuxLayer
 
 # ============================================================================
 # EngramModule
@@ -188,7 +187,7 @@ function (layer::EngramModule)((token_ids, hidden_state), ps, st)
     indices = ChainRulesCore.ignore_derivatives() do
         idx_cpu = compute_engram_indices(layer, Array(token_ids_b), st.hash_multipliers)
         # Transfer to same device as embedding table
-        _to_device_like(ps.EmbeddingTable, vec(idx_cpu))
+        to_device_like(ps.EmbeddingTable, vec(idx_cpu))
     end
 
     # 2. Gather embeddings from combined table: single vectorized gather
@@ -220,21 +219,26 @@ function (layer::EngramModule)((token_ids, hidden_state), ps, st)
 end
 
 # ============================================================================
-# Device transfer helper
+# Collision diagnostics
 # ============================================================================
 
-function _to_device_like(target::AbstractArray, x::AbstractArray)
-    target_type = string(typeof(target))
-    if occursin("CuArray", target_type)
-        cuda_mod = parentmodule(typeof(target))
-        while cuda_mod !== Main && !isdefined(cuda_mod, :CuArray)
-            cuda_mod = parentmodule(cuda_mod)
-        end
-        if isdefined(cuda_mod, :CuArray)
-            return cuda_mod.CuArray(x)
-        end
-    end
-    return x
+"""
+    engram_collision_rate(layer, token_ids, hash_mults) → Float64
+
+Compute the fraction of hash collisions across all tables for the given
+token sequence. Useful for monitoring hash quality during development.
+
+Returns a value in [0, 1] where 0 = no collisions, 1 = all collide.
+"""
+function engram_collision_rate(
+    layer::EngramModule,
+    token_ids::AbstractMatrix{<:Integer},
+    hash_mults::Matrix{Int64},
+)
+    indices = compute_engram_indices(layer, token_ids, hash_mults)
+    total = length(indices)
+    unique_count = length(Set(vec(indices)))
+    return 1.0 - unique_count / total
 end
 
 # ============================================================================
@@ -243,5 +247,6 @@ end
 
 export EngramModule
 export subtokens_to_token_ids
+export engram_collision_rate
 
 end # module

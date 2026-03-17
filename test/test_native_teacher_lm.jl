@@ -2,10 +2,8 @@ using Test
 using Random
 using JSON3
 using Lux
-using PyCall
-
-include("../src/Swamma.jl")
-using .Swamma
+using Swamma
+using Swamma.NativeTeacherLM
 
 function synthetic_granite_tensor_map(config::NativeTeacherConfig)
     tensors = Dict{String,Array{Float32}}()
@@ -81,9 +79,10 @@ function write_synthetic_granite_checkpoint(dir::String, config::NativeTeacherCo
         JSON3.write(io, config_payload)
     end
 
-    np = pyimport("numpy")
-    safetensors_numpy = pyimport("safetensors.numpy")
-    py_tensors = PyDict()
+    PyCall = Base.require(Base.PkgId(Base.UUID("438e738f-606a-5dbb-bf0a-cddfbfd45ab0"), "PyCall"))
+    np = PyCall.pyimport("numpy")
+    safetensors_numpy = PyCall.pyimport("safetensors.numpy")
+    py_tensors = PyCall.PyDict()
     for (name, tensor) in tensors
         py_tensors[name] = np.asarray(tensor; dtype = np.float32)
     end
@@ -205,6 +204,13 @@ end
     end
 
     @testset "Synthetic Granite Import" begin
+        safetensors_available = try
+            PyCall = Base.require(Base.PkgId(Base.UUID("438e738f-606a-5dbb-bf0a-cddfbfd45ab0"), "PyCall"))
+            PyCall.pyimport("safetensors.numpy"); true
+        catch; false; end
+        if !safetensors_available
+            @test_skip "Python safetensors package not available"
+        else
         mktempdir() do dir
             granite_config = NativeTeacherConfig(
                 vocab_size = 64,
@@ -259,6 +265,7 @@ end
             @test size(logits) == (loaded_config.vocab_size, 5, 1)
             @test all(isfinite, logits)
         end
+        end  # safetensors_available
     end
 
     @testset "Granite Chat Template Wrapper" begin

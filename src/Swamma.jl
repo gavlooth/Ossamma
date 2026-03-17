@@ -16,22 +16,38 @@ Notes:
 - `SwammaBlock` uses `WavePDELayer` as its structured gate path.
 """
 
-include("Attention.jl")
-include("linearAttention.jl")
-include("WavePDE.jl")
-include("Engram.jl")
-include("PredicateEngram.jl")
-include("CircuitLayer.jl")
+# ============================================================================
+# Shared device transfer helpers (must precede submodule includes)
+# ============================================================================
 
-using .Attention: SWAttention
-using .WavePDE: WavePDELayer
-using .EngramMod: EngramModule, subtokens_to_token_ids as engram_subtokens_to_token_ids
-using .PredicateEngramMod: PredicateEngram, vq_quantize, predicate_engram_commitment_loss
-using .CircuitLayerMod: AlgebraicCircuitLayer, circuit_leaf_activations, circuit_structure_summary
+"""
+    to_device_like(target, x::AbstractArray)
 
-# Import struct from LinearAttention module
-using .LinearAttention: LinearAttentionLayer
+Transfer `x` to the same device as `target` (CPU or CUDA) without a
+compile-time dependency on CUDA.jl.
+"""
+function to_device_like(target, x::AbstractArray)
+    target_type = string(typeof(target))
+    if occursin("CuArray", target_type)
+        cuda_mod = parentmodule(typeof(target))
+        while cuda_mod !== Main && !isdefined(cuda_mod, :CuArray)
+            cuda_mod = parentmodule(cuda_mod)
+        end
+        if isdefined(cuda_mod, :CuArray)
+            return cuda_mod.CuArray(x)
+        end
+    end
+    return x
+end
 
+"""
+    is_gpu_array(x) → Bool
+
+Return `true` if `x` is backed by a CUDA array.
+"""
+is_gpu_array(x) = occursin("CuArray", string(typeof(x)))
+
+# Core deps needed by submodules (must precede includes)
 using Lux
 using Random
 using NNlib
@@ -40,6 +56,24 @@ using Statistics: mean
 const LuxLayer =
     isdefined(Lux, :AbstractExplicitLayer) ? Lux.AbstractExplicitLayer :
     Lux.AbstractLuxLayer
+
+include("Attention.jl")
+include("linearAttention.jl")
+include("WavePDE.jl")
+include("Engram.jl")
+include("PredicateEngram.jl")
+include("CircuitLayer.jl")
+include("RuleConditionedWavePDE.jl")
+
+using .Attention: SWAttention
+using .WavePDE: WavePDELayer
+using .EngramMod: EngramModule, subtokens_to_token_ids as engram_subtokens_to_token_ids, engram_collision_rate
+using .PredicateEngramMod: PredicateEngram, vq_quantize, predicate_engram_commitment_loss, apply_ema_codebook!
+using .CircuitLayerMod: AlgebraicCircuitLayer, circuit_leaf_activations, circuit_structure_summary
+using .RuleConditionedWavePDEMod: RuleConditionedWavePDE, rc_wavepde_commitment_loss, apply_rc_ema_codebook!
+
+# Import struct from LinearAttention module
+using .LinearAttention: LinearAttentionLayer
 
 # ============================================================================
 # RMSNorm (Root Mean Square Layer Normalization)
@@ -1350,6 +1384,13 @@ include("MoET.jl")
 using .MoET: MoETConfig, ExpertTower, MoETModel
 
 # ============================================================================
+# Reasoning Drafter (speculative decoding for AR verifiers)
+# ============================================================================
+include("ReasoningDrafter.jl")
+using .ReasoningDrafterMod: ReasoningDrafterConfig, ReasoningDrafterBlock, ReasoningDrafter
+using .ReasoningDrafterMod: draft_reasoning_tokens, estimate_drafter_parameters
+
+# ============================================================================
 # Native Teacher LM (Lux-native causal decoder foundation)
 # ============================================================================
 include("NativeTeacherLM.jl")
@@ -1434,16 +1475,23 @@ export warmup_cosine_schedule, evaluate, compute_accuracy
 export TrainingConfig, load_training_config, train!
 export load_checkpoint, save_checkpoint
 
+# Shared device helpers
+export to_device_like, is_gpu_array
+
 # Engram conditional memory
-export EngramMod, EngramModule
+export EngramMod, EngramModule, engram_collision_rate
 
 # Predicate Engram (VQ-VAE + Soft TPR + gated injection)
 export PredicateEngramMod, PredicateEngram
-export vq_quantize, predicate_engram_commitment_loss
+export vq_quantize, predicate_engram_commitment_loss, apply_ema_codebook!
 
 # Algebraic Circuit Layer (sum-product networks)
 export CircuitLayerMod, AlgebraicCircuitLayer
 export circuit_leaf_activations, circuit_structure_summary
+
+# Rule-Conditioned WavePDE (VQ situation → modulated wave dynamics)
+export RuleConditionedWavePDEMod, RuleConditionedWavePDE
+export rc_wavepde_commitment_loss, apply_rc_ema_codebook!
 
 # Provide conventional aliases for the main layer types.
 export SWAttention, WavePDELayer
@@ -1524,6 +1572,11 @@ export EXPERT_LOGIC, EXPERT_LANGUAGE, EXPERT_MATH, EXPERT_MEMORY, EXPERT_NAMES
 # MoE Transformer exports
 export MoET
 export MoETConfig, ExpertTower, MoETModel
+
+# Reasoning Drafter exports
+export ReasoningDrafterMod
+export ReasoningDrafterConfig, ReasoningDrafterBlock, ReasoningDrafter
+export draft_reasoning_tokens, estimate_drafter_parameters
 
 # Native teacher LM exports
 export NativeTeacherLM

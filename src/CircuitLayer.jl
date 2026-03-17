@@ -32,9 +32,7 @@ using Random
 using NNlib
 using ChainRulesCore
 
-const LuxLayer =
-    isdefined(Lux, :AbstractExplicitLayer) ? Lux.AbstractExplicitLayer :
-    Lux.AbstractLuxLayer
+using ..Swamma: LuxLayer
 
 # ============================================================================
 # AlgebraicCircuitLayer
@@ -138,7 +136,8 @@ function (layer::AlgebraicCircuitLayer)(hidden_state, ps, st)
     #    Uses log-space for numerical stability.
     # =====================================================================
     # Reshape: (product_arity, num_products, N, nc) → sum logs → exp
-    log_leaves = log.(leaves .+ 1f-8)  # avoid log(0)
+    leaves = clamp.(leaves, 1f-6, 1f0 - 1f-6)
+    log_leaves = log.(leaves)
     log_leaves_grouped = reshape(log_leaves, layer.product_arity, layer.num_products, N, nc)
     log_products = dropdims(sum(log_leaves_grouped, dims=1), dims=1)  # (num_products, N, nc)
     products = exp.(log_products)  # (num_products, N, nc)

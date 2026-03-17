@@ -31,6 +31,11 @@ using Test
 
         # Gate bias initialized negative → engram injection starts small
         @test all(ps.GateBias .< 0)
+
+        # Collision rate should be reasonable for diverse tokens
+        collision_rate = EngramMod.engram_collision_rate(engram, token_ids, st.hash_multipliers)
+        @test 0.0 <= collision_rate <= 1.0
+        @test collision_rate < 0.5  # should not be mostly collisions
     end
 
     @testset "subtokens_to_token_ids" begin

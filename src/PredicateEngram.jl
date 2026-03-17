@@ -26,10 +26,9 @@ using Lux
 using Random
 using NNlib
 using ChainRulesCore
+using Statistics: mean
 
-const LuxLayer =
-    isdefined(Lux, :AbstractExplicitLayer) ? Lux.AbstractExplicitLayer :
-    Lux.AbstractLuxLayer
+using ..Swamma: LuxLayer
 
 # ============================================================================
 # PredicateEngram
@@ -42,6 +41,7 @@ struct PredicateEngram <: LuxLayer
     num_roles::Int          # TPR roles for variable binding
     filler_dim::Int         # dimension per filler
     commitment_cost::Float32  # VQ-VAE commitment loss weight (for training)
+    ema_decay::Float32        # EMA decay for codebook update (0 = disabled)
 end
 
 function PredicateEngram(
@@ -51,6 +51,7 @@ function PredicateEngram(
     num_roles::Int = 4,
     filler_dim::Int = 0,
     commitment_cost::Float32 = 0.25f0,
+    ema_decay::Float32 = 0.99f0,
 )
     if filler_dim <= 0
         filler_dim = embedding_dim ÷ num_roles
@@ -58,7 +59,7 @@ function PredicateEngram(
     embedding_dim == filler_dim * num_roles || throw(ArgumentError(
         "embedding_dim ($embedding_dim) must equal filler_dim ($filler_dim) × num_roles ($num_roles)"
     ))
-    return PredicateEngram(embedding_dim, code_dim, codebook_size, num_roles, filler_dim, commitment_cost)
+    return PredicateEngram(embedding_dim, code_dim, codebook_size, num_roles, filler_dim, commitment_cost, ema_decay)
 end
 
 function Lux.initialparameters(rng::Random.AbstractRNG, layer::PredicateEngram)
@@ -101,7 +102,11 @@ function _init_rule_bank(rng::Random.AbstractRNG, num_roles::Int, codebook_size:
 end
 
 function Lux.initialstates(rng::Random.AbstractRNG, layer::PredicateEngram)
-    return (;)  # no mutable state
+    return (
+        # EMA codebook update state (for training)
+        ema_cluster_size = ones(Float32, layer.codebook_size),  # N_i running counts
+        ema_embed_sum = zeros(Float32, layer.code_dim, layer.codebook_size),  # sum of assigned encodings
+    )
 end
 
 # ============================================================================
@@ -114,19 +119,21 @@ end
 Vector quantization with straight-through estimator.
 Forward: returns nearest codebook vector. Backward: gradient passes through
 as identity on `query` (codebook gets gradients via the gather).
+
+Distance computation stays on-device (no CPU round-trip).
 """
 function vq_quantize(query, codebook)
     # query: (code_dim, N), codebook: (code_dim, codebook_size)
 
-    # Find nearest codebook entry (no gradient through argmin)
+    # Find nearest codebook entry on-device (no gradient through argmin)
     indices = ChainRulesCore.ignore_derivatives() do
-        q_cpu = Array(query)
-        c_cpu = Array(codebook)
-        q_sq = sum(q_cpu .^ 2, dims=1)        # (1, N)
-        c_sq = sum(c_cpu .^ 2, dims=1)        # (1, codebook_size)
-        dots = c_cpu' * q_cpu                   # (codebook_size, N)
+        # ||q - c||² = ||q||² + ||c||² - 2 q·c  — all ops stay on device
+        q_sq = sum(query .^ 2, dims=1)         # (1, N)
+        c_sq = sum(codebook .^ 2, dims=1)      # (1, codebook_size)
+        dots = codebook' * query                # (codebook_size, N)
         dists = q_sq .+ c_sq' .- 2 .* dots     # (codebook_size, N)
-        vec(map(ci -> ci[1], argmin(dists, dims=1)))  # (N,)
+        idx_cart = argmin(dists, dims=1)         # CartesianIndex array
+        vec(map(ci -> ci[1], Array(idx_cart)))   # (N,) — only argmin indices to CPU
     end
 
     # Gather quantized vectors (differentiable w.r.t. codebook)
@@ -222,7 +229,51 @@ function (layer::PredicateEngram)(hidden_state, ps, st)
         output = dropdims(output, dims=3)
     end
 
-    return output, st
+    # =====================================================================
+    # 9. EMA codebook update (mutates state, only meaningful during training)
+    # =====================================================================
+    new_st = ChainRulesCore.ignore_derivatives() do
+        _ema_codebook_update(layer, query, indices, st)
+    end
+
+    return output, new_st
+end
+
+"""
+    _ema_codebook_update(layer, query, indices, st) → updated_state
+
+Exponential moving average update for codebook vectors.
+Prevents codebook collapse by tracking per-code usage counts and
+updating codebook entries toward the mean of their assigned encodings.
+"""
+function _ema_codebook_update(layer::PredicateEngram, query, indices, st)
+    layer.ema_decay > 0 || return st
+
+    decay = layer.ema_decay
+    query_cpu = Array(query)
+    cs = layer.codebook_size
+    N = length(indices)
+
+    # Count assignments per code
+    new_counts = zeros(Float32, cs)
+    for i in 1:N
+        new_counts[indices[i]] += 1.0f0
+    end
+
+    # Sum of encoder outputs per code
+    new_sums = zeros(Float32, layer.code_dim, cs)
+    for i in 1:N
+        new_sums[:, indices[i]] .+= @view query_cpu[:, i]
+    end
+
+    # EMA update
+    ema_cluster_size = decay .* st.ema_cluster_size .+ (1.0f0 - decay) .* new_counts
+    ema_embed_sum = decay .* st.ema_embed_sum .+ (1.0f0 - decay) .* new_sums
+
+    return (
+        ema_cluster_size = ema_cluster_size,
+        ema_embed_sum = ema_embed_sum,
+    )
 end
 
 # ============================================================================
@@ -243,14 +294,32 @@ function predicate_engram_commitment_loss(hidden_flat, ps, layer)
     return Float32(mean((query .- ChainRulesCore.ignore_derivatives(quantized)) .^ 2))
 end
 
-using Statistics: mean
-
 # ============================================================================
 # Exports
 # ============================================================================
 
+"""
+    apply_ema_codebook!(ps, st, layer; laplace_smoothing=1f-5)
+
+Apply accumulated EMA statistics to update codebook vectors in-place.
+Call this after each training step (outside the gradient computation).
+
+Uses Laplace smoothing on cluster sizes to prevent division by zero
+for unused codes.
+"""
+function apply_ema_codebook!(ps, st, layer::PredicateEngram; laplace_smoothing::Float32 = 1f-5)
+    layer.ema_decay > 0 || return
+    n = sum(st.ema_cluster_size)
+    smoothed = (st.ema_cluster_size .+ laplace_smoothing) ./
+               (n + layer.codebook_size * laplace_smoothing) .* n
+    for c in 1:layer.codebook_size
+        ps.Codebook[:, c] .= st.ema_embed_sum[:, c] ./ max(smoothed[c], 1f-8)
+    end
+end
+
 export PredicateEngram
 export vq_quantize
 export predicate_engram_commitment_loss
+export apply_ema_codebook!
 
 end # module
