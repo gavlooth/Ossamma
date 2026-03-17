@@ -4150,3 +4150,49 @@ Copy this block for new sessions:
 - DOMShell still requires browser-side manual setup to become active:
   - load `/home/christos/.local/src/DOMShell/dist` as an unpacked Chrome extension, or install from the Chrome Web Store
 - Winx is built locally, but MCP client integration is still manual if the user wants it added to a Claude Desktop or other MCP config.
+
+## 2026-03-17 — ReasoningDrafter Architecture & Pipeline
+
+### Objectives
+- Evaluate last commit additions (Engram, PredicateEngram, AlgebraicCircuit)
+- Fix review issues (7 items)
+- Design and implement ReasoningDrafter for speculative decoding
+- Build complete chess→language→Granite training pipeline
+
+### Changes Made
+
+**New modules:**
+- `src/RuleConditionedWavePDE.jl` — VQ situation → modulated wave dynamics (replaces PredicateEngram's TPR)
+- `src/ReasoningDrafter.jl` — speculative decoding module: RuleConditionedWavePDE → GLU(LinAttn ⊙ sigmoid(WavePDE)) → AlgebraicCircuit
+- `src/chess/ChessTokenizer.jl` — FEN ↔ 64-square token grid + UCI move encoding
+- `src/chess/ChessDataset.jl` — Lichess eval DB JSONL loader
+- `src/chess/ReasoningDataset.jl` — 6-dataset reasoning loader (LogicNLI, GSM8K, ReClor, ARC, bAbI)
+
+**Training pipeline (4 scripts):**
+- `scripts/train_chess_reasoning.jl` — Phase 1: chess pre-training
+- `scripts/transfer_surgery.jl` — Phase 2: freeze backbone + add adapters
+- `scripts/train_reasoning_language.jl` — Phase 3a: language fine-tuning with frozen backbone
+- `scripts/distill_granite.jl` — Phase 3b: KL distillation from Granite verifier
+- `scripts/launch_reasoning_pipeline.sh` — master launcher
+
+**Fixes (from commit review):**
+- Deduplicated `to_device_like`, `is_gpu_array`, `const LuxLayer` across all submodules
+- GPU-native VQ distance, EMA codebook update, collision diagnostics
+- NativeTeacherLM: batched attention, vectorized RoPE, lazy PyCall, fix in-place mutation
+
+**Adapter headers for domain transfer:**
+- EncoderHeader, RuleBankHeader, GateBiasShift (in RuleConditionedWavePDE)
+- CircuitLeafHeader, CircuitGateBiasShift (in ReasoningDrafterBlock)
+- Identity-initialized, ~149K params overhead at dim=256
+
+### Data Status
+- Lichess eval DB: download in progress (~19GB)
+- Reasoning datasets: 31,230 examples downloaded (6 datasets)
+
+### Best Recommendation
+Move development to NVIDIA Spark GB10. Run `./scripts/launch_reasoning_pipeline.sh --smoke` first, then full pipeline. Target verifier: Granite (ibm-granite/granite-4.0-micro).
+
+### Unresolved
+- Lichess download not yet complete
+- Granite tokenizer integration for Phase 3 (currently using char-level)
+- Acceptance rate evaluation framework not yet built

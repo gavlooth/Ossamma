@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.5"
+julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "82cebd554764d2631b69bb23453078831f3f660e"
+project_hash = "bf6a4141176e7d7aff74892038caa5bf28f691e6"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "8b2b045b22740e4be20654175cc38291d48539db"
@@ -207,6 +207,23 @@ weakdeps = ["SparseArrays"]
 
     [deps.ChainRulesCore.extensions]
     ChainRulesCoreSparseArraysExt = "SparseArrays"
+
+[[deps.ChunkCodecCore]]
+git-tree-sha1 = "1a3ad7e16a321667698a19e77362b35a1e94c544"
+uuid = "0b6fb165-00bc-4d37-ab8b-79f91016dbe1"
+version = "1.0.1"
+
+[[deps.ChunkCodecLibZlib]]
+deps = ["ChunkCodecCore", "Zlib_jll"]
+git-tree-sha1 = "cee8104904c53d39eb94fd06cbe60cb5acde7177"
+uuid = "4c0bbee4-addc-4d73-81a0-b6caacae83c8"
+version = "1.0.0"
+
+[[deps.ChunkCodecLibZstd]]
+deps = ["ChunkCodecCore", "Zstd_jll"]
+git-tree-sha1 = "34d9873079e4cb3d0c62926a225136824677073f"
+uuid = "55437552-ac27-4d47-9aa3-63184e8fd398"
+version = "1.0.0"
 
 [[deps.CodeTracking]]
 deps = ["InteractiveUtils", "UUIDs"]
@@ -417,6 +434,16 @@ git-tree-sha1 = "acebe244d53ee1b461970f8910c235b259e772ef"
 uuid = "9aa1b823-49e4-5ca5-8b0f-3971ec8bab6a"
 version = "0.3.2"
 
+[[deps.FileIO]]
+deps = ["Pkg", "Requires", "UUIDs"]
+git-tree-sha1 = "6522cfb3b8fe97bec632252263057996cbd3de20"
+uuid = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
+version = "1.18.0"
+weakdeps = ["HTTP"]
+
+    [deps.FileIO.extensions]
+    HTTPExt = "HTTP"
+
 [[deps.FileWatching]]
 uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
 version = "1.11.0"
@@ -469,12 +496,10 @@ deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra",
 git-tree-sha1 = "d6ee21b67347871a78da57c4a77318caa5e75a05"
 uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
 version = "11.3.2"
+weakdeps = ["JLD2"]
 
     [deps.GPUArrays.extensions]
     JLD2Ext = "JLD2"
-
-    [deps.GPUArrays.weakdeps]
-    JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 
 [[deps.GPUArraysCore]]
 deps = ["Adapt"]
@@ -560,6 +585,18 @@ version = "0.2.6"
 git-tree-sha1 = "a3f24677c21f5bbe9d2a714f95dcd58337fb2856"
 uuid = "82899510-4779-5014-852e-03e436cf321d"
 version = "1.0.0"
+
+[[deps.JLD2]]
+deps = ["ChunkCodecLibZlib", "ChunkCodecLibZstd", "FileIO", "MacroTools", "Mmap", "OrderedCollections", "PrecompileTools", "ScopedValues"]
+git-tree-sha1 = "8f8ff711442d1f4cfc0d86133e7ee03d62ec9b98"
+uuid = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+version = "0.6.3"
+
+    [deps.JLD2.extensions]
+    UnPackExt = "UnPack"
+
+    [deps.JLD2.weakdeps]
+    UnPack = "3a884ed6-31ef-47d7-9d2a-63182c4928ed"
 
 [[deps.JLLWrappers]]
 deps = ["Artifacts", "Preferences"]
@@ -1347,7 +1384,7 @@ uuid = "bea87d4a-7f5b-5778-9afe-8cc45184846c"
 version = "7.8.3+2"
 
 [[deps.Swamma]]
-deps = ["ArgParse", "CUDA", "ChainRulesCore", "Dates", "Downloads", "FFTW", "GPUArrays", "HTTP", "JSON3", "Lux", "LuxCUDA", "LuxCore", "MLStyle", "NNlib", "OpenCL", "Optimisers", "Printf", "ProgressMeter", "PyCall", "Random", "Revise", "Serialization", "Sockets", "Statistics", "TOML", "Zygote", "oneAPI"]
+deps = ["ArgParse", "CUDA", "ChainRulesCore", "Dates", "Downloads", "FFTW", "GPUArrays", "HTTP", "JSON3", "LinearAlgebra", "Lux", "LuxCUDA", "LuxCore", "MLStyle", "NNlib", "OpenCL", "Optimisers", "Printf", "ProgressMeter", "PyCall", "Random", "Revise", "Serialization", "Sockets", "Statistics", "TOML", "Zygote", "oneAPI"]
 path = "."
 uuid = "21ef6326-9699-446c-bc99-5de46acc82b6"
 version = "0.1.0"
