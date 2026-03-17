@@ -1427,6 +1427,12 @@ include("serve/Monitoring.jl")
 include("serve/InferenceServer.jl")
 
 # ============================================================================
+# Chess Tokenizer and Dataset (for reasoning drafter pre-training)
+# ============================================================================
+include("chess/ChessTokenizer.jl")
+include("chess/ChessDataset.jl")
+
+# ============================================================================
 # Wave-Gate Accessors
 # ============================================================================
 """
@@ -1572,6 +1578,9 @@ export EXPERT_LOGIC, EXPERT_LANGUAGE, EXPERT_MATH, EXPERT_MEMORY, EXPERT_NAMES
 # MoE Transformer exports
 export MoET
 export MoETConfig, ExpertTower, MoETModel
+
+# Chess pre-training data
+export ChessTokenizer, ChessDataset
 
 # Reasoning Drafter exports
 export ReasoningDrafterMod
