@@ -487,6 +487,72 @@ end
     @test size(outputs.relation_logits) == (config.num_relations, config.max_candidate_pairs, 1)
 end
 
+@testset "Relation Extraction Pair MLP Decoder" begin
+    config = SW.RelationExtractionConfig(
+        vocab_size = 128,
+        max_sequence_length = 16,
+        embedding_dimension = 32,
+        number_of_heads = 4,
+        number_of_layers = 2,
+        num_entity_labels = 5,
+        num_relations = 4,
+        time_dimension = 16,
+        state_dimension = 32,
+        window_size = 2,
+        dropout_rate = 0.0f0,
+        max_candidate_spans = 6,
+        max_candidate_pairs = 8,
+        max_span_width = 4,
+        biaffine_rank = 8,
+        pair_neighbor_radius = 2,
+        relation_decoder_mode = :pair_mlp,
+    )
+
+    model = SW.SwammaRelationExtractor(config)
+    rng = Random.default_rng()
+    ps, st = Lux.setup(rng, model)
+
+    token_ids = reshape(rand(rng, 1:config.vocab_size, 12), 12, 1)
+    outputs, _ = model((token_ids = token_ids,), ps, st)
+
+    @test size(outputs.retrieval_logits) == (1, config.max_candidate_pairs, 1)
+    @test size(outputs.relation_logits) == (config.num_relations, config.max_candidate_pairs, 1)
+end
+
+@testset "Relation Extraction Pair Evidence MLP Decoder" begin
+    config = SW.RelationExtractionConfig(
+        vocab_size = 128,
+        max_sequence_length = 16,
+        embedding_dimension = 32,
+        number_of_heads = 4,
+        number_of_layers = 2,
+        num_entity_labels = 5,
+        num_relations = 4,
+        time_dimension = 16,
+        state_dimension = 32,
+        window_size = 2,
+        dropout_rate = 0.0f0,
+        max_candidate_spans = 6,
+        max_candidate_pairs = 8,
+        max_span_width = 4,
+        biaffine_rank = 8,
+        pair_neighbor_radius = 2,
+        pair_evidence_dimension = 16,
+        relation_decoder_mode = :pair_evidence_mlp,
+    )
+
+    model = SW.SwammaRelationExtractor(config)
+    rng = Random.default_rng()
+    ps, st = Lux.setup(rng, model)
+
+    token_ids = reshape(rand(rng, 1:config.vocab_size, 12), 12, 1)
+    token_mask = trues(12, 1)
+    outputs, _ = model((token_ids = token_ids, token_mask = token_mask), ps, st)
+
+    @test size(outputs.evidence_summary) == (config.embedding_dimension, config.max_candidate_pairs, 1)
+    @test size(outputs.relation_logits) == (config.num_relations, config.max_candidate_pairs, 1)
+end
+
 @testset "prepare_rebel_batch Sampled Negatives" begin
     rows = [
         (
@@ -618,4 +684,182 @@ end
         max_span_width = 3,
     )
     @test vec(explicit_batch.sentence_ids[1:4, 1]) == Int32[1, 1, 2, 2]
+
+    teacher_rows = [
+        (
+            tokens = ["Alice", "works", "at", "Acme"],
+            entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            relations = [
+                (head = 1, tail = 2, label = "WORKS_FOR"),
+            ],
+            teacher_entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            teacher_relations = [
+                (head = 1, tail = 2, label = "WORKS_FOR", confidence = 0.8),
+            ],
+        ),
+    ]
+    teacher_vocab = SW.build_token_vocab(teacher_rows; max_vocab = 64)
+    teacher_entity_labels = SW.build_entity_label_space(teacher_rows)
+    teacher_relation_labels = SW.build_relation_label_space(teacher_rows)
+    teacher_batch = SW.prepare_rebel_batch(
+        teacher_rows,
+        teacher_vocab,
+        teacher_entity_labels,
+        teacher_relation_labels;
+        max_len = 6,
+        max_candidate_spans = 4,
+        max_candidate_pairs = 4,
+        max_span_width = 3,
+    )
+    @test teacher_batch.teacher_entity_labels[1, 1] == teacher_entity_labels["B-PERSON"]
+    @test teacher_batch.teacher_entity_labels[4, 1] == teacher_entity_labels["B-ORGANIZATION"]
+    teacher_pair_idx = findfirst(@view(teacher_batch.relation_mask[:, 1]))
+    @test teacher_pair_idx !== nothing
+    idx = teacher_pair_idx::Int
+    @test teacher_batch.relation_supervision_mask[idx, 1]
+    @test teacher_batch.teacher_relation_mask[idx, 1]
+    @test teacher_batch.teacher_relation_labels[idx, 1] == teacher_relation_labels["WORKS_FOR"]
+    @test isapprox(teacher_batch.teacher_confidence_targets[idx, 1], 0.8f0; atol = 1f-6)
+    @test teacher_batch.teacher_confidence_mask[idx, 1]
+
+    teacher_only_rows = [
+        (
+            tokens = ["Alice", "works", "at", "Acme"],
+            entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            relations = Any[],
+            teacher_entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            teacher_relations = [
+                (head = 1, tail = 2, label = "WORKS_FOR", confidence = 0.6),
+            ],
+        ),
+    ]
+    teacher_only_batch = SW.prepare_rebel_batch(
+        teacher_only_rows,
+        teacher_vocab,
+        teacher_entity_labels,
+        teacher_relation_labels;
+        max_len = 6,
+        max_candidate_spans = 4,
+        max_candidate_pairs = 4,
+        max_span_width = 3,
+    )
+    teacher_only_pair_idx = findfirst(@view(teacher_only_batch.teacher_relation_mask[:, 1]))
+    @test teacher_only_pair_idx !== nothing
+    teacher_only_idx = teacher_only_pair_idx::Int
+    @test teacher_only_batch.relation_mask[teacher_only_idx, 1]
+    @test !teacher_only_batch.relation_supervision_mask[teacher_only_idx, 1]
+    @test teacher_only_batch.relation_labels[teacher_only_idx, 1] == teacher_relation_labels["NO_RELATION"]
+    @test teacher_only_batch.teacher_relation_labels[teacher_only_idx, 1] == teacher_relation_labels["WORKS_FOR"]
+    @test isapprox(teacher_only_batch.teacher_confidence_targets[teacher_only_idx, 1], 0.6f0; atol = 1f-6)
+
+    teacher_span_rows = [
+        (
+            tokens = ["Alice", "works", "at", "Acme"],
+            entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            relations = Any[],
+            teacher_entities = [
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+                (start = 1, stop = 1, label = "PERSON"),
+            ],
+            teacher_relations = [
+                (head_start = 1, head_stop = 1, tail_start = 4, tail_stop = 4, label = "WORKS_FOR", confidence = 0.7),
+            ],
+        ),
+    ]
+    teacher_span_batch = SW.prepare_rebel_batch(
+        teacher_span_rows,
+        teacher_vocab,
+        teacher_entity_labels,
+        teacher_relation_labels;
+        max_len = 6,
+        max_candidate_spans = 4,
+        max_candidate_pairs = 4,
+        max_span_width = 3,
+    )
+    teacher_span_pair_idx = findfirst(@view(teacher_span_batch.teacher_relation_mask[:, 1]))
+    @test teacher_span_pair_idx !== nothing
+    teacher_span_idx = teacher_span_pair_idx::Int
+    @test teacher_span_batch.relation_mask[teacher_span_idx, 1]
+    @test !teacher_span_batch.relation_supervision_mask[teacher_span_idx, 1]
+    @test teacher_span_batch.teacher_relation_labels[teacher_span_idx, 1] == teacher_relation_labels["WORKS_FOR"]
+    @test isapprox(teacher_span_batch.teacher_confidence_targets[teacher_span_idx, 1], 0.7f0; atol = 1f-6)
+
+    teacher_extra_span_rows = [
+        (
+            tokens = ["Alice", "works", "at", "Acme"],
+            entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+            ],
+            relations = Any[],
+            teacher_entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            teacher_relations = [
+                (head_start = 1, head_stop = 1, tail_start = 4, tail_stop = 4, label = "WORKS_FOR", confidence = 0.65),
+            ],
+        ),
+    ]
+    teacher_extra_entity_labels = SW.build_entity_label_space([
+        (
+            tokens = ["Alice", "works", "at", "Acme"],
+            entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            relations = [
+                (head = 1, tail = 2, label = "WORKS_FOR"),
+            ],
+        ),
+    ])
+    teacher_extra_relation_labels = SW.build_relation_label_space([
+        (
+            tokens = ["Alice", "works", "at", "Acme"],
+            entities = [
+                (start = 1, stop = 1, label = "PERSON"),
+                (start = 4, stop = 4, label = "ORGANIZATION"),
+            ],
+            relations = [
+                (head = 1, tail = 2, label = "WORKS_FOR"),
+            ],
+        ),
+    ])
+    teacher_extra_batch = SW.prepare_rebel_batch(
+        teacher_extra_span_rows,
+        teacher_vocab,
+        teacher_extra_entity_labels,
+        teacher_extra_relation_labels;
+        max_len = 6,
+        max_candidate_spans = 4,
+        max_candidate_pairs = 4,
+        max_span_width = 3,
+    )
+    @test sum(teacher_extra_batch.span_mask[:, 1]) == 2
+    @test sum(teacher_extra_batch.span_supervision_mask[:, 1]) == 1
+    injected_span_idx = findfirst(i -> teacher_extra_batch.span_mask[i, 1] && !teacher_extra_batch.span_supervision_mask[i, 1], 1:size(teacher_extra_batch.span_mask, 1))
+    @test injected_span_idx !== nothing
+    injected_idx = injected_span_idx::Int
+    @test teacher_extra_batch.spans[:, injected_idx, 1] == [4, 4]
+    teacher_extra_pair_idx = findfirst(@view(teacher_extra_batch.teacher_relation_mask[:, 1]))
+    @test teacher_extra_pair_idx !== nothing
+    teacher_extra_rel_idx = teacher_extra_pair_idx::Int
+    @test teacher_extra_batch.relation_mask[teacher_extra_rel_idx, 1]
+    @test !teacher_extra_batch.relation_supervision_mask[teacher_extra_rel_idx, 1]
+    @test teacher_extra_batch.teacher_relation_labels[teacher_extra_rel_idx, 1] == teacher_extra_relation_labels["WORKS_FOR"]
+    @test isapprox(teacher_extra_batch.teacher_confidence_targets[teacher_extra_rel_idx, 1], 0.65f0; atol = 1f-6)
 end

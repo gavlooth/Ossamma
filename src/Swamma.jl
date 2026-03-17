@@ -19,9 +19,15 @@ Notes:
 include("Attention.jl")
 include("linearAttention.jl")
 include("WavePDE.jl")
+include("Engram.jl")
+include("PredicateEngram.jl")
+include("CircuitLayer.jl")
 
 using .Attention: SWAttention
 using .WavePDE: WavePDELayer
+using .EngramMod: EngramModule, subtokens_to_token_ids as engram_subtokens_to_token_ids
+using .PredicateEngramMod: PredicateEngram, vq_quantize, predicate_engram_commitment_loss
+using .CircuitLayerMod: AlgebraicCircuitLayer, circuit_leaf_activations, circuit_structure_summary
 
 # Import struct from LinearAttention module
 using .LinearAttention: LinearAttentionLayer
@@ -1267,6 +1273,20 @@ using .NER: load_ner_config, estimate_parameters, print_config_summary
 using .NER: load_training_config as load_ner_training_config
 
 # ============================================================================
+# Deep Scaling Strategies (48-96+ layers)
+# (must precede RelationExtraction which imports HierarchicalFrequencyConfig)
+# ============================================================================
+include("DeepScaling.jl")
+using .DeepScaling: HierarchicalFrequencyConfig, compute_layer_frequencies, frequency_summary
+using .DeepScaling: LayerScaleConfig, apply_layer_scale, init_layer_scale
+using .DeepScaling: StochasticDepthConfig, should_drop_layer, layer_drop_rate, drop_path
+using .DeepScaling: CheckpointConfig, should_checkpoint
+using .DeepScaling: SwammaBlockDeep
+using .DeepScaling: DeepModelConfig, create_deep_blocks, print_model_summary
+using .DeepScaling: deep_48L_config, ultra_96L_config, long_context_config
+using .DeepScaling: BlockTypeSchedule, UNIFORM, PROGRESSIVE, SANDWICH, ALTERNATING, get_block_type
+
+# ============================================================================
 # Relation Extraction Model
 # ============================================================================
 include("RelationExtraction.jl")
@@ -1302,19 +1322,6 @@ using .DrafterTraining: DrafterTrainingConfig, create_drafter_training_state
 using .DrafterTraining: apply_random_mask, apply_block_mask, apply_suffix_mask
 
 # ============================================================================
-# Deep Scaling Strategies (48-96+ layers)
-# ============================================================================
-include("DeepScaling.jl")
-using .DeepScaling: HierarchicalFrequencyConfig, compute_layer_frequencies, frequency_summary
-using .DeepScaling: LayerScaleConfig, apply_layer_scale, init_layer_scale
-using .DeepScaling: StochasticDepthConfig, should_drop_layer, layer_drop_rate, drop_path
-using .DeepScaling: CheckpointConfig, should_checkpoint
-using .DeepScaling: SwammaBlockDeep
-using .DeepScaling: DeepModelConfig, create_deep_blocks, print_model_summary
-using .DeepScaling: deep_48L_config, ultra_96L_config, long_context_config
-using .DeepScaling: BlockTypeSchedule, UNIFORM, PROGRESSIVE, SANDWICH, ALTERNATING, get_block_type
-
-# ============================================================================
 # TiDAR - Speculative Decoding with Granite Models
 # ============================================================================
 include("TiDAR.jl")
@@ -1341,6 +1348,17 @@ using .LogicGated: EXPERT_LOGIC, EXPERT_LANGUAGE, EXPERT_MATH, EXPERT_MEMORY, EX
 # ============================================================================
 include("MoET.jl")
 using .MoET: MoETConfig, ExpertTower, MoETModel
+
+# ============================================================================
+# Native Teacher LM (Lux-native causal decoder foundation)
+# ============================================================================
+include("NativeTeacherLM.jl")
+using .NativeTeacherLM: NativeTeacherConfig, RotaryEmbedding
+using .NativeTeacherLM: CausalSelfAttention, GatedMLP, DecoderBlock, NativeCausalLM
+using .NativeTeacherLM: build_causal_attention_bias, next_token_logits, greedy_generate
+using .NativeTeacherLM: AttentionKVCache, NativeDecoderCache, init_decoder_cache, cache_sequence_length
+using .NativeTeacherLM: forward_with_cache, next_token_logits_cached, greedy_generate_cached
+using .NativeTeacherLM: resolve_hf_model_dir, granite_config_from_hf, load_granite_weights, load_granite_model
 
 # ============================================================================
 # HuggingFace Tokenizer (optional - requires PyCall)
@@ -1415,6 +1433,17 @@ export TrainState, create_train_state, train_step!
 export warmup_cosine_schedule, evaluate, compute_accuracy
 export TrainingConfig, load_training_config, train!
 export load_checkpoint, save_checkpoint
+
+# Engram conditional memory
+export EngramMod, EngramModule
+
+# Predicate Engram (VQ-VAE + Soft TPR + gated injection)
+export PredicateEngramMod, PredicateEngram
+export vq_quantize, predicate_engram_commitment_loss
+
+# Algebraic Circuit Layer (sum-product networks)
+export CircuitLayerMod, AlgebraicCircuitLayer
+export circuit_leaf_activations, circuit_structure_summary
 
 # Provide conventional aliases for the main layer types.
 export SWAttention, WavePDELayer
@@ -1495,5 +1524,14 @@ export EXPERT_LOGIC, EXPERT_LANGUAGE, EXPERT_MATH, EXPERT_MEMORY, EXPERT_NAMES
 # MoE Transformer exports
 export MoET
 export MoETConfig, ExpertTower, MoETModel
+
+# Native teacher LM exports
+export NativeTeacherLM
+export NativeTeacherConfig, RotaryEmbedding
+export CausalSelfAttention, GatedMLP, DecoderBlock, NativeCausalLM
+export build_causal_attention_bias, next_token_logits, greedy_generate
+export AttentionKVCache, NativeDecoderCache, init_decoder_cache, cache_sequence_length
+export forward_with_cache, next_token_logits_cached, greedy_generate_cached
+export resolve_hf_model_dir, granite_config_from_hf, load_granite_weights, load_granite_model
 
 end

@@ -509,6 +509,114 @@ function load_null_relation_weight(config_path::String)::Float32
     return Float32(get(training, "null_relation_weight", 1.0))
 end
 
+function load_relation_focal_gamma(config_path::String)::Float32
+    data = TOML.parsefile(config_path)
+    training = get(data, "training", Dict{String,Any}())
+    gamma = Float32(get(training, "relation_focal_gamma", 0.0))
+    gamma >= 0.0f0 || error("training.relation_focal_gamma must be >= 0, got $(gamma)")
+    return gamma
+end
+
+function load_positive_relation_weight(config_path::String)::Float32
+    data = TOML.parsefile(config_path)
+    training = get(data, "training", Dict{String,Any}())
+    weight = Float32(get(training, "positive_relation_weight", 1.0))
+    weight > 0.0f0 || error("training.positive_relation_weight must be > 0, got $(weight)")
+    return weight
+end
+
+function load_relation_logit_adjustment_tau(config_path::String)::Float32
+    data = TOML.parsefile(config_path)
+    training = get(data, "training", Dict{String,Any}())
+    tau = Float32(get(training, "relation_logit_adjustment_tau", 0.0))
+    tau >= 0.0f0 || error("training.relation_logit_adjustment_tau must be >= 0, got $(tau)")
+    return tau
+end
+
+function load_distillation_settings(config_path::String)
+    data = TOML.parsefile(config_path)
+    training = get(data, "training", Dict{String,Any}())
+    entity_weight = Float32(get(training, "teacher_entity_loss_weight", 0.0))
+    relation_weight = Float32(get(training, "teacher_relation_loss_weight", 0.0))
+    confidence_weight = Float32(get(training, "teacher_confidence_loss_weight", 0.0))
+    allow_missing_teacher_targets = Bool(get(training, "allow_missing_teacher_targets", false))
+    entity_weight >= 0.0f0 || error("training.teacher_entity_loss_weight must be >= 0, got $(entity_weight)")
+    relation_weight >= 0.0f0 || error("training.teacher_relation_loss_weight must be >= 0, got $(relation_weight)")
+    confidence_weight >= 0.0f0 || error("training.teacher_confidence_loss_weight must be >= 0, got $(confidence_weight)")
+    return (
+        entity_weight = entity_weight,
+        relation_weight = relation_weight,
+        confidence_weight = confidence_weight,
+        allow_missing_teacher_targets = allow_missing_teacher_targets,
+    )
+end
+
+function summarize_teacher_payloads(rows)
+    rows_with_teacher_entities = 0
+    rows_with_teacher_relations = 0
+    teacher_entity_total = 0
+    teacher_relation_total = 0
+    for row in rows
+        if haskey(row, :teacher_entities)
+            teacher_entities = collect(row.teacher_entities)
+            rows_with_teacher_entities += 1
+            teacher_entity_total += length(teacher_entities)
+        end
+        if haskey(row, :teacher_relations)
+            teacher_relations = collect(row.teacher_relations)
+            rows_with_teacher_relations += 1
+            teacher_relation_total += length(teacher_relations)
+        end
+    end
+    return (
+        rows_with_teacher_entities = rows_with_teacher_entities,
+        rows_with_teacher_relations = rows_with_teacher_relations,
+        teacher_entity_total = teacher_entity_total,
+        teacher_relation_total = teacher_relation_total,
+    )
+end
+
+function validate_teacher_payload_coverage(rows, distillation_settings; context::String = "train")
+    requested = distillation_settings.entity_weight > 0.0f0 ||
+                distillation_settings.relation_weight > 0.0f0 ||
+                distillation_settings.confidence_weight > 0.0f0
+    requested || return nothing
+
+    coverage = summarize_teacher_payloads(rows)
+    println(
+        "Teacher payload coverage ($context): " *
+        "entity_rows=$(coverage.rows_with_teacher_entities), " *
+        "relation_rows=$(coverage.rows_with_teacher_relations), " *
+        "entity_targets=$(coverage.teacher_entity_total), " *
+        "relation_targets=$(coverage.teacher_relation_total)"
+    )
+
+    missing_entity_targets = distillation_settings.entity_weight > 0.0f0 &&
+                             coverage.teacher_entity_total == 0
+    missing_relation_targets = (distillation_settings.relation_weight > 0.0f0 ||
+                                distillation_settings.confidence_weight > 0.0f0) &&
+                               coverage.teacher_relation_total == 0
+
+    if !distillation_settings.allow_missing_teacher_targets &&
+       (missing_entity_targets || missing_relation_targets)
+        missing_parts = String[]
+        missing_entity_targets && push!(missing_parts, "teacher_entities")
+        missing_relation_targets && push!(missing_parts, "teacher_relations")
+        missing_spec = join(missing_parts, " and ")
+        error(
+            "Distillation losses are enabled but $(missing_spec) are missing in the $context rows. " *
+            "Add teacher payloads or set training.allow_missing_teacher_targets=true for plumbing-only smoke runs."
+        )
+    end
+
+    if distillation_settings.allow_missing_teacher_targets &&
+       (missing_entity_targets || missing_relation_targets)
+        println("Warning: proceeding without teacher payload coverage because training.allow_missing_teacher_targets=true")
+    end
+
+    return coverage
+end
+
 function load_edge_ranking_settings(config_path::String)
     data = TOML.parsefile(config_path)
     training = get(data, "training", Dict{String,Any}())
@@ -728,6 +836,14 @@ function relation_loss(
     outputs,
     targets;
     null_relation_weight::Float32 = 1.0f0,
+    positive_relation_weight::Float32 = 1.0f0,
+    no_relation_id::Int = 1,
+    relation_focal_gamma::Float32 = 0.0f0,
+    relation_logit_adjustment_tau::Float32 = 0.0f0,
+    relation_logit_adjustment::Union{Nothing,Vector{Float32}} = nothing,
+    teacher_entity_loss_weight::Float32 = 0.0f0,
+    teacher_relation_loss_weight::Float32 = 0.0f0,
+    teacher_confidence_loss_weight::Float32 = 0.0f0,
     edge_ranking_loss_weight::Float32 = 0.0f0,
     edge_ranking_margin::Float32 = 0.2f0,
     edge_ranking_hard_negatives::Int = 16,
@@ -742,7 +858,7 @@ function relation_loss(
             hard_negatives = edge_ranking_hard_negatives,
         )
     ) : 0.0f0
-    return entity_cross_entropy(outputs.entity_logits, targets.entity_labels) +
+    supervised = entity_cross_entropy(outputs.entity_logits, targets.entity_labels) +
            boundary_bce(outputs.boundary_logits, targets.boundary_labels) +
            Swamma.RelationExtraction.mention_bce(
                outputs.mention_logits,
@@ -755,14 +871,52 @@ function relation_loss(
                targets.relation_labels,
                targets.relation_mask;
                null_relation_weight = null_relation_weight,
+               positive_relation_weight = positive_relation_weight,
+               no_relation_id = no_relation_id,
+               focal_gamma = relation_focal_gamma,
+               logit_adjustment_tau = relation_logit_adjustment_tau,
+               logit_adjustment = relation_logit_adjustment,
            ) +
            confidence_bce(outputs.confidence_logits, targets.relation_targets, targets.relation_mask)
+
+    teacher_entity = teacher_entity_loss_weight > 0.0f0 ?
+        entity_cross_entropy(outputs.entity_logits, targets.teacher_entity_labels) :
+        0.0f0
+    teacher_relation = teacher_relation_loss_weight > 0.0f0 ?
+        relation_cross_entropy(
+            outputs.relation_logits,
+            targets.teacher_relation_labels,
+            targets.teacher_relation_mask;
+            null_relation_weight = 1.0f0,
+            positive_relation_weight = 1.0f0,
+            no_relation_id = no_relation_id,
+            focal_gamma = 0.0f0,
+            logit_adjustment_tau = 0.0f0,
+            logit_adjustment = nothing,
+        ) :
+        0.0f0
+    teacher_confidence = teacher_confidence_loss_weight > 0.0f0 ?
+        confidence_bce(outputs.confidence_logits, targets.teacher_confidence_targets, targets.teacher_confidence_mask) :
+        0.0f0
+    distillation = teacher_entity_loss_weight * teacher_entity +
+                   teacher_relation_loss_weight * teacher_relation +
+                   teacher_confidence_loss_weight * teacher_confidence
+
+    return supervised + distillation
 end
 
 function relation_loss_breakdown(
     outputs,
     targets;
     null_relation_weight::Float32 = 1.0f0,
+    positive_relation_weight::Float32 = 1.0f0,
+    no_relation_id::Int = 1,
+    relation_focal_gamma::Float32 = 0.0f0,
+    relation_logit_adjustment_tau::Float32 = 0.0f0,
+    relation_logit_adjustment::Union{Nothing,Vector{Float32}} = nothing,
+    teacher_entity_loss_weight::Float32 = 0.0f0,
+    teacher_relation_loss_weight::Float32 = 0.0f0,
+    teacher_confidence_loss_weight::Float32 = 0.0f0,
     edge_ranking_loss_weight::Float32 = 0.0f0,
     edge_ranking_margin::Float32 = 0.2f0,
     edge_ranking_hard_negatives::Int = 16,
@@ -797,12 +951,45 @@ function relation_loss_breakdown(
             targets.relation_labels,
             targets.relation_mask;
             null_relation_weight = null_relation_weight,
+            positive_relation_weight = positive_relation_weight,
+            no_relation_id = no_relation_id,
+            focal_gamma = relation_focal_gamma,
+            logit_adjustment_tau = relation_logit_adjustment_tau,
+            logit_adjustment = relation_logit_adjustment,
         )
     )
     confidence = Float32(
         confidence_bce(outputs.confidence_logits, targets.relation_targets, targets.relation_mask)
     )
-    total = entity + boundary + mention + retrieval + relation + confidence
+    teacher_entity = Float32(
+        teacher_entity_loss_weight > 0.0f0 ?
+        entity_cross_entropy(outputs.entity_logits, targets.teacher_entity_labels) :
+        0.0f0
+    )
+    teacher_relation = Float32(
+        teacher_relation_loss_weight > 0.0f0 ?
+        relation_cross_entropy(
+            outputs.relation_logits,
+            targets.teacher_relation_labels,
+            targets.teacher_relation_mask;
+            null_relation_weight = 1.0f0,
+            positive_relation_weight = 1.0f0,
+            no_relation_id = no_relation_id,
+            focal_gamma = 0.0f0,
+            logit_adjustment_tau = 0.0f0,
+            logit_adjustment = nothing,
+        ) :
+        0.0f0
+    )
+    teacher_confidence = Float32(
+        teacher_confidence_loss_weight > 0.0f0 ?
+        confidence_bce(outputs.confidence_logits, targets.teacher_confidence_targets, targets.teacher_confidence_mask) :
+        0.0f0
+    )
+    distillation = teacher_entity_loss_weight * teacher_entity +
+                   teacher_relation_loss_weight * teacher_relation +
+                   teacher_confidence_loss_weight * teacher_confidence
+    total = entity + boundary + mention + retrieval + relation + confidence + distillation
     return (
         entity = entity,
         boundary = boundary,
@@ -811,6 +998,10 @@ function relation_loss_breakdown(
         retrieval_rank = retrieval_rank,
         relation = relation,
         confidence = confidence,
+        teacher_entity = teacher_entity,
+        teacher_relation = teacher_relation,
+        teacher_confidence = teacher_confidence,
+        distillation = distillation,
         total = total,
     )
 end
@@ -819,6 +1010,11 @@ function proposal_training_loss(
     proposal_outputs,
     proposal_targets;
     null_relation_weight::Float32 = 1.0f0,
+    positive_relation_weight::Float32 = 1.0f0,
+    no_relation_id::Int = 1,
+    relation_focal_gamma::Float32 = 0.0f0,
+    relation_logit_adjustment_tau::Float32 = 0.0f0,
+    relation_logit_adjustment::Union{Nothing,Vector{Float32}} = nothing,
     edge_ranking_loss_weight::Float32 = 0.0f0,
     edge_ranking_margin::Float32 = 0.2f0,
     edge_ranking_hard_negatives::Int = 16,
@@ -848,6 +1044,11 @@ function proposal_training_loss(
             proposal_targets.relation_labels,
             proposal_targets.relation_mask,
             null_relation_weight = null_relation_weight,
+            positive_relation_weight = positive_relation_weight,
+            no_relation_id = no_relation_id,
+            focal_gamma = relation_focal_gamma,
+            logit_adjustment_tau = relation_logit_adjustment_tau,
+            logit_adjustment = relation_logit_adjustment,
         )
     )
     confidence = Float32(
@@ -1129,11 +1330,16 @@ function make_batch(
         mention_labels = batch.mention_labels,
         mention_mask = batch.mention_mask,
         spans = batch.spans,
-        span_mask = batch.span_mask,
+        span_mask = batch.span_supervision_mask,
         relation_labels = batch.relation_labels,
         relation_pairs = batch.relation_pairs,
-        relation_mask = batch.relation_mask,
+        relation_mask = batch.relation_supervision_mask,
         relation_targets = batch.relation_targets,
+        teacher_entity_labels = batch.teacher_entity_labels,
+        teacher_relation_labels = batch.teacher_relation_labels,
+        teacher_relation_mask = batch.teacher_relation_mask,
+        teacher_confidence_targets = batch.teacher_confidence_targets,
+        teacher_confidence_mask = batch.teacher_confidence_mask,
     )
     return to_device(inputs), to_device(targets)
 end
@@ -1851,6 +2057,8 @@ function evaluate_model(
     pair_proposer_settings;
     current_step::Union{Nothing,Int} = nothing,
     evidence_pooling_mode::Symbol = :token,
+    relation_logit_adjustment_tau::Float32 = 0.0f0,
+    relation_logit_adjustment::Union{Nothing,Vector{Float32}} = nothing,
 )
     isempty(rows) && return (
         total_loss = NaN32,
@@ -1951,6 +2159,12 @@ function evaluate_model(
     no_relation_id = get(relation_label_to_id, "NO_RELATION", 1)
     retrieval_bias_settings = load_retrieval_bias_settings(run_config.config_path)
     null_relation_weight = load_null_relation_weight(run_config.config_path)
+    relation_focal_gamma = load_relation_focal_gamma(run_config.config_path)
+    positive_relation_weight = load_positive_relation_weight(run_config.config_path)
+    distillation_settings = load_distillation_settings(run_config.config_path)
+    logit_adjustment_tau = relation_logit_adjustment_tau > 0.0f0 ?
+        relation_logit_adjustment_tau :
+        load_relation_logit_adjustment_tau(run_config.config_path)
     edge_ranking_settings = load_edge_ranking_settings(run_config.config_path)
     eval_rng = MersenneTwister(run_config.seed)
 
@@ -1973,6 +2187,14 @@ function evaluate_model(
             outputs,
             targets;
             null_relation_weight = null_relation_weight,
+            positive_relation_weight = positive_relation_weight,
+            no_relation_id = no_relation_id,
+            relation_focal_gamma = relation_focal_gamma,
+            relation_logit_adjustment_tau = logit_adjustment_tau,
+            relation_logit_adjustment = relation_logit_adjustment,
+            teacher_entity_loss_weight = distillation_settings.entity_weight,
+            teacher_relation_loss_weight = distillation_settings.relation_weight,
+            teacher_confidence_loss_weight = distillation_settings.confidence_weight,
             edge_ranking_loss_weight = edge_ranking_settings.weight,
             edge_ranking_margin = edge_ranking_settings.margin,
             edge_ranking_hard_negatives = edge_ranking_settings.hard_negatives,
@@ -2000,6 +2222,11 @@ function evaluate_model(
             proposal_outputs,
             proposal_targets;
             null_relation_weight = null_relation_weight,
+            positive_relation_weight = positive_relation_weight,
+            no_relation_id = no_relation_id,
+            relation_focal_gamma = relation_focal_gamma,
+            relation_logit_adjustment_tau = logit_adjustment_tau,
+            relation_logit_adjustment = relation_logit_adjustment,
             edge_ranking_loss_weight = edge_ranking_settings.weight,
             edge_ranking_margin = edge_ranking_settings.margin,
             edge_ranking_hard_negatives = edge_ranking_settings.hard_negatives,
@@ -3142,6 +3369,23 @@ function save_re_checkpoint(path; params, state, opt_state, step, epoch, loss, v
         :model_config => model_config,
         :timestamp => Dates.now(),
     ))
+    # Background HF upload if configured
+    hf_repo = get(ENV, "SWAMMA_HF_REPO", "")
+    if !isempty(hf_repo)
+        upload_script = joinpath(@__DIR__, "upload_checkpoint_hf.py")
+        venv_python = joinpath(@__DIR__, "..", ".venv", "bin", "python3")
+        if isfile(upload_script) && isfile(venv_python)
+            config_path = hasfield(typeof(run_config), :config_path) ? run_config.config_path : ""
+            cmd = `$venv_python $upload_script --checkpoint $path --repo $hf_repo --config $config_path --commit $(string("step ", step, " loss ", round(loss, digits=4)))`
+            @async begin
+                println("[hf] Uploading checkpoint to $hf_repo ...")
+                flush(stdout)
+                run(pipeline(cmd; stdout=devnull, stderr=devnull))
+                println("[hf] Upload complete: $(basename(path))")
+                flush(stdout)
+            end
+        end
+    end
 end
 
 function reclaim_device_memory()
@@ -3171,6 +3415,41 @@ function load_eval_context(run_config::RETrainingRunConfig)
         model_config = model_config,
         pair_proposer_settings = pair_proposer_settings,
     )
+end
+
+function build_relation_logit_adjustment(
+    rows,
+    relation_label_to_id::Dict{String,Int};
+    smoothing::Float32 = 1.0f0,
+)::Vector{Float32}
+    num_relations = length(relation_label_to_id)
+    num_relations > 0 || return Float32[]
+    no_relation_id = get(relation_label_to_id, "NO_RELATION", 1)
+    counts = fill(smoothing, num_relations)
+    if 1 <= no_relation_id <= num_relations
+        counts[no_relation_id] = 1.0f0
+    end
+
+    for row in rows
+        haskey(row, :relations) || continue
+        for rel in row.relations
+            rel_id = get(relation_label_to_id, String(rel.label), 0)
+            (1 <= rel_id <= num_relations) || continue
+            rel_id == no_relation_id && continue
+            counts[rel_id] += 1.0f0
+        end
+    end
+
+    pos_total = sum(counts) - ((1 <= no_relation_id <= num_relations) ? counts[no_relation_id] : 0.0f0)
+    pos_total > 0.0f0 || (pos_total = Float32(max(num_relations - 1, 1)))
+
+    log_adjustment = zeros(Float32, num_relations)
+    for rel_id in 1:num_relations
+        rel_id == no_relation_id && continue
+        prior = max(counts[rel_id] / pos_total, 1f-6)
+        log_adjustment[rel_id] = log(prior)
+    end
+    return log_adjustment
 end
 
 function override_relation_config(config::RelationExtractionConfig; kwargs...)
@@ -3594,6 +3873,10 @@ function run_checkpoint_sweep(run_config::RETrainingRunConfig, checkpoint_paths:
     end)
     context = load_eval_context(run_config)
     isempty(context.val_rows) && error("Validation data not found for checkpoint sweep.")
+    relation_logit_adjustment_tau = load_relation_logit_adjustment_tau(run_config.config_path)
+    relation_logit_adjustment = relation_logit_adjustment_tau > 0.0f0 ?
+        build_relation_logit_adjustment(context.train_rows, context.relation_label_to_id) :
+        nothing
 
     println("=" ^ 120)
     println("RE Checkpoint Sweep")
@@ -3648,7 +3931,9 @@ function run_checkpoint_sweep(run_config::RETrainingRunConfig, checkpoint_paths:
             relation_label_to_id,
             model_config,
             run_config,
-            context.pair_proposer_settings,
+            context.pair_proposer_settings;
+            relation_logit_adjustment_tau = relation_logit_adjustment_tau,
+            relation_logit_adjustment = relation_logit_adjustment,
         )
 
         println(
@@ -3709,6 +3994,10 @@ function run_mention_sweep(
 )
     context = load_eval_context(run_config)
     isempty(context.val_rows) && error("Validation data not found for mention sweep.")
+    relation_logit_adjustment_tau = load_relation_logit_adjustment_tau(run_config.config_path)
+    relation_logit_adjustment = relation_logit_adjustment_tau > 0.0f0 ?
+        build_relation_logit_adjustment(context.train_rows, context.relation_label_to_id) :
+        nothing
     ckpt = deserialize(checkpoint_path)
     checkpoint_config = get(ckpt, :model_config, context.model_config)
     vocab = get(ckpt, :vocab, context.vocab)
@@ -3761,7 +4050,9 @@ function run_mention_sweep(
                 relation_label_to_id,
                 eval_config,
                 run_config,
-                context.pair_proposer_settings,
+                context.pair_proposer_settings;
+                relation_logit_adjustment_tau = relation_logit_adjustment_tau,
+                relation_logit_adjustment = relation_logit_adjustment,
             )
             println(format_mention_sweep_row(mode, span_budget, eval_stats))
             reclaim_device_memory()
@@ -3793,6 +4084,10 @@ function run_evidence_pooling_sweep(
 )
     context = load_eval_context(run_config)
     isempty(context.val_rows) && error("Validation data not found for evidence pooling sweep.")
+    relation_logit_adjustment_tau = load_relation_logit_adjustment_tau(run_config.config_path)
+    relation_logit_adjustment = relation_logit_adjustment_tau > 0.0f0 ?
+        build_relation_logit_adjustment(context.train_rows, context.relation_label_to_id) :
+        nothing
     ckpt = deserialize(checkpoint_path)
     checkpoint_config = get(ckpt, :model_config, context.model_config)
     vocab = get(ckpt, :vocab, context.vocab)
@@ -3838,6 +4133,8 @@ function run_evidence_pooling_sweep(
             run_config,
             context.pair_proposer_settings;
             evidence_pooling_mode = mode,
+            relation_logit_adjustment_tau = relation_logit_adjustment_tau,
+            relation_logit_adjustment = relation_logit_adjustment,
         )
         println(format_evidence_pooling_row(mode, eval_stats))
         reclaim_device_memory()
@@ -3940,6 +4237,10 @@ function main()
     )
     Random.seed!(run_config.seed)
     null_relation_weight = load_null_relation_weight(options.config_path)
+    relation_focal_gamma = load_relation_focal_gamma(options.config_path)
+    positive_relation_weight = load_positive_relation_weight(options.config_path)
+    relation_logit_adjustment_tau = load_relation_logit_adjustment_tau(options.config_path)
+    distillation_settings = load_distillation_settings(options.config_path)
     if options.max_eval_batches_override !== nothing
         run_config = RETrainingRunConfig(
             config_path = run_config.config_path,
@@ -4088,12 +4389,16 @@ function main()
     pair_proposer_settings = load_pair_proposer_settings(run_config.config_path)
     train_rows = load_rebel_jsonl(run_config.train_path)
     val_rows = isfile(run_config.val_path) ? load_rebel_jsonl(run_config.val_path) : Any[]
+    validate_teacher_payload_coverage(train_rows, distillation_settings; context = "train")
     all_rows = isempty(val_rows) ? train_rows : vcat(train_rows, val_rows)
 
     vocab = build_token_vocab(train_rows; max_vocab = base_config.vocab_size)
     entity_label_to_id = build_entity_label_space(all_rows)
     relation_label_to_id = build_relation_label_space(all_rows)
     model_config = with_label_counts(base_config, length(entity_label_to_id), length(relation_label_to_id), length(vocab))
+    relation_logit_adjustment = relation_logit_adjustment_tau > 0.0f0 ?
+        build_relation_logit_adjustment(train_rows, relation_label_to_id) :
+        nothing
 
     print_relation_extraction_summary(model_config)
     println("Train rows: $(length(train_rows))")
@@ -4135,6 +4440,10 @@ function main()
         end
     end
 
+    relation_logit_adjustment = relation_logit_adjustment_tau > 0.0f0 ?
+        build_relation_logit_adjustment(train_rows, relation_label_to_id) :
+        nothing
+
     params = tree_to_device(params)
     state = tree_to_device(state)
     if opt_state === nothing
@@ -4155,6 +4464,13 @@ function main()
     println("Proposal loss wt: $(run_config.proposal_loss_weight)")
     println("Proposal warmup: $(run_config.proposal_warmup_steps)")
     println("Null relation wt: $(null_relation_weight)")
+    println("Relation focal gamma: $(relation_focal_gamma)")
+    println("Positive relation wt: $(positive_relation_weight)")
+    println("Relation logit-adjust tau: $(relation_logit_adjustment_tau)")
+    println("Teacher entity loss wt: $(distillation_settings.entity_weight)")
+    println("Teacher relation loss wt: $(distillation_settings.relation_weight)")
+    println("Teacher confidence loss wt: $(distillation_settings.confidence_weight)")
+    println("Allow missing teacher targets: $(distillation_settings.allow_missing_teacher_targets)")
     println("Total step updates: $(run_config.total_steps)")
     println()
 
@@ -4162,7 +4478,12 @@ function main()
     epoch = start_epoch
     recent_losses = Float32[]
 
+    println("[train] Entering training loop (step=$step, total=$(run_config.total_steps))")
+    flush(stdout)
+
     while step < run_config.total_steps
+        println("[train] Epoch $epoch: shuffling $(length(train_rows)) rows...")
+        flush(stdout)
         shuffled = Random.shuffle(rng, copy(train_rows))
         batch_starts = collect(1:run_config.batch_size:length(shuffled))
         grad_accum = nothing
@@ -4171,6 +4492,10 @@ function main()
         for batch_start in batch_starts
             batch_end = min(batch_start + run_config.batch_size - 1, length(shuffled))
             batch_rows = shuffled[batch_start:batch_end]
+            if step < 3
+                println("[train] step=$(step+1): make_batch batch_start=$batch_start...")
+                flush(stdout)
+            end
             inputs, targets = make_batch(
                 batch_rows,
                 vocab,
@@ -4191,13 +4516,30 @@ function main()
             no_relation_id = get(relation_label_to_id, "NO_RELATION", 1)
             edge_ranking_weight = edge_ranking_weight_for_step(edge_ranking_settings, next_step)
 
+            # Force GPU memory reclaim before each gradient pass
+            GC.gc(true)
+            CUDA.reclaim()
+
             t0 = time_ns()
+            if step < 5
+                free_mb = round(CUDA.available_memory() / 1e6, digits=0)
+                println("[train] step=$(step+1): gradient pass... (GPU free: $(free_mb) MB)")
+                flush(stdout)
+            end
             (loss, new_state), grads = Zygote.withgradient(params) do p
                 outputs, teacher_state = model(inputs, p, state)
                 total_loss = relation_loss(
                     outputs,
                     targets;
                     null_relation_weight = null_relation_weight,
+                    positive_relation_weight = positive_relation_weight,
+                    no_relation_id = no_relation_id,
+                    relation_focal_gamma = relation_focal_gamma,
+                    relation_logit_adjustment_tau = relation_logit_adjustment_tau,
+                    relation_logit_adjustment = relation_logit_adjustment,
+                    teacher_entity_loss_weight = distillation_settings.entity_weight,
+                    teacher_relation_loss_weight = distillation_settings.relation_weight,
+                    teacher_confidence_loss_weight = distillation_settings.confidence_weight,
                     edge_ranking_loss_weight = edge_ranking_weight,
                     edge_ranking_margin = edge_ranking_settings.margin,
                     edge_ranking_hard_negatives = edge_ranking_settings.hard_negatives,
@@ -4220,6 +4562,11 @@ function main()
                         proposal_outputs,
                         proposal_targets;
                         null_relation_weight = null_relation_weight,
+                        positive_relation_weight = positive_relation_weight,
+                        no_relation_id = no_relation_id,
+                        relation_focal_gamma = relation_focal_gamma,
+                        relation_logit_adjustment_tau = relation_logit_adjustment_tau,
+                        relation_logit_adjustment = relation_logit_adjustment,
                         edge_ranking_loss_weight = edge_ranking_weight,
                         edge_ranking_margin = edge_ranking_settings.margin,
                         edge_ranking_hard_negatives = edge_ranking_settings.hard_negatives,
@@ -4233,8 +4580,10 @@ function main()
             CUDA.synchronize()
 
             grad_accum = tree_add(grad_accum, grads[1])
+            grads = nothing  # Free AD tape
             accum_count += 1
             state = new_state
+            new_state = nothing
             push!(recent_losses, Float32(loss))
 
             if accum_count == run_config.gradient_accumulation_steps || batch_end == length(shuffled)
@@ -4242,7 +4591,10 @@ function main()
                 mean_grads = tree_scale(grad_accum, 1.0f0 / Float32(accum_count))
                 opt_state, params = Optimisers.update(opt_state, params, mean_grads)
                 grad_accum = nothing
+                mean_grads = nothing
                 accum_count = 0
+                GC.gc(false)
+                CUDA.reclaim()
 
                 if step % run_config.log_every == 0 || step == 1
                     dt_ms = (time_ns() - t0) / 1e6
@@ -4269,6 +4621,8 @@ function main()
                         run_config,
                         pair_proposer_settings,
                         current_step = step,
+                        relation_logit_adjustment_tau = relation_logit_adjustment_tau,
+                        relation_logit_adjustment = relation_logit_adjustment,
                     )
                     @printf("  eval step %6d | %s\n", step, format_eval_summary(eval_stats))
                     flush(stdout)

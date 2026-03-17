@@ -1,0 +1,114 @@
+# Swamma 1B Relation Extraction.
+#
+# ~1B parameters: d=1408, L=28, H=22
+# Full REBEL dataset: 2.49M train rows, 1144 relation types
+# Hierarchical per-layer wave-gate frequencies for spectral diversity
+# Target: NVIDIA Spark (128GB unified memory)
+
+[model]
+vocab_size = 64000
+max_sequence_length = 512
+embedding_dimension = 1408
+number_of_heads = 22
+number_of_layers = 28
+num_entity_labels = 3
+num_relations = 1200
+
+[model.dimensions]
+time_dimension = 352
+state_dimension = 1408
+
+[model.attention]
+window_size = 32
+
+[model.wave_gate]
+min_frequency = 0.005
+max_frequency = 10.0
+default_time_step = 0.03
+# Per-layer frequency diversity: early layers = high freq (local), late layers = low freq (global)
+use_hierarchical_frequencies = true
+hierarchical_base_min = 0.005
+hierarchical_base_max = 50.0
+hierarchical_decay_rate = 3.0
+hierarchical_scaling = "exponential"
+
+[model.regularization]
+dropout_rate = 0.1
+
+[model.ablation]
+use_ffn = true
+ffn_expansion = 1.333333
+use_vector_gains = false
+use_per_head_alpha = false
+use_branch_projections = false
+
+[parallelization]
+use_parallel_scan = true
+chunk_size = 64
+
+[relation_extraction]
+max_candidate_spans = 128
+max_candidate_pairs = 128
+max_span_width = 10
+span_context_layers = 0
+span_context_neighbor_radius = 1
+span_context_topk = 4
+biaffine_rank = 128
+pair_neighbor_radius = 4
+pair_proposer_mode = "edge_retrieval_v2"
+pair_global_top_spans = 16
+pair_router_dimension = 128
+pair_router_buckets = 8
+pair_router_topk = 8
+pair_router_routes_per_span = 2
+pair_router_score_scale = 0.5
+edge_v2_semantic_topk = 16
+edge_v2_reverse_topk = 12
+edge_v2_global_reserve = 20
+edge_v2_semantic_score_scale = 1.5
+edge_v2_span_score_scale = 0.5
+edge_v2_distance_penalty = 0.02
+edge_v2_require_mutual = false
+pair_overgenerate_factor = 4
+pair_retrieval_dimension = 128
+pair_distance_buckets = 16
+pair_retrieval_loss_weight = 0.25
+pair_evidence_dimension = 128
+relation_decoder_mode = "pair_evidence_mlp"
+mention_score_mode = "learned"
+mention_score_learned_weight = 1.0
+
+[training]
+batch_size = 4
+gradient_accumulation_steps = 1
+learning_rate = 1.4e-4
+min_learning_rate = 1e-6
+warmup_steps = 1000
+total_steps = 50000
+gradient_clip = 1.0
+weight_decay = 0.01
+null_relation_weight = 0.25
+relation_focal_gamma = 2.0
+positive_relation_weight = 2.0
+relation_logit_adjustment_tau = 0.0
+teacher_entity_loss_weight = 0.3
+teacher_relation_loss_weight = 0.5
+teacher_confidence_loss_weight = 0.2
+allow_missing_teacher_targets = true
+seed = 42
+
+[training.checkpoints]
+eval_every = 5000
+log_every = 25
+save_every = 2500
+
+[data]
+train_path = "data/rebel_full/train.jsonl"
+val_path = "data/rebel_full/validation.jsonl"
+test_path = "data/rebel_full/test.jsonl"
+max_len = 512
+
+[hardware]
+device = "gpu"
+mixed_precision = true
+num_workers = 4

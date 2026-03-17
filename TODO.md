@@ -1,5 +1,12 @@
 # TODO — SWAMMA Rollout + Legacy Removal
 
+## LLaDA PRIME 3B Distillation Path
+
+- [x] Create the `~3B` PRIME student config in [`configs/llada_prime_3b.toml`](/home/christos/code/julia/Swamma/configs/llada_prime_3b.toml)
+- [x] Record the `~5B` stretch config in [`configs/llada_prime_5b.toml`](/home/christos/code/julia/Swamma/configs/llada_prime_5b.toml)
+- [x] Write the full rollout checklist in [`docs/LLADA_PRIME_3B_DISTILLATION_TODO.md`](/home/christos/code/julia/Swamma/docs/LLADA_PRIME_3B_DISTILLATION_TODO.md)
+- [ ] Execute the checklist to completion before promoting a new PRIME baseline
+
 ## REDFM English Training Path
 
 Goal: train the Swamma relation extractor on English REDFM first, without adding multilingual scope yet.
@@ -512,17 +519,136 @@ Goal: replace the current diagnostic-grade RE scaffold with a serious span-graph
 - [ ] Only after baseline is stable, add teacher annotation generation for:
   - [ ] REBEL
   - [ ] mREBEL if needed later
-- [ ] Extend training rows to optionally carry teacher targets:
-  - [ ] teacher entity targets
-  - [ ] teacher relation targets
-  - [ ] teacher confidence targets
-- [ ] Add mixed supervised + distillation loss to `scripts/train_re_gpu.jl`.
+- [x] Extend training rows to optionally carry teacher targets:
+  - [x] teacher entity targets
+  - [x] teacher relation targets
+  - [x] teacher confidence targets
+- [x] Add mixed supervised + distillation loss to `scripts/train_re_gpu.jl`.
+- [x] Add distillation pilot config with non-zero teacher weights and run short resume smoke (`2000 -> 2005`).
+- [x] Validate eval path on pilot checkpoint with threshold-sweep smoke (`max_eval_batches=16`).
+- [x] Add teacher-payload validator script and confirm current REBEL train split has zero teacher payload coverage.
+- [x] Add teacher-target merge script that writes span-based `teacher_relations` into REBEL rows.
+- [x] Add teacher-request export script for REBEL rows with span-based response schema.
+- [x] Add a lightweight pilot-evaluation script for parsed REBEL teacher outputs vs gold labels.
+- [x] Add parser for raw teacher response text -> normalized REBEL teacher annotation rows.
+- [x] Add teacher-data generation script for REBEL request JSONL -> raw teacher responses.
+- [x] Add one-command REBEL teacher-corpus preparation orchestrator.
+- [x] Add coverage gate so distillation runs fail fast when teacher payloads are missing.
+- [x] Inject teacher-only positive relations into candidate pairs without forcing contradictory supervised `NO_RELATION` labels.
+- [x] Switch teacher relation alignment to span-based mapping so teacher entity order no longer needs to match gold entity order.
+- [x] Inject teacher-only entity spans into the training candidate spans while keeping gold span supervision masked separately.
+- [x] Add a Lux-native causal teacher foundation module (`src/NativeTeacherLM.jl`) with:
+  - [x] RoPE
+  - [x] grouped-query-capable causal self-attention
+  - [x] RMSNorm pre-norm decoder blocks
+  - [x] greedy generation helpers
+  - [x] focused forward/masking/generation tests
+- [x] Add a native Hugging Face config + checkpoint importer for the first supported teacher family:
+  - [x] pick `ibm-granite/granite-4.0-micro` as the first target
+  - [x] map Granite HF tensor names to `NativeTeacherLM` parameter structure
+  - [x] add synthetic safetensors import coverage tests
+  - [x] smoke the real Granite HF config through the Julia loader path
+- [x] Run one full real-weight Granite micro load through `load_granite_model(...)` on local/downloaded shards.
+- [x] Validate tokenizer/chat-template compatibility against the chosen model family.
+  - [x] replace the brittle PyCall `transformers` tokenizer path with a local fallback based on `tokenizers` + `chat_template.jinja`
+  - [x] verify the native Granite smoke script renders the prompt correctly
+  - [x] verify a real forward pass runs on the rendered prompt
+- [x] Add KV-cache-aware decoding path for `NativeTeacherLM` so teacher generation is not full-prefix recompute.
+  - [x] add per-layer attention KV cache structs
+  - [x] add cached prefill / next-token helpers
+  - [x] add cached greedy generation helper
+  - [x] verify cached logits against full recompute on unit tests and real Granite smoke
+- [x] Add a Julia-native RE teacher generation script on top of `NativeTeacherLM`.
+  - [x] consume the same REBEL request JSONL format as the Python generator
+  - [x] emit the same raw-response JSONL contract for the parser/merge pipeline
+  - [x] smoke one request end-to-end with the native Granite path
+- [ ] Improve native teacher response quality / control.
+  - [x] add JSON-gated native generation with response-prefix support, verbose timing, and error previews
+  - [x] compare native Granite next-token behavior against Hugging Face on a short prompt
+  - [x] fix Granite-specific inference drift by matching `attention_multiplier` and `residual_multiplier`
+  - [x] add a compact RE teacher-request prompt style for smaller, less ambiguous native generation prompts
+  - [x] switch the native generator default dtype to `float32` for CPU-bound runs
+  - [ ] reduce empty or malformed completions under greedy decode on real RE prompts
+  - [x] add a reusable HF-vs-native parity smoke for exact prompt-token comparisons
+  - [x] use the parity smoke to isolate the remaining long-context native generation mismatch
+  - [x] identify the first-token parity break window (`192` tokens still matches, `256` tokens diverges)
+  - [x] fix the long-context RoPE mismatch in `NativeTeacherLM` (Granite uses half-split rotation, not adjacent even/odd pairs)
+  - [x] test lightweight JSON-aware decode heuristics (`0` suppression at numeric field starts, early EOS/code-fence suppression)
+  - [x] confirm exact-token parity is restored at `256` and `308` prompt tokens after the RoPE fix
+  - [x] produce one accepted native RE teacher row under strict JSON validation
+  - [x] identify that entity-first decoding is the wrong control surface on the broader label schema (runaway entity/date enumeration)
+  - [x] tighten the compact RE prompt toward relation-first, high-confidence, low-overgeneration extraction
+  - [x] switch the best native control recipe to a relation-first response prefix:
+    - [x] `{"entities":[],"relations":[{"head_start":`
+  - [x] fix response assembly so strict validation accepts completions that restart the full JSON object instead of always re-prepending the response prefix
+  - [x] verify a tiny strict relation-first shard can accept on more than one row
+    - [x] initial 3-row compact/no-title shard: `2/3` accepted under strict JSON
+    - [x] final 3-row compact/no-title shard: `3/3` accepted under strict JSON
+    - [x] final accepted rows parsed downstream with `3` total relations and `0` entities
+  - [x] raise the tiny strict relation-first shard from `2/3` to `3/3`
+    - [x] add relation-only partial-JSON salvage for continuation-style relation floods
+    - [x] verify the hard row accepts under strict JSON after salvage
+  - [x] run a 10-row strict relation-first shard with the current best recipe
+    - [x] strict generation acceptance: `10/10`
+    - [x] strict downstream parse success: `10/10`
+    - [x] parsed relation count total: `7`
+  - [x] tighten strict native validation so accepted rows must also use allowed entity / relation labels
+  - [x] add compact prompt relation glosses for Wikidata property IDs (`P127=owned by`, etc.)
+  - [x] compare 10-row label-gated pilots before vs after relation glosses
+    - [x] no-gloss label-gated pilot: `7/10` accepted, top-1 label-in-gold `0.000`, collapsed to `P161`
+    - [x] glossed label-gated pilot: `7/10` accepted, top-1 label-in-gold `0.143`, predicted labels spread across `P127/P161/P57/P136`
+  - [x] test decode-time relation-label token constraints on the glossed 10-row pilot
+    - [x] constrained glossed pilot: `6/10` accepted, top-1 label-in-gold `0.000`
+    - [x] conclusion: token-level label constraints reduce acceptance without improving semantic quality
+  - [x] test natural-language relation-label variants with downstream canonicalization
+    - [x] `id_or_name` prompt: `3/10` accepted, top-1 label-in-gold `0.000`
+    - [x] `name`-only prompt: `5/10` accepted, top-1 label-in-gold `0.200`
+    - [x] conclusion: naming variants are more brittle on acceptance and do not improve absolute correct-row count over the glossed ID prompt
+  - [x] run a larger native relation-first pilot shard (`50-100` rows) and inspect non-empty relation yield / label mix
+    - [x] glossed single-pass 50-row pilot: `24/50` accepted, `22` predicted relations, top-1 label-in-gold `0.0455`
+    - [x] no-gloss single-pass 50-row pilot: `50/50` matched, `29` predicted relations, top-1 label-in-gold `0.0345`, full `P106` collapse
+  - [x] add a stronger semantic control step for relation-label choice
+    - [x] either constrained label decoding at `label` fields
+    - [x] or a two-stage natural-language relation-name -> Wikidata-ID mapping path
+    - [x] prefer an explicit two-stage mapping/reranking path; simple token constraints and inline name variants were not enough
+    - [x] glossed stage1 + two-stage relabel on 50 rows: `24/50` matched, `22` predicted relations, top-1 label-in-gold `0.3636`, exact label-set match `0.0455`
+    - [x] no-gloss stage1 + two-stage relabel on 50 rows: `50/50` matched, `29` predicted relations, top-1 label-in-gold `0.4483`, exact label-set match `0.1379`
+    - [x] no-schema stage1 + single-pass 50-row pilot: `50/50` matched, `50` predicted relations, top-1 label-in-gold `0.1000`, exact label-set match `0.0200`
+    - [x] no-schema stage1 + two-stage relabel on 50 rows: `50/50` matched, `50` predicted relations, top-1 label-in-gold `0.3800`, exact label-set match `0.1000`
+    - [x] no-schema stage1 + single-pass 100-row pilot: `100/100` matched, `100` predicted relations, top-1 label-in-gold `0.1200`, exact label-set match `0.0200`
+    - [x] no-schema stage1 + two-stage relabel on 100 rows: `100/100` matched, `100` predicted relations, top-1 label-in-gold `0.3800`, exact label-set match `0.0800`
+    - [x] no-schema stage1 + single-pass 250-row pilot: `250/250` matched, `250` predicted relations, top-1 label-in-gold `0.1400`, exact label-set match `0.0320`
+    - [x] no-schema stage1 + two-stage relabel on 250 rows: `250/250` matched, `250` predicted relations, top-1 label-in-gold `0.3480`, exact label-set match `0.1000`
+    - [x] conclusion: the best current architecture is compact no-title no-schema relation-first stage 1 plus semantic stage-2 relabeling; glossed single-pass prompting is no longer the main path
+  - [x] improve stage-1 non-empty relation yield without sacrificing the no-gloss stage-1 acceptance advantage
+    - [x] test whether stage-1 relation span quality can be improved with lighter prompt edits that do not reintroduce the glossed acceptance collapse
+    - [x] rerun the two-stage stack on a `100`-row shard once the stage-1 operating point is locked
+  - [ ] investigate why stage-2 relabel updates miss a small residual tail (`48/50` on the repaired 50-row no-schema pilot, `98/100` on the repaired 100-row no-schema pilot)
+    - [x] add safe merge-side salvage for truncated `"label"` fields and near-gloss aliases such as `headquartered in -> P159`
+    - [x] tighten the stage-2 prompt against free-form type answers like `city`, `single`, and `nickname`
+    - [x] confirm the remaining failures are semantic drift, not key mismatch or JSON parser failure
+    - [ ] inspect the remaining hard case(s), currently dominated by outputs like `single` that still refuse to map to an allowed relation gloss
+  - [ ] inspect whether the no-schema stage-1 relation-rate gain is worth the slight drop in exact label-set match versus the smaller 50-row no-gloss relabel pilot
+  - [x] compare greedy vs sampled settings on a small held-out request set after the prompt/parity fixes
+    - [x] stage-2 sampled relabel on the promoted 100-row no-schema stack (`temperature=0.7`, `top_p=0.9`) updated `100/100` relations after merge robustness fixes
+    - [x] sampled semantic quality regressed versus greedy:
+      - [x] greedy: top-1 label-in-gold `0.3800`, exact label-set `0.0800`
+      - [x] sampled: top-1 label-in-gold `0.2700`, exact label-set `0.0600`
+    - [x] conclusion: keep greedy stage-2 relabel as the default; sampling increases verbose off-target continuations without improving label choice
+- [ ] Run first controlled distillation comparison (`base` vs `distill`) at matched step budget.
+  - [x] freeze the native teacher-corpus recipe for the first larger build:
+    - [x] stage 1: compact no-title no-schema relation-first generation
+    - [x] stage 2: greedy relabel with glossed choices
+  - [x] launch full-train stage-1 teacher generation from the validated `250`-row seed
+  - [ ] wait for full-train stage-1 generation to finish, then run full-train stage-2 relabel
+  - [ ] merge the completed full-train teacher corpus back into REDFM JSONL
+  - [ ] run the first matched-budget distillation training comparison on the merged corpus
 
 ### 7. Explicit Non-Goals For This Phase
 
 - [ ] Do not add more languages yet.
 - [ ] Do not add SREDFM yet.
-- [ ] Do not start teacher distillation before the English supervised baseline is stable.
+- [ ] Do not start full teacher distillation before the English supervised baseline is stable (plumbing smoke only for now).
 
 ## 0. Naming And Legacy Purge (Breaking)
 

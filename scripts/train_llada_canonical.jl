@@ -163,6 +163,36 @@ function parse_commandline()
             help = "Generation denoising steps for end-of-run sample"
             arg_type = Int
             default = 32
+        "--pack-texts"
+            help = "Concatenate tokenized texts into one stream before chunking"
+            action = :store_true
+        "--prepare-only"
+            help = "Stop after tokenizer/corpus/chunk preparation and write a prep summary"
+            action = :store_true
+        "--distillation-mode"
+            help = "Offline distillation mode label to record in metadata"
+            arg_type = String
+            default = ""
+        "--teacher-model"
+            help = "Teacher model id/path to record in metadata"
+            arg_type = String
+            default = ""
+        "--teacher-revision"
+            help = "Teacher revision/hash to record in metadata"
+            arg_type = String
+            default = ""
+        "--corpus-manifest"
+            help = "Path to corpus manifest JSON/TOML used for this run"
+            arg_type = String
+            default = ""
+        "--teacher-mixture-ratio"
+            help = "Optional teacher-corpus mixture ratio to record in metadata"
+            arg_type = Float64
+            default = -1.0
+        "--raw-mixture-ratio"
+            help = "Optional raw-corpus mixture ratio to record in metadata"
+            arg_type = Float64
+            default = -1.0
     end
 
     return parse_args(s)
@@ -171,6 +201,17 @@ end
 function parse_data_section(path::String)
     cfg = TOML.parsefile(path)
     return get(cfg, "data", Dict{String, Any}())
+end
+
+function parse_distillation_section(path::String)
+    cfg = TOML.parsefile(path)
+    return get(cfg, "distillation", Dict{String, Any}())
+end
+
+function data_pack_texts(path::String)
+    cfg = TOML.parsefile(path)
+    data_cfg = get(cfg, "data", Dict{String, Any}())
+    return Bool(get(data_cfg, "pack_texts", false))
 end
 
 function load_texts(path::String; text_field::String = "text", alt_text_field::String = "content")
@@ -240,9 +281,28 @@ function text_to_chunks(
     texts::AbstractVector{<:AbstractString},
     seq_len::Int;
     stride::Int = seq_len,
+    pack_texts::Bool = false,
 )
     chunks = Vector{Vector{Int}}()
     local_stride = stride <= 0 ? seq_len : stride
+    if pack_texts
+        packed_ids = Int[]
+        for text in texts
+            ids = encode(tokenizer, text; add_special_tokens = true)
+            isempty(ids) && continue
+            append!(packed_ids, ids)
+        end
+
+        if length(packed_ids) < seq_len
+            return chunks
+        end
+
+        last_start = length(packed_ids) - seq_len + 1
+        for start in 1:local_stride:last_start
+            push!(chunks, packed_ids[start:(start + seq_len - 1)])
+        end
+        return chunks
+    end
 
     for text in texts
         ids = encode(tokenizer, text; add_special_tokens = true)
@@ -311,6 +371,8 @@ function main()
     model_config = load_config(args["config"])
     train_config = load_training_config(args["config"])
     data_cfg = parse_data_section(args["config"])
+    distill_cfg = parse_distillation_section(args["config"])
+    pack_texts = args["pack-texts"] || data_pack_texts(args["config"])
 
     train_path = !isempty(args["train-path"]) ? args["train-path"] : get(data_cfg, "train_path", "")
     val_path = !isempty(args["val-path"]) ? args["val-path"] : get(data_cfg, "val_path", "")
@@ -321,6 +383,36 @@ function main()
 
     if isempty(train_path)
         error("No training path provided. Set --train-path or [data].train_path in the config.")
+    end
+
+    distillation_mode = !isempty(args["distillation-mode"]) ?
+        args["distillation-mode"] : string(get(distill_cfg, "mode", ""))
+    teacher_model = !isempty(args["teacher-model"]) ?
+        args["teacher-model"] : string(get(distill_cfg, "teacher_model", ""))
+    teacher_revision = !isempty(args["teacher-revision"]) ?
+        args["teacher-revision"] : string(get(distill_cfg, "teacher_revision", ""))
+    corpus_manifest = !isempty(args["corpus-manifest"]) ?
+        args["corpus-manifest"] : string(get(distill_cfg, "corpus_manifest", ""))
+    teacher_mixture_ratio = args["teacher-mixture-ratio"] > 0 ?
+        args["teacher-mixture-ratio"] : Float64(get(distill_cfg, "teacher_mixture_ratio", -1.0))
+    raw_mixture_ratio = args["raw-mixture-ratio"] > 0 ?
+        args["raw-mixture-ratio"] : Float64(get(distill_cfg, "raw_mixture_ratio", -1.0))
+
+    if !isempty(distillation_mode)
+        println("Distillation mode: $distillation_mode")
+    end
+    if !isempty(teacher_model)
+        println("Teacher model: $teacher_model")
+    end
+    if !isempty(corpus_manifest)
+        println("Corpus manifest: $corpus_manifest")
+    end
+    if teacher_mixture_ratio > 0 || raw_mixture_ratio > 0
+        println("Mixture ratios: teacher=$(teacher_mixture_ratio), raw=$(raw_mixture_ratio)")
+    end
+    println("Pack texts: $pack_texts")
+    if !isempty(distillation_mode) || !isempty(teacher_model) || !isempty(corpus_manifest)
+        println()
     end
 
     seq_len = maybe_override(model_config.max_sequence_length, args["seq-len"])
@@ -337,8 +429,19 @@ function main()
         load_tokenizer(tokenizer_model)
     catch err
         msg = sprint(showerror, err)
-        if occursin("transformers", lowercase(msg))
-            error("Could not load HF tokenizer because Python package `transformers` is missing in the PyCall environment.")
+        lower_msg = lowercase(msg)
+        runtime_python = get(ENV, "PYCALL_JL_RUNTIME_PYTHON", "PyCall default runtime")
+        if occursin("generationmixin", lower_msg) || occursin("openssl", lower_msg) || occursin("cryptography", lower_msg)
+            error(
+                "Could not load HF tokenizer via PyCall runtime $(runtime_python). " *
+                "This machine needs `CRYPTOGRAPHY_OPENSSL_NO_LEGACY=1` for some lazy HuggingFace imports under PyCall. " *
+                "Use the rollout runner or export that env var before launching Julia."
+            )
+        elseif occursin("transformers", lower_msg) || occursin("autotokenizer", lower_msg) || occursin("sentencepiece", lower_msg)
+            error(
+                "Could not load HF tokenizer because the PyCall runtime $(runtime_python) is missing required HuggingFace tokenizer dependencies. " *
+                "Ensure `transformers`, `tokenizers`, and `sentencepiece` are installed in that Python, or set `PYCALL_JL_RUNTIME_PYTHON` accordingly."
+            )
         end
         rethrow(err)
     end
@@ -370,8 +473,8 @@ function main()
     println()
 
     println("[3/6] Tokenizing and chunking")
-    train_chunks = text_to_chunks(tokenizer, train_texts, seq_len; stride = stride)
-    val_chunks = text_to_chunks(tokenizer, val_texts, seq_len; stride = stride)
+    train_chunks = text_to_chunks(tokenizer, train_texts, seq_len; stride = stride, pack_texts = pack_texts)
+    val_chunks = text_to_chunks(tokenizer, val_texts, seq_len; stride = stride, pack_texts = pack_texts)
 
     if isempty(train_chunks)
         error("No train chunks produced. Reduce --seq-len or provide larger text corpus.")
@@ -393,6 +496,39 @@ function main()
     println("  chunks: $(length(train_chunks)) train / $(length(val_chunks)) val")
     println("  batches: $(length(train_batches)) train / $(length(val_batches)) val")
     println()
+
+    if args["prepare-only"]
+        ckpt_dir = args["checkpoint-dir"]
+        mkpath(ckpt_dir)
+        prep_summary = Dict(
+            "timestamp_utc" => string(now(UTC)),
+            "tokenizer_model" => tokenizer_model,
+            "tokenizer_vocab_size" => tok_vocab_size,
+            "train_path" => train_path,
+            "val_path" => val_path,
+            "sequence_length" => seq_len,
+            "stride" => stride,
+            "pack_texts" => pack_texts,
+            "batch_size" => batch_size,
+            "train_texts" => length(train_texts),
+            "val_texts" => length(val_texts),
+            "train_chunks" => length(train_chunks),
+            "val_chunks" => length(val_chunks),
+            "train_batches" => length(train_batches),
+            "val_batches" => length(val_batches),
+            "distillation_mode" => distillation_mode,
+            "teacher_model" => teacher_model,
+            "teacher_revision" => teacher_revision,
+            "corpus_manifest" => corpus_manifest,
+            "teacher_mixture_ratio" => teacher_mixture_ratio > 0 ? teacher_mixture_ratio : nothing,
+            "raw_mixture_ratio" => raw_mixture_ratio > 0 ? raw_mixture_ratio : nothing,
+        )
+        open(joinpath(ckpt_dir, "data_prep_summary.json"), "w") do io
+            JSON3.pretty(io, prep_summary)
+        end
+        println("Preparation summary written to $(joinpath(ckpt_dir, "data_prep_summary.json"))")
+        return
+    end
 
     resolved_vocab_size = max(model_config.vocab_size, tok_vocab_size)
     resolved_window = min(model_config.window_size, seq_len)
@@ -464,6 +600,9 @@ function main()
     open(joinpath(ckpt_dir, "run_config.toml"), "w") do io
         save_config(model_config, io)
         println(io)
+        println(io, "[data]")
+        println(io, "pack_texts = ", lowercase(string(pack_texts)))
+        println(io)
         println(io, "[training]")
         println(io, "batch_size = ", run_train_config.batch_size)
         println(io, "learning_rate = ", run_train_config.learning_rate)
@@ -472,6 +611,17 @@ function main()
         println(io, "total_steps = ", run_train_config.total_steps)
         println(io, "mask_schedule = \"", run_train_config.mask_schedule, "\"")
         println(io, "gradient_clip = ", run_train_config.gradient_clip)
+        if !isempty(distillation_mode) || !isempty(teacher_model) || !isempty(teacher_revision) ||
+           !isempty(corpus_manifest) || teacher_mixture_ratio > 0 || raw_mixture_ratio > 0
+            println(io)
+            println(io, "[distillation]")
+            println(io, "mode = ", repr(distillation_mode))
+            println(io, "teacher_model = ", repr(teacher_model))
+            println(io, "teacher_revision = ", repr(teacher_revision))
+            println(io, "corpus_manifest = ", repr(corpus_manifest))
+            println(io, "teacher_mixture_ratio = ", teacher_mixture_ratio)
+            println(io, "raw_mixture_ratio = ", raw_mixture_ratio)
+        end
     end
 
     metadata = Dict(
@@ -481,11 +631,18 @@ function main()
         "resolved_vocab_size" => model_config.vocab_size,
         "sequence_length" => seq_len,
         "stride" => stride,
+        "pack_texts" => pack_texts,
         "batch_size" => batch_size,
         "train_texts" => length(train_texts),
         "val_texts" => length(val_texts),
         "train_chunks" => length(train_chunks),
         "val_chunks" => length(val_chunks),
+        "distillation_mode" => distillation_mode,
+        "teacher_model" => teacher_model,
+        "teacher_revision" => teacher_revision,
+        "corpus_manifest" => corpus_manifest,
+        "teacher_mixture_ratio" => teacher_mixture_ratio > 0 ? teacher_mixture_ratio : nothing,
+        "raw_mixture_ratio" => raw_mixture_ratio > 0 ? raw_mixture_ratio : nothing,
     )
     open(joinpath(ckpt_dir, "run_metadata.json"), "w") do io
         JSON3.pretty(io, metadata)

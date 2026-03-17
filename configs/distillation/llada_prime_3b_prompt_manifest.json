@@ -1,0 +1,27 @@
+{
+  "run_name": "llada_prime_3b_offline_sequence_v1",
+  "student_config": "configs/llada_prime_3b_distill_offline.toml",
+  "raw_input": "data/rebel/train.jsonl",
+  "raw_validation_input": "data/rebel/validation.jsonl",
+  "raw_holdout_input": "data/rebel/test.jsonl",
+  "text_field": "text",
+  "alt_text_field": "content",
+  "task": "continuation",
+  "system_prompt": "You are a precise, fluent assistant. Continue the user's text naturally and coherently.",
+  "builder": {
+    "seed": 42,
+    "max_prompts": 5000,
+    "prefix_words": 48,
+    "min_words": 80,
+    "val_ratio": 0.05
+  },
+  "packaging": {
+    "render_mode": "prompt_response",
+    "teacher_repeat": 1,
+    "raw_train": "",
+    "raw_val": "",
+    "raw_repeat": 1,
+    "teacher_mixture_ratio": 1.0,
+    "raw_mixture_ratio": 0.0
+  }
+}

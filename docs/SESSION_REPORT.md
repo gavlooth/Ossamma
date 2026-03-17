@@ -1,5 +1,369 @@
 # Session Report
 
+## 2026-03-17 — Reasoning Memory Prototypes (PredicateEngram + CircuitLayer)
+
+### Objectives
+- Prototype two novel reasoning memory modules inspired by recent literature survey:
+  1. **PredicateEngram** — VQ-VAE codebook (hashable reasoning patterns) + Soft TPR (variable binding) + gated injection
+  2. **AlgebraicCircuitLayer** — bank of decomposable sum-product circuits as einsum-native tensor ops
+
+### Changes Saved
+- **New file: `src/PredicateEngram.jl`** — `PredicateEngram` Lux layer:
+  - VQ-VAE codebook quantizes hidden states into discrete "reasoning situation" codes
+  - Rule bank stores (num_roles × num_roles) mixing matrices per code — initialized near identity
+  - Soft TPR unbinding: learned filler extraction per role via projection
+  - Rule application: batched matmul of rule_matrix × fillers (permutes/mixes roles)
+  - Straight-through estimator for VQ quantization (Zygote-compatible)
+  - Gated residual injection (gate bias -2.0, starts near-closed)
+  - Separate `predicate_engram_commitment_loss` for training
+- **New file: `src/CircuitLayer.jl`** — `AlgebraicCircuitLayer` Lux layer:
+  - Bank of parallel 2-level sum-product networks
+  - Leaf nodes: sigmoid neural predicates from hidden states (truth values in [0,1])
+  - Product layer: grouped multiply in log-space (decomposable — disjoint scopes)
+  - Sum layer: softplus-normalized weighted sums (smooth — same scopes)
+  - Composition modes: `:mix` (weighted sum) or `:product` (conjunction across circuits)
+  - `circuit_leaf_activations` for interpretability, `circuit_structure_summary` for inspection
+  - All ops are standard tensor contractions — einsum-native, GPU-ready
+- **Modified: `src/Swamma.jl`** — includes + exports for both modules
+- **New: `test/test_predicate_engram.jl`** — 23 tests (shapes, VQ quantization, rule init, gate behavior)
+- **New: `test/test_circuit_layer.jl`** — 26 tests (both compose modes, leaf activations, structure)
+
+### Commands Run
+- `julia --project=. test/test_predicate_engram.jl` — 23/23 pass
+- `julia --project=. test/test_circuit_layer.jl` — 26/26 pass
+- `julia --project=. test/test_engram.jl` — 24/24 pass (regression check)
+
+### Design Rationale
+- **PredicateEngram** fills the gap between Engram (lexical memory, content-addressed) and dynamic attention (expensive). It addresses logical reasoning via structure-addressed lookup: the VQ codebook learns to cluster hidden states by "reasoning situation," and the rule bank learns transformations (role permutation, filler routing) that encode common logical patterns.
+- **AlgebraicCircuitLayer** provides guaranteed-tractable structured reasoning. The decomposability and smoothness properties ensure correct marginalization and composability. Circuit product composition (`:product` mode) enables conjunction of independent rule evaluations.
+
+### Unresolved / Next Actions
+- Neither module is integrated into LLaDA yet — both are standalone Lux layers ready for insertion
+- Zygote gradient flow not yet verified for either module (forward pass only)
+- VQ-VAE codebook collapse mitigation (EMA updates, commitment loss scheduling) not implemented
+- Circuit depth is fixed at 2 levels — deeper circuits would need gradient checkpointing
+- The two modules could be combined: PredicateEngram selects *which* circuit to activate, CircuitLayer evaluates it
+
+---
+
+## 2026-03-17 — Engram Conditional Memory Integration
+
+### Objectives
+- Integrate Engram conditional memory (Ma et al., 2026 — arxiv 2603.10087) into the Swamma/LLaDA architecture.
+- Engram decouples static N-gram knowledge lookup (O(1)) from dynamic computation via multi-head hashing into large embedding tables with gated injection.
+
+### Changes Saved
+- **New file: `src/Engram.jl`** — `EngramModule` Lux layer implementing:
+  - Multi-granular causal N-gram extraction (configurable orders, e.g., bigrams + trigrams)
+  - Multi-head polynomial hashing into a combined embedding table
+  - Vectorized gather + sum across heads, project to model dim, sigmoid-gated residual injection
+  - Gate bias initialized at -2.0 (conservative injection at init)
+  - `subtokens_to_token_ids` helper for PRIME subtoken → token ID reconstruction
+- **Modified: `src/Swamma.jl`** — Added `include("Engram.jl")`, `using .EngramMod`, and exports
+- **Modified: `src/LLaDA.jl`** — Full integration:
+  - `LLaDAConfig` gains 6 new fields: `use_engram`, `engram_layers`, `engram_num_heads`, `engram_ngram_orders`, `engram_table_size`, `engram_head_dim`
+  - `LLaDAModel` struct extended with `use_engram`, `engram_layer_map`, `EngramModules`
+  - Auto-selection of engram layers when `engram_layers=[]`: early layer (2) + ~42% depth
+  - Forward pass: token IDs reconstructed from subtokens (in `ignore_derivatives`), engram applied before selected SwammaBlocks in the `foldl` loop
+  - `config_from_dict` updated for TOML parsing of vector fields
+  - `initialparameters`/`initialstates` handle engram modules
+  - Backward compatible: `use_engram=false` (default) produces identical behavior
+- **New file: `test/test_engram.jl`** — 24 tests covering:
+  - Standalone EngramModule (batched/unbatched, shapes, gate init)
+  - `subtokens_to_token_ids` correctness
+  - LLaDA with engram disabled (backward compat)
+  - LLaDA with engram auto-selected layers (6-layer model → layers 2,3)
+  - LLaDA with explicit engram layers
+  - `config_from_dict` with engram TOML fields
+
+### Commands Run
+- `julia --project=. test/test_engram.jl` — 24/24 pass
+
+### Best Current Recommendation
+- Use `use_engram=true` with `engram_table_size` scaled to model size (512–4096 for small, 65536 for base, 262144 for large)
+- For deeper models (12+ layers), explicit `engram_layers=[2, 5]` or similar gives more control than auto-selection
+- The gate bias at -2.0 means engram starts nearly off — training will learn where injection helps
+
+### Unresolved / Next Actions
+- Gradient flow through engram embedding tables not yet verified under Zygote autodiff (forward pass works, training loop needs testing)
+- No GPU/CUDA testing yet — the `_to_device_like` pattern is used for index transfer but untested on actual GPU
+- Consider Option B (engram as third branch in SwammaBlock's α-mixer) if pre-attention injection proves insufficient
+- Engram table memory footprint can be large (e.g., 256MB for base config) — consider gradient checkpointing or sparse updates
+
+---
+
+## 2026-03-15 — Distillation Plumbing Smoke (Teacher Targets + Losses)
+
+### Objectives
+- Verify the new teacher-target batch fields and mixed distillation losses run end-to-end without runtime regressions.
+- Confirm trainer and threshold-sweep evaluation paths are stable with non-zero teacher loss weights.
+
+### Changes Saved
+- Teacher-target plumbing and distillation loss wiring completed in:
+  - [`src/RelationExtraction.jl`](/home/christos/code/julia/Swamma/src/RelationExtraction.jl)
+  - [`scripts/train_re_gpu.jl`](/home/christos/code/julia/Swamma/scripts/train_re_gpu.jl)
+  - [`test/test_relation_extraction.jl`](/home/christos/code/julia/Swamma/test/test_relation_extraction.jl)
+- Relation batch plumbing now separates:
+  - candidate-pair activation mask for model forward
+  - supervision mask for gold losses/metrics
+- Teacher-only positive relations are now injected into candidate pairs without forcing contradictory supervised `NO_RELATION` targets on those slots.
+- Teacher relation alignment now supports span-based mapping, so teacher relation order no longer has to follow the gold entity order.
+- Teacher-only entity spans are now injected into the training span inventory while gold span supervision remains masked separately.
+- Trainer now validates teacher payload coverage before training when distillation losses are enabled.
+  - config key: `training.allow_missing_teacher_targets` for plumbing-only smoke runs
+- Teacher-payload validator added:
+  - [`scripts/validate_rebel_teacher_targets.jl`](/home/christos/code/julia/Swamma/scripts/validate_rebel_teacher_targets.jl)
+- Teacher-target merge tool added:
+  - [`scripts/merge_rebel_teacher_targets.jl`](/home/christos/code/julia/Swamma/scripts/merge_rebel_teacher_targets.jl)
+- Teacher-request export tool added:
+  - [`scripts/build_rebel_teacher_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_teacher_requests.jl)
+- Teacher-response parser added:
+  - [`scripts/parse_rebel_teacher_responses.jl`](/home/christos/code/julia/Swamma/scripts/parse_rebel_teacher_responses.jl)
+- Teacher-response generator added:
+  - [`scripts/generate_rebel_teacher_responses.py`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses.py)
+- End-to-end preparation orchestrator added:
+  - [`scripts/prepare_rebel_teacher_corpus.py`](/home/christos/code/julia/Swamma/scripts/prepare_rebel_teacher_corpus.py)
+- Pilot config added:
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot.toml)
+
+### Experiment Commands And Key Metrics
+- Resume smoke (`2000 -> 2005`) with teacher losses enabled:
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2005`
+  - result: clean completion at step `2005`.
+  - loaded weights: `teacher_entity_loss_weight=0.2`, `teacher_relation_loss_weight=0.4`, `teacher_confidence_loss_weight=0.2`.
+- Threshold-sweep smoke on pilot checkpoint (`max_eval_batches=16`, `threshold=0.80`, `margin=0.10`):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot/checkpoint_last.jls --threshold-sweep-values 0.80 --threshold-sweep-margin 0.10 --max-eval-batches 16`
+  - `pred spans + pred pairs`: `rel_f1=0.0004`, `oracle_rel=0.5625`, `pair_r=0.1437`, `pair_t16=0.0312`.
+- Teacher-payload coverage check on current train split:
+  - `julia --project=. scripts/validate_rebel_teacher_targets.jl --data data/rebel/train.jsonl`
+  - result: `2878` rows scanned, `0` rows with `teacher_entities`, `0` rows with `teacher_relations`.
+- Parse + tests after candidate/supervision mask split:
+  - `julia --project=. -e 'include("src/Swamma.jl"); include("scripts/train_re_gpu.jl"); println("parse-ok")'`
+  - `julia --project=. test/test_relation_extraction.jl`
+  - result: parse passed, relation extraction tests passed including teacher-only pair injection coverage.
+- Coverage-gate verification:
+  - pilot config with opt-out:
+    - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2000`
+    - result: logs zero teacher coverage, warns, and completes because `allow_missing_teacher_targets=true`.
+  - temporary config without opt-out:
+    - `julia --project=. scripts/train_re_gpu.jl --config /tmp/jl_4RA9eRobk9.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2000`
+    - result: aborts before training with `teacher_entities and teacher_relations are missing in the train rows`.
+- Synthetic merge + span-mapping verification:
+  - merged reordered teacher entities plus index-based teacher relations into span-based `teacher_relations` with:
+    - `julia --project=. scripts/merge_rebel_teacher_targets.jl --base /tmp/jl_QhonUZEboL_base.jsonl --teacher /tmp/jl_8p8xAlydi1_teacher.jsonl --output /tmp/jl_8DolGdIZSP_out.jsonl --strict`
+  - validated merged output with:
+    - `julia --project=. scripts/validate_rebel_teacher_targets.jl --data /tmp/jl_8DolGdIZSP_out.jsonl --require-teacher`
+  - result: merged row preserved teacher coverage and produced span-based teacher relations (`head_start/head_stop/tail_start/tail_stop`) accepted by the validator.
+- Teacher-request export verification:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_sample.jsonl --max-rows 1`
+  - result: exported one promptable request row with stable `match_key`, tokenized source context, strict response schema, and span-based relation instructions.
+- Synthetic raw-response parse -> merge -> validate verification:
+  - parsed raw teacher text JSON with:
+    - `julia --project=. scripts/parse_rebel_teacher_responses.jl --input /tmp/jl_edsz2RaBSp_raw_teacher.jsonl --output /tmp/jl_parsed_teacher.jsonl --strict`
+  - merged parsed annotations into base rows with:
+    - `julia --project=. scripts/merge_rebel_teacher_targets.jl --base /tmp/jl_base_one.jsonl --teacher /tmp/jl_parsed_teacher.jsonl --output /tmp/jl_merged_teacher.jsonl --strict`
+  - validated merged output with:
+    - `julia --project=. scripts/validate_rebel_teacher_targets.jl --data /tmp/jl_merged_teacher.jsonl --require-teacher`
+  - result: end-to-end export/parse/merge/validate pipeline now works on synthetic teacher responses, including teacher-only span cases.
+- Generator + orchestrator verification:
+  - generator CLI:
+    - `python3 scripts/generate_rebel_teacher_responses.py --help`
+  - orchestrator CLI:
+    - `python3 scripts/prepare_rebel_teacher_corpus.py --help`
+  - non-strict smoke reuse of an existing raw response file:
+    - `python3 scripts/prepare_rebel_teacher_corpus.py --input /tmp/jl_base_one.jsonl --output-dir /tmp/rebel_teacher_pipeline_smoke_ok --raw-input /tmp/jl_edsz2RaBSp_raw_teacher.jsonl --skip-generation`
+  - result: build-request -> parse -> merge -> validate chain completed end-to-end inside the orchestrator.
+  - strict smoke on the same synthetic row fails as expected because the synthetic teacher labels intentionally do not match the base row schema.
+- Parse + tests after teacher-only span injection:
+  - `julia --project=. -e 'include("src/Swamma.jl"); include("scripts/train_re_gpu.jl"); println("parse-ok")'`
+  - `julia --project=. test/test_relation_extraction.jl`
+  - result: parse passed, full relation extraction tests passed including teacher-only span injection coverage.
+
+### Best Current Checkpoint/Config Recommendation
+- Keep this as a plumbing-validation result only.
+- Do not treat the pilot as quality evidence for promotion or full distillation rollout.
+
+### Unresolved Issues And Next Actions
+- Baseline remains weak, and the current train split has no teacher payloads at all, so distillation should stay in controlled pilot mode.
+- The remaining missing piece is real teacher output generation, not more trainer plumbing.
+- Next actions:
+  - run `prepare_rebel_teacher_corpus.py` on the real train split with a real teacher model.
+  - inspect strict-validation failures, if any, on the produced merged corpus.
+  - run the first matched-budget `base` vs `distill` comparison.
+
+## 2026-03-15 — Decoder Bottleneck Probes (Pair-MLP vs Pair+Evidence-MLP)
+
+### Objectives
+- Isolate whether decoded relation collapse is primarily a decoder-head bottleneck after the edge-v2 training matrix.
+- Test relation heads that remove biaffine residual dependence and rely on pair features (+ retrieval logits, optionally evidence).
+- Test a class-imbalance-targeted relation objective (`relation_focal_gamma`) on the stronger decoder branch.
+
+### Changes Saved
+- Added decoder modes in relation extraction stack:
+  - [`src/RelationExtraction.jl`](/home/christos/code/julia/Swamma/src/RelationExtraction.jl)
+  - `:pair_mlp`
+  - `:pair_evidence_mlp`
+- Added optional focal term support in relation CE:
+  - [`src/RelationExtraction.jl`](/home/christos/code/julia/Swamma/src/RelationExtraction.jl)
+  - `relation_cross_entropy(...; no_relation_id, focal_gamma, positive_relation_weight)`
+  - GPU-safe focal broadcast path (device-local constants)
+- Wired focal config loading + propagation in trainer/eval loss paths:
+  - [`scripts/train_re_gpu.jl`](/home/christos/code/julia/Swamma/scripts/train_re_gpu.jl)
+  - new config key: `training.relation_focal_gamma` (default `0.0`)
+  - new config key: `training.positive_relation_weight` (default `1.0`)
+  - new config key: `training.relation_logit_adjustment_tau` (default `0.0`)
+  - added training-prior builder for relation logit adjustment (`NO_RELATION` kept unshifted)
+- Added probe config files:
+  - [`configs/redfm_base_safe_pair_edgev2_pairmlp_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairmlp_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw15_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw15_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw3_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw3_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj1_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj1_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj01_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj01_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj025_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj025_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj05_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj05_probe.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_fusedevidence_focal2_posw2_probe.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_fusedevidence_focal2_posw2_probe.toml)
+- Added decoder coverage tests:
+  - [`test/test_relation_extraction.jl`](/home/christos/code/julia/Swamma/test/test_relation_extraction.jl)
+  - new testsets for `pair_mlp` and `pair_evidence_mlp`
+
+### Experiment Commands And Key Metrics
+- Pair-MLP probe run (`2000 -> 2250` from edge-v2 scratch checkpoint):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairmlp_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+  - eval@2250 (in-run): `rel_f1=0.0000`, `pair_recall=0.2073`, `relation_loss=5.2697`
+- Pair+Evidence-MLP probe run (`2000 -> 2250` from same checkpoint):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+  - eval@2250 (in-run): `rel_f1=0.0000`, `pair_recall=0.3171`, `relation_loss=5.0877`
+- Matched full-val threshold sweeps (`threshold=0.60/0.70/0.80`, `margin=0.10`, `max_eval_batches=128`):
+  - Pair-MLP:
+    - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairmlp_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairmlp_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+    - best `pred spans + pred pairs`: `rel_f1=0.0003` (`threshold=0.60`, `oracle_rel=0.6485`, `pair_r=0.1434`, `pair_t16=0.0604`)
+  - Pair+Evidence-MLP:
+    - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+    - best `pred spans + pred pairs`: `rel_f1=0.0008` (`threshold=0.80`, `oracle_rel=0.5604`, `pair_r=0.1917`, `pair_t16=0.0734`)
+- Focal objective probe on Pair+Evidence-MLP (`gamma=2.0`, `2000 -> 2250`):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+  - eval@2250 (in-run): `rel_f1=0.0000`, `relation_loss=4.8929`, `pair_recall=0.3171`, `pair_t16=0.0976`
+  - matched full-val sweep:
+    - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+    - best `pred spans + pred pairs`: `rel_f1=0.0007` (`threshold=0.80`, `oracle_rel=0.5363`, `pair_r=0.1908`, `pair_t16=0.0760`)
+- Focal + positive-class weighting probe on Pair+Evidence-MLP (`gamma=2.0`, `positive_weight=2.0`, `2000 -> 2250`):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+  - eval@2250 (in-run): `rel_f1=0.0000`, `relation_loss=4.8323`, `oracle_rel=0.6951`, `pair_recall=0.3293`, `pair_t16=0.0976`
+  - matched full-val sweep:
+    - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+    - best `pred spans + pred pairs`: `rel_f1=0.0011` (`threshold=0.80`, `oracle_rel=0.6477`, `pair_r=0.1917`, `pair_t16=0.0656`)
+- Positive-weight sensitivity runs (`gamma=2.0`, same `2000 -> 2250` + matched sweep protocol):
+  - `posw=1.5`:
+    - train: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw15_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+    - sweep: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw15_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw15_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+    - best `pred spans + pred pairs`: `rel_f1=0.0003` (`threshold=0.80`, `oracle_rel=0.5648`, `pair_r=0.1917`, `pair_t16=0.0717`)
+  - `posw=3.0`:
+    - train: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw3_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+    - sweep: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw3_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw3_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+    - best `pred spans + pred pairs`: `rel_f1=0.0006` (`threshold=0.80`, `oracle_rel=0.5976`, `pair_r=0.1943`, `pair_t16=0.0717`)
+- Logit-adjusted CE probe on top of best objective point (`focal2 + posw2`, `tau=1.0`):
+  - train: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj1_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+  - eval@2250 (in-run): `relation_loss=5.9235`, `oracle_rel=0.6341`, `pair_recall=0.3171`, `pair_t16=0.0976`
+  - sweep: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj1_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj1_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+  - best `pred spans + pred pairs`: `rel_f1=0.0003` (`threshold=0.80`, `oracle_rel=0.5639`, `pair_r=0.1960`, `pair_t16=0.0743`)
+- Low-`tau` logit-adjusted CE check (`focal2 + posw2`, `tau=0.25`):
+  - train: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj025_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+  - eval@2250 (in-run): `relation_loss=5.0346`, `oracle_rel=0.6341`, `pair_recall=0.3415`, `pair_t16=0.1098`
+  - sweep: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj025_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj025_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+  - best `pred spans + pred pairs`: `rel_f1=0.0003` (`threshold=0.80`, `oracle_rel=0.6036`, `pair_r=0.1934`, `pair_t16=0.0751`)
+- Low-`tau` closure checks (`focal2 + posw2`):
+  - `tau=0.1`:
+    - train: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj01_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+    - eval@2250 (in-run): `relation_loss=4.9300`, `oracle_rel=0.5610`, `pair_recall=0.3293`, `pair_t16=0.1098`, `rel_f1=0.0009`
+    - sweep best `pred spans + pred pairs`: `rel_f1=0.0011` (`threshold=0.80`, `oracle_rel=0.5035`, `pair_r=0.1762`, `pair_t16=0.0691`)
+  - `tau=0.5`:
+    - train: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_logitadj05_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+    - eval@2250 (in-run): `relation_loss=5.3055`, `oracle_rel=0.6463`, `pair_recall=0.3293`, `pair_t16=0.0854`, `rel_f1=0.0010`
+    - sweep best `pred spans + pred pairs`: `rel_f1=0.0003` (`threshold=0.80`, `oracle_rel=0.5967`, `pair_r=0.1943`, `pair_t16=0.0699`)
+- Architecture-side decoder alternative on best objective point (`fused_evidence + focal2 + posw2`):
+  - train: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_fusedevidence_focal2_posw2_probe.toml --resume checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls --max-steps 2250`
+  - eval@2250 (in-run): `relation_loss=11.3288`, `oracle_rel=0.6098`, `pair_recall=0.2317`, `pair_t16=0.1220`
+  - sweep: `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_fusedevidence_focal2_posw2_probe.toml --threshold-sweep-checkpoint checkpoints/redfm_base_safe_pair_edgev2_fusedevidence_focal2_posw2_probe/checkpoint_last.jls --threshold-sweep-values 0.60,0.70,0.80 --threshold-sweep-margin 0.10 --max-eval-batches 128`
+  - best `pred spans + pred pairs`: `rel_f1=0.0005` (`threshold=0.80`, `oracle_rel=0.5751`, `pair_r=0.1606`, `pair_t16=0.0734`)
+
+### Best Current Checkpoint/Config Recommendation
+- Keep `pair_evidence_mlp` as the stronger decoder direction over `pair_mlp` on this checkpoint family.
+- Current branch ranking:
+  - `pair_mlp`: best `rel_f1=0.0003` (degrades).
+  - `pair_evidence_mlp`: best `rel_f1=0.0008`.
+  - `pair_evidence_mlp + focal2`: best `rel_f1=0.0007` (worse than non-focal).
+  - `pair_evidence_mlp + focal2 + posw1.5`: best `rel_f1=0.0003`.
+  - `pair_evidence_mlp + focal2 + posw2`: best `rel_f1=0.0011` (best in this probe family).
+  - `pair_evidence_mlp + focal2 + posw3`: best `rel_f1=0.0006`.
+  - `pair_evidence_mlp + focal2 + posw2 + logitadj0.1`: best `rel_f1=0.0011` but with lower coverage (`oracle_rel=0.5035`, `pair_r=0.1762`).
+  - `pair_evidence_mlp + focal2 + posw2 + logitadj1`: best `rel_f1=0.0003` (regressive).
+  - `pair_evidence_mlp + focal2 + posw2 + logitadj0.25`: best `rel_f1=0.0003` (regressive).
+  - `pair_evidence_mlp + focal2 + posw2 + logitadj0.5`: best `rel_f1=0.0003` (regressive).
+  - `fused_evidence + focal2 + posw2`: best `rel_f1=0.0005` (regressive).
+- Do not promote to `v1_locked` yet; even best probe branch remains materially below promotion target.
+
+### Unresolved Issues And Next Actions
+- Decoder architecture + objective tweaks improved the local edge-v2 ceiling, but global quality remains low.
+- Next actions:
+  - keep `focal2+posw2` as local objective baseline for this branch.
+  - keep logit-adjustment disabled (no robust net win across `tau=0.1/0.25/0.5/1.0`).
+  - keep the same matched threshold sweep protocol to preserve comparability.
+
+## 2026-03-15 — Training-First Matrix (Control vs Edge-v2 vs Edge-v2+Curriculum)
+
+### Objectives
+- Execute a training-centric matrix to avoid further decode-only tuning.
+- Compare control continuation against edge-v2 from-scratch variants under matched eval protocol.
+
+### Changes Saved
+- Added dedicated matrix configs:
+  - [`configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_matrix_control.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_matrix_control.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_fromscratch.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_fromscratch.toml)
+  - [`configs/redfm_base_safe_pair_edgev2_curric10_fromscratch.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_curric10_fromscratch.toml)
+- Matrix run checkpoints produced:
+  - `checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_matrix_control/checkpoint_last.jls`
+  - `checkpoints/redfm_base_safe_pair_edgev2_fromscratch/checkpoint_last.jls`
+  - `checkpoints/redfm_base_safe_pair_edgev2_curric10_fromscratch/checkpoint_last.jls`
+
+### Experiment Commands And Key Metrics
+- Control continuation (`1250 -> 2000`):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4_matrix_control.toml --resume checkpoints/redfm_base_safe_pair_sparse_learned128_nullw025_overgen4/checkpoint_last.jls --max-steps 2000`
+  - in-train eval highlights:
+    - step `1500`: `rel_f1=0.0022`, `pair_recall=0.1463`
+    - step `1750`: `rel_f1=0.0000`, `pair_recall=0.2073`
+    - step `2000`: `rel_f1=0.0000`, `pair_recall=0.1707`
+- Edge-v2 from scratch (`0 -> 2000`):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_fromscratch.toml --max-steps 2000`
+  - in-train eval highlights:
+    - step `1250`: `rel_f1=0.0000`, `pair_recall=0.2195`
+    - step `1500`: `rel_f1=0.0023`, `pair_recall=0.2317`
+    - step `1750`: `rel_f1=0.0000`, `pair_recall=0.2195`
+    - step `2000`: `rel_f1=0.0000`, `pair_recall=0.1951`
+- Edge-v2 + curriculum from scratch (`0 -> 2000`):
+  - `julia --project=. scripts/train_re_gpu.jl --config configs/redfm_base_safe_pair_edgev2_curric10_fromscratch.toml --max-steps 2000`
+  - in-train eval highlights:
+    - step `1250`: `rel_f1=0.0000`, `pair_recall=0.1585`
+    - step `1500`: `rel_f1=0.0000`, `pair_recall=0.1220`
+    - step `1750`: `rel_f1=0.0000`, `pair_recall=0.2561`
+    - step `2000`: `rel_f1=0.0000`, `pair_recall=0.3171`
+- Matched full-val threshold sweeps for all three (`threshold=0.60/0.70/0.80`, margin `0.10`, `max_eval_batches=128`):
+  - control best (`pred spans + pred pairs`): `rel_f1=0.0006`, `oracle_rel=0.4810`, `pair_r=0.1071`, `pair_t16=0.0509`
+  - edge-v2 scratch best: `rel_f1=0.0008`, `oracle_rel=0.6140`, `pair_r=0.1485`, `pair_t16=0.0570`
+  - edge-v2 + curriculum best: `rel_f1=0.0000`, `oracle_rel=0.5570`, `pair_r=0.1813`, `pair_t16=0.0622`
+
+### Best Current Checkpoint/Config Recommendation
+- None of the matrix legs is promotable.
+- Keep this matrix as evidence that training alone (in this recipe) still does not recover decoded relation quality.
+
+### Unresolved Issues And Next Actions
+- Coverage improvements are not converting into relation classification quality.
+- Next actions:
+  - isolate decoder bottleneck with targeted decoder-side training (stronger relation head, less no-relation collapse).
+  - run short calibration stress after each 250-step checkpoint to detect early confidence collapse and stop bad runs sooner.
+
 ## 2026-03-15 — Relation-Agnostic Compatibility Hook (Edge Retrieval v2)
 
 ### Objectives
@@ -2031,3 +2395,1758 @@ Copy this block for new sessions:
 ### Open Issues
 - ...
 ```
+
+## 2026-03-15 — Hybrid Swamma Reasoning Findings
+
+### Objectives
+- Inspect the current Swamma diffusion / drafter implementation.
+- Resolve architecture questions around dense width, depth, MoE placement, and DGX Spark feasibility.
+- Capture a concrete design direction for a hybrid `AR LLM + Swamma drafter + MoE reasoning experts + symbolic expert` system.
+
+### Changes Saved
+- Added findings document:
+  - [`docs/SWAMMA_HYBRID_REASONING_FINDINGS_2026-03-15.md`](/home/christos/code/julia/Swamma/docs/SWAMMA_HYBRID_REASONING_FINDINGS_2026-03-15.md)
+- No source or config code changes were made in this session.
+
+### Key Experiment Outcomes
+- No training experiments were run.
+- Local architectural inspection confirmed the existing Julia diffusion / masking path in:
+  - [`src/LLaDA.jl`](/home/christos/code/julia/Swamma/src/LLaDA.jl)
+  - [`src/Training.jl`](/home/christos/code/julia/Swamma/src/Training.jl)
+  - [`src/Drafter.jl`](/home/christos/code/julia/Swamma/src/Drafter.jl)
+  - [`src/TiDAR.jl`](/home/christos/code/julia/Swamma/src/TiDAR.jl)
+- Local parameter-count scaling on Swamma/LLaDA was used to estimate why single-DGX-Spark full 120B training is not realistic.
+
+### Current Recommendation
+- Use Swamma as a reasoning drafter around a strong long-context autoregressive LLM.
+- Keep the sequence backbone shared and place MoE only in the FFN path first.
+- Spark-safe surrogate for development:
+  - `embedding_dimension=4096`
+  - `number_of_heads=32`
+  - `number_of_layers=32`
+  - `state_dimension=4096`
+  - `num_experts=16`
+  - `top_k=2`
+  - MoE every 2nd layer
+- Longer-term architecture direction:
+  - hybrid `AR verifier/finalizer + Swamma reasoning drafter + reasoning-specialized MoE + rare symbolic expert`
+
+### Open Issues
+- The exact interface to a symbolic expert remains undecided:
+  - masked spans
+  - logical forms
+  - puzzle states
+  - latent thought segments
+- No code has yet been written for `MoEFFN`, routing, or symbolic-expert integration.
+
+## 2026-03-15 — Lux-Native Teacher LM Foundation
+
+### Objectives
+- Replace the hand-wavy “use Lux” claim with an actual Julia-native decoder foundation for teacher inference.
+- Add the minimum reusable components needed before any native HF teacher import:
+  - causal decoder blocks
+  - RoPE
+  - grouped-query-capable self-attention
+  - simple generation helpers
+- Verify that the new path is structurally correct before touching checkpoint import.
+
+### Changes Saved
+- Added [`src/NativeTeacherLM.jl`](/home/christos/code/julia/Swamma/src/NativeTeacherLM.jl):
+  - `NativeTeacherConfig`
+  - `RotaryEmbedding`
+  - `CausalSelfAttention`
+  - `GatedMLP`
+  - `DecoderBlock`
+  - `NativeCausalLM`
+  - `build_causal_attention_bias`
+  - `next_token_logits`
+  - `greedy_generate`
+- Updated [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl):
+  - included the new `NativeTeacherLM` submodule
+  - re-exported the native teacher types/helpers through top-level `Swamma`
+- Added [`test/test_native_teacher_lm.jl`](/home/christos/code/julia/Swamma/test/test_native_teacher_lm.jl):
+  - forward-pass shape/finite smoke
+  - causal masking regression check
+  - greedy-generation smoke
+  - causal-bias helper check
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the correct next sequence for native teacher work:
+  - HF checkpoint importer
+  - KV-cache decode
+  - Julia-native RE teacher generation
+
+### Key Experiment Outcomes
+- Parse check passed:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; println("parse-ok")'`
+- Native teacher test suite passed:
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `13/13` tests passed in `4.6s`
+- This is now a real Lux-native decoder stack, but still randomly initialized:
+  - no Hugging Face checkpoint importer yet
+  - no tokenizer/chat-template parity enforcement yet
+  - no KV-cache decode path yet
+
+### Current Recommendation
+- Keep [`configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot.toml`](/home/christos/code/julia/Swamma/configs/redfm_base_safe_pair_edgev2_pairevidmlp_focal2_posw2_distill_pilot.toml) as the plumbing-only distillation config until real teacher weights exist.
+- For the Julia-native teacher path, target `ibm-granite/granite-4.0-micro` first rather than Qwen 7B.
+- Treat the next critical task as checkpoint import, not more architecture churn.
+
+### Open Issues
+- `NativeTeacherLM` currently proves the native decoder architecture, not usable teacher quality.
+- There is still no mapping from Hugging Face safetensors to the Lux parameter tree.
+- Generation currently recomputes the full prefix each step; a KV-cache path is still required for practical teacher data generation.
+
+## 2026-03-15 — Granite Native Importer (Config + Safetensors Mapping)
+
+### Objectives
+- Move the native teacher path past “decoder scaffold only” by adding a real Granite import path.
+- Convert Hugging Face Granite config metadata into `NativeTeacherConfig`.
+- Map Granite safetensors tensor names into the Lux `NativeTeacherLM` parameter tree and verify the mapping without depending on a multi-GB end-to-end load in tests.
+
+### Changes Saved
+- Extended [`src/NativeTeacherLM.jl`](/home/christos/code/julia/Swamma/src/NativeTeacherLM.jl):
+  - added Granite-compatible config fields:
+    - `rms_norm_eps`
+    - `embedding_multiplier`
+    - `logits_scaling`
+    - `tie_word_embeddings`
+  - updated native forward path to apply Granite-style embedding scaling and logits scaling
+  - added Hugging Face helpers:
+    - `resolve_hf_model_dir(...)`
+    - `granite_config_from_hf(...)`
+    - `load_granite_weights(...)`
+    - `load_granite_model(...)`
+  - added safetensors shard loading through Julia via `PyCall + safetensors`
+  - added Granite tensor-name mapping for:
+    - token embeddings
+    - RMSNorm scales
+    - `q/k/v/o` attention projections
+    - combined `shared_mlp.input_linear.weight` split into gate/up projections
+    - `shared_mlp.output_linear.weight`
+    - tied output head
+- Updated [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl) exports so the Granite loader helpers are available through top-level `Swamma`.
+- Extended [`test/test_native_teacher_lm.jl`](/home/christos/code/julia/Swamma/test/test_native_teacher_lm.jl):
+  - synthetic Granite-style `config.json`
+  - synthetic `model.safetensors.index.json`
+  - synthetic safetensors shard generation
+  - import verification for config parsing and parameter mapping
+
+### Key Experiment Outcomes
+- Parse check passed:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; println("parse-ok")'`
+- Native teacher suite passed after importer work:
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `30/30` tests passed in `8.4s`
+- Real Granite config smoke passed without full weight download:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; cfg = granite_config_from_hf("ibm-granite/granite-4.0-micro"); println((cfg.vocab_size, cfg.embedding_dimension, cfg.number_of_layers, cfg.number_of_heads, cfg.number_of_kv_heads, cfg.mlp_hidden_dimension, cfg.embedding_multiplier, cfg.logits_scaling, cfg.tie_word_embeddings))'`
+  - result:
+    - `vocab_size=100352`
+    - `embedding_dimension=2560`
+    - `number_of_layers=40`
+    - `number_of_heads=40`
+    - `number_of_kv_heads=8`
+    - `mlp_hidden_dimension=8192`
+    - `embedding_multiplier=12`
+    - `logits_scaling=10`
+    - `tie_word_embeddings=true`
+
+### Current Recommendation
+- The native path is now real enough to continue; the blocker is no longer “we need a Julia decoder architecture.”
+- Keep `ibm-granite/granite-4.0-micro` as the first supported teacher family.
+- The next step should be one real full-shard weight load through `load_granite_model(...)`, then KV-cache decoding. Do not detour into another teacher architecture first.
+
+### Open Issues
+- The synthetic importer test proves the mapping logic, but I have not yet completed a full real Granite shard load end-to-end.
+- Tokenizer/chat-template parity for the native Granite path is still not validated.
+- Generation is still full-prefix recompute; practical teacher-corpus generation will still need KV-cache support.
+
+## 2026-03-15 — Real Granite Load Smoke + Tokenizer Runtime Check
+
+### Objectives
+- Validate that the new native Granite importer works on the actual `ibm-granite/granite-4.0-micro` weight shards, not just synthetic safetensors.
+- Add a reusable smoke script for the native Granite path.
+- Check whether the existing Julia tokenizer wrapper can support Granite chat-template prompting in this runtime.
+
+### Changes Saved
+- Updated [`src/HFTokenizer.jl`](/home/christos/code/julia/Swamma/src/HFTokenizer.jl):
+  - added `local_files_only` support to `load_tokenizer(...)`
+  - added chat-template helpers:
+    - `has_chat_template(...)`
+    - `apply_chat_template(...)`
+    - `apply_chat_template_tokens(...)`
+- Added native smoke script:
+  - [`scripts/smoke_native_granite_load.jl`](/home/christos/code/julia/Swamma/scripts/smoke_native_granite_load.jl)
+  - script loads:
+    - tokenizer if available
+    - chat-template prompt if available
+    - native Granite model/weights through `load_granite_model(...)`
+  - tokenizer failure is reported explicitly instead of silently breaking the script
+- Extended [`test/test_native_teacher_lm.jl`](/home/christos/code/julia/Swamma/test/test_native_teacher_lm.jl):
+  - added a local Granite chat-template smoke
+  - marked it as a broken/skip-style check when the PyCall tokenizer runtime is unavailable
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) to mark real-weight load complete and make the tokenizer-runtime issue explicit.
+
+### Key Experiment Outcomes
+- Parse check passed:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; println("parse-ok")'`
+- Native teacher suite passed with one expected broken tokenizer-runtime check:
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `30 passed`, `1 broken`
+- Real Granite weight-load smoke passed:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma, Random, Lux; rng = Random.MersenneTwister(1); @time model, ps, st = load_granite_model("ibm-granite/granite-4.0-micro"; rng=rng, dtype=Float16, local_files_only=true); println("loaded"); println((model.config.vocab_size, model.config.embedding_dimension, model.config.number_of_layers, model.config.number_of_heads, model.config.number_of_kv_heads, model.config.mlp_hidden_dimension)); println(size(ps.TokenEmbedding.weight)); println(size(ps.Blocks[1].Attention.QueryProjection.weight)); println(size(ps.Blocks[end].FeedForward.DownProjection.weight)); println(size(ps.OutputHead.weight));'`
+  - result:
+    - full load completed in `~25.8s`
+    - allocator volume `~30.8 GiB`
+    - imported shapes:
+      - token embedding `(2560, 100352)`
+      - first-layer Q projection `(2560, 2560)`
+      - last-layer FFN down projection `(2560, 8192)`
+      - output head `(100352, 2560)`
+- Native smoke script passed for the weight-load path:
+  - `julia --project=. scripts/smoke_native_granite_load.jl --model ibm-granite/granite-4.0-micro --dtype float16 --local-files-only`
+  - result:
+    - native model load succeeds and reports the expected Granite micro config
+    - tokenizer phase currently reports a PyCall runtime failure instead of succeeding
+- Tokenizer runtime finding:
+  - plain `python3` can load `AutoTokenizer` and apply the Granite chat template
+  - the PyCall runtime used by Julia currently fails importing the required `transformers` path with a `GenerationMixin`/`ModuleNotFoundError` chain
+  - this is now treated as an explicit environment/runtime issue, not hidden under a passing native-model smoke
+
+### Current Recommendation
+- Treat the native Granite model-import path as working.
+- Do not treat the tokenizer/chat-template path as solved yet.
+- The next serious tasks are:
+  - fix or replace the Julia tokenizer runtime path
+  - add KV-cache decoding
+  - only then build the Julia-native RE teacher generator
+
+### Open Issues
+- `HFTokenizer.jl` is still blocked by the current PyCall/`transformers` runtime for Granite chat-template usage.
+- The native model can load real weights, but generation is still full-prefix recompute.
+- No end-to-end native teacher-corpus generation run is possible yet until tokenizer/runtime plus cache support are addressed.
+
+## 2026-03-15 — Native Granite Tokenizer Fallback + Real Forward Smoke
+
+### Objectives
+- Remove the remaining tokenizer/runtime blocker from the native Granite path.
+- Replace the fragile `transformers`-through-PyCall tokenizer dependency with a fallback that can still render Granite prompts locally.
+- Verify the full native path on a real prompt:
+  - chat-template render
+  - tokenize
+  - real-weight load
+  - real forward pass
+
+### Changes Saved
+- Reworked [`src/HFTokenizer.jl`](/home/christos/code/julia/Swamma/src/HFTokenizer.jl):
+  - added a fallback backend built on:
+    - Python `tokenizers`
+    - local HF `tokenizer.json`
+    - `tokenizer_config.json`
+    - `special_tokens_map.json`
+    - `chat_template.jinja`
+  - `load_tokenizer(...)` now:
+    - tries `transformers.AutoTokenizer` first
+    - falls back to the local `tokenizers` backend when the `transformers` import path is broken under PyCall
+  - added local snapshot resolution through `huggingface_hub.snapshot_download(...)`
+  - kept the same Julia-facing encode/decode/batch/chat-template API across both backends
+- Updated [`scripts/smoke_native_granite_load.jl`](/home/christos/code/julia/Swamma/scripts/smoke_native_granite_load.jl):
+  - tokenizer stage now uses the fallback-capable wrapper
+  - supports prompt rendering plus optional real forward smoke
+- Updated [`test/test_native_teacher_lm.jl`](/home/christos/code/julia/Swamma/test/test_native_teacher_lm.jl):
+  - Granite chat-template wrapper check now passes through the fallback backend
+
+### Key Experiment Outcomes
+- Native teacher suite now passes fully:
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `35/35` tests passed
+- Native Granite tokenizer + load smoke passed:
+  - `julia --project=. scripts/smoke_native_granite_load.jl --model ibm-granite/granite-4.0-micro --dtype float16 --local-files-only`
+  - result:
+    - tokenizer fallback loads successfully
+    - Granite chat template renders correctly
+    - prompt token count: `27`
+    - native model load succeeds on real weights
+- Native Granite forward smoke passed:
+  - `julia --project=. scripts/smoke_native_granite_load.jl --model ibm-granite/granite-4.0-micro --dtype float16 --local-files-only --run-forward --max-prompt-tokens 32`
+  - result:
+    - rendered prompt tokenized to `27` tokens
+    - real forward pass completed
+    - logits shape: `(100352, 27, 1)`
+    - next-token logits shape: `(100352, 1)`
+
+### Current Recommendation
+- The native Granite path is now functionally validated:
+  - local tokenizer fallback works
+  - chat template works
+  - real weights load
+  - real forward execution works
+- The next blocker is no longer basic correctness. It is performance:
+  - KV-cache decode
+  - then native teacher-corpus generation
+
+### Open Issues
+- `NativeTeacherLM` still recomputes the full prefix at every generation step.
+- No native teacher generation script exists yet on top of the now-working Granite path.
+- Full teacher-corpus generation should wait for KV-cache support, otherwise the runtime will be unnecessarily expensive.
+
+## 2026-03-15 — KV-Cache Decode For Native Granite Path
+
+### Objectives
+- Remove the last obvious efficiency blocker from the native Granite path by adding cache-aware decoding.
+- Verify that cached decoding stays numerically aligned with full-prefix recompute.
+- Validate the cache path on both:
+  - the small unit-test model
+  - the real `ibm-granite/granite-4.0-micro` weights
+
+### Changes Saved
+- Extended [`src/NativeTeacherLM.jl`](/home/christos/code/julia/Swamma/src/NativeTeacherLM.jl):
+  - added RoPE position-offset support for cached decoding
+  - generalized `build_causal_attention_bias(...)` to rectangular masks with query offset
+  - added cache structs:
+    - `AttentionKVCache`
+    - `NativeDecoderCache`
+  - added cache helpers:
+    - `init_decoder_cache(...)`
+    - `cache_sequence_length(...)`
+  - added cached execution helpers:
+    - `forward_with_cache(...)`
+    - `next_token_logits_cached(...)`
+    - `greedy_generate_cached(...)`
+  - refactored attention through an internal cache-capable path so standard forward and cached forward share the same logic
+- Updated [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl) exports for the new cache API.
+- Extended [`test/test_native_teacher_lm.jl`](/home/christos/code/julia/Swamma/test/test_native_teacher_lm.jl):
+  - cached next-token logits vs full recompute
+  - cached greedy generation vs uncached greedy generation
+  - rectangular/offset causal-mask checks
+- Updated [`scripts/smoke_native_granite_load.jl`](/home/christos/code/julia/Swamma/scripts/smoke_native_granite_load.jl):
+  - added `--run-cached-check`
+  - compares cached next-token logits against full recompute on the real Granite model
+
+### Key Experiment Outcomes
+- Parse check passed:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; println("parse-ok")'`
+- Native teacher suite passed after cache work:
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `44/44` tests passed
+- Real Granite cached smoke passed:
+  - `julia --project=. scripts/smoke_native_granite_load.jl --model ibm-granite/granite-4.0-micro --dtype float16 --local-files-only --run-cached-check --max-prompt-tokens 32`
+  - result:
+    - prompt token count: `27`
+    - cache sequence length after appending one token: `28`
+    - cached logits shape: `(100352, 1)`
+    - max absolute delta vs full recompute: `0.00747633`
+- Interpretation:
+  - on Float16 real weights, the cached path is close to full recompute
+  - the remaining small delta is consistent with different accumulation/order effects rather than a broken cache path
+
+### Current Recommendation
+- Treat the native Granite path as functionally ready for generation work:
+  - tokenizer fallback works
+  - real weights load
+  - real forward works
+  - KV-cache decode works
+- The next concrete task is a Julia-native RE teacher generation script on top of this path.
+
+### Open Issues
+- The native path is now blocked mainly by missing application code, not model infrastructure.
+- There is still no end-to-end Julia-native teacher-corpus generation script for REBEL rows.
+- Runtime/perf benchmarking for long rollouts has not yet been done beyond basic cache-smoke validation.
+
+## 2026-03-15 — Julia-Native RE Teacher Generation Script
+
+### Objectives
+- Move beyond model/tokenizer infrastructure and add the first Julia-native RE teacher generation script.
+- Reuse the existing REBEL request JSONL contract so downstream parser/merge/validate tooling stays unchanged.
+- Smoke the full request -> native generation -> raw response JSONL path.
+
+### Changes Saved
+- Added [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - consumes the same request JSONL as the Python generator
+  - uses:
+    - `HFTokenizer` fallback-backed prompt rendering
+    - `load_granite_model(...)`
+    - cached native decoding via `forward_with_cache(...)`
+  - writes the same raw response JSONL contract expected by [`scripts/parse_rebel_teacher_responses.jl`](/home/christos/code/julia/Swamma/scripts/parse_rebel_teacher_responses.jl)
+  - writes `.errors.jsonl` on generation failures
+  - supports:
+    - `--resume`
+    - `--overwrite`
+    - `--max-rows`
+    - `--max-input-tokens`
+    - `--max-new-tokens`
+    - `--do-sample`
+    - `--temperature`
+    - `--top-p`
+    - `--stop-sequence`
+    - `--plain-prompt`
+    - `--local-files-only`
+    - `--dtype`
+- Fixed a first-token cache bug discovered during native-generation wiring:
+  - cached generation now uses the prefill logits for the first generated token instead of re-feeding the last prompt token
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) to reflect that the native generator exists and the next task is generation-quality control.
+
+### Key Experiment Outcomes
+- Parse + unit test checks passed after the cache/generation fix:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; println("parse-ok")'`
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `44/44` tests passed
+- Real Granite cached smoke still passed after the generation fix:
+  - `julia --project=. scripts/smoke_native_granite_load.jl --model ibm-granite/granite-4.0-micro --dtype float16 --local-files-only --run-cached-check --max-prompt-tokens 32`
+  - result: cache sequence length `28`, cached/full recompute max abs delta `0.00747633`
+- Native request export smoke:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_smoke.jsonl --max-rows 1`
+  - result: exported one teacher request row
+- Native generation smoke, greedy:
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_smoke.jsonl --output /tmp/rebel_teacher_raw_native_smoke.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 1 --max-new-tokens 8`
+  - result: model/runtime path works, but this request returned an empty greedy completion and was logged to `.errors.jsonl`
+- Native generation smoke, sampled:
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_smoke.jsonl --output /tmp/rebel_teacher_raw_native_smoke_sampled.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 1 --max-new-tokens 32 --do-sample --temperature 0.8 --top-p 0.95`
+  - result: `accepted=1`, `failed=0`
+  - confirms the Julia-native generator can produce a raw response row end-to-end
+
+### Current Recommendation
+- Treat the Julia-native RE teacher generator as operational at the plumbing level.
+- Do not treat current sampled output quality as good enough yet for a real corpus rollout.
+- The next task is quality control:
+  - reduce empty greedy completions
+  - improve JSON adherence
+  - calibrate a small set of native generation settings before large-scale corpus generation
+
+### Open Issues
+- Greedy decode can still terminate immediately with an empty completion on at least some prompts.
+- Sampled output can produce low-quality/non-JSON text without stronger decoding constraints.
+- The native path is ready for corpus generation only after a short generation-quality tuning pass.
+
+## 2026-03-15 — Native Granite Parity Fix + JSON Generation Diagnostics
+
+### Objectives
+- Determine whether the bad native RE teacher generations were caused by weak prompting or by native Granite inference drift.
+- Tighten the native generator so failures preserve enough evidence to debug the next step instead of only reporting “invalid JSON”.
+- Re-run a small native RE generation smoke after fixing any model-side mismatch.
+
+### Changes Saved
+- Extended [`src/NativeTeacherLM.jl`](/home/christos/code/julia/Swamma/src/NativeTeacherLM.jl):
+  - added Granite config support for:
+    - `attention_multiplier`
+    - `residual_multiplier`
+  - applied `attention_multiplier` inside native attention score scaling
+  - applied `residual_multiplier` on both attention and feed-forward residual additions
+- Extended [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - added `--response-prefix`
+  - added JSON-gated response validation by default
+  - added `--allow-non-json` escape hatch
+  - added `--verbose` timing/progress logging
+  - reserve prompt-token budget explicitly for the response prefix instead of letting truncation cut it off
+  - error logs now include `completion_preview` and `response_preview`
+- Updated [`scripts/build_rebel_teacher_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_teacher_requests.jl):
+  - removed pseudo-schema literals like `{"start": Int, ...}` that the model was copying into outputs
+  - explicitly warned against outputting keys such as `title`, `text`, or `tokens`
+  - kept the concrete JSON skeleton example, but shifted the prose schema toward real JSON semantics rather than type-annotation text
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) to reflect that the current blocker is parity plus prompt/control quality, not missing native infrastructure.
+
+### Key Experiment Outcomes
+- Parse and unit checks still passed after the Granite-scaling fix:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; println("parse-ok")'`
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `44/44` tests passed
+- Hugging Face reference next-token probe on a short Granite prompt:
+  - prompt: system=`You extract entities and relations.` user=`Barack Obama was born in Hawaii.`
+  - `python3` + `transformers` top tokens before native comparison:
+    - `Entities`
+    - `Here`
+    - `-`
+    - `In`
+    - `Entity`
+    - `**`
+    - `Extract`
+    - `{\n}`
+- Native Granite probe before the scaling fix was badly off:
+  - top tokens were dominated by whitespace / punctuation / multilingual junk
+  - this explained why the native RE teacher generator was emitting garbage despite the prompt controls
+- Native Granite probe after the scaling fix is materially closer to Hugging Face:
+  - `Here`, `Entities`, `Extract`, `-`, `Entity`, `**`, `In` now appear among the top predictions
+  - conclusion: the native model is no longer obviously numerically broken at the next-token level on the short prompt
+- Native RE generation diagnostics after the parity fix:
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_qc_oneonly.jsonl --output /tmp/rebel_teacher_raw_native_qc_oneonly_postfix.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 1 --max-input-tokens 128 --max-new-tokens 32 --verbose`
+  - result:
+    - tokenizer load: `~1.84s`
+    - native model load: `~22.81s`
+    - row generation time: `~42.48s`
+    - still failed JSON validation
+    - failure preview moved from multilingual garbage to JSON-like malformed structure:
+      - `{"entities":[{"title": ...`
+- Stronger prefix probe:
+  - `--response-prefix '{"entities":[{"start":'`
+  - before prompt-text cleanup, the model copied `Int` literals into JSON
+  - after prompt-text cleanup, the failure became:
+    - `{"entities":[{"start":0": 0": 0"...`
+  - conclusion: prompt/control is now the main blocker for RE JSON generation on the micro model, not the previously broken native inference path
+
+### Current Recommendation
+- Treat the native Granite path as materially more trustworthy after the config-faithful scaling fix.
+- Do not start corpus generation or distillation from the native path yet.
+- The next move should be a focused prompt/control pass:
+  - keep the HF-vs-native short-prompt parity probe as a regression check
+  - tune prompt wording and response prefixes against a tiny held-out RE shard
+  - only proceed to larger teacher-corpus runs once a few rows produce parseable JSON consistently
+
+### Open Issues
+- The native generator is still CPU-only in practice; CUDA is available in Julia, but the current `NativeTeacherLM` implementation is not GPU-ready because it still contains host-oriented scalar loops and host array construction.
+- Native Granite next-token parity improved substantially, but no reusable automated parity smoke exists yet.
+- `ibm-granite/granite-4.0-micro` still fails to emit parseable RE JSON on the tested held-out row under the current prompt/prefix settings.
+- Native RE generation remains too slow for large prompt iteration on CPU (`~22s` model load, `~42s` total for one 128-token / 32-new-token row).
+
+## 2026-03-15 — Compact Prompt Sweep + Float32 Native Debug Baseline
+
+### Objectives
+- Reduce prompt ambiguity for the native RE teacher path without changing the downstream parser/merge contract.
+- Check whether the remaining generation failures are caused by prompt contamination, truncation policy, or a deeper native-vs-HF generation gap.
+- Set a more sane default dtype for CPU-bound native generation experiments.
+
+### Changes Saved
+- Extended [`scripts/build_rebel_teacher_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_teacher_requests.jl):
+  - added `--prompt-style <verbose|compact>`
+  - added a `compact` request format that:
+    - removes prose-heavy numbered token lines
+    - emits a shorter schema description
+    - provides `tokens = [...]` as a JSON array
+  - preserved `--no-title`, which is now useful for compact-mode sweeps
+- Extended [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - changed prompt truncation from naive head-only clipping to head+tail preservation
+  - switched the default native generation dtype from `float16` to `float32`
+  - kept the compact-prompt experiments on the same raw-response JSONL contract
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the compact-prompt and `float32` baseline findings.
+
+### Key Experiment Outcomes
+- Hugging Face control with the compact prompt and strong prefix:
+  - source row: the held-out `CBS Corporation` example
+  - command family: `python3` + `transformers` on `ibm-granite/granite-4.0-micro`
+  - result on compact prompt:
+    - `{"entities":[{"start":1,"stop":2,"label":"ORG"}],"relations":[]}\n{"entities":[{"start":7,"stop":8,"label":"LOC"}]}`
+  - interpretation:
+    - the micro model can continue JSON-structured extraction text under the compact prompt
+    - it still tends to overrun into extra objects, but the first object is structurally sane enough for the existing JSON-object extractor
+- Hugging Face control with compact `--no-title` prompt:
+  - result stayed structurally sane and continued a plausible entity list rather than collapsing into junk
+- Native compact prompt, pre-`float32` default:
+  - response preview became much closer to extraction semantics:
+    - `{"entities":[{"start":0,"end":0,"label":"ORG","text":"CBS"...`
+  - but still malformed and repetitive, so JSON validation rejected it
+- Native compact prompt, `float32`, `--plain-prompt`, `--no-title`:
+  - the generator still failed JSON validation
+  - failure preview:
+    - `{"entities":[{"start":0":0":0"...`
+  - interpretation:
+    - `float32` is the right debug baseline for CPU runs, but it does not by itself remove the remaining generation pathology
+- Truncation finding:
+  - the earlier 128-token debug runs were misleading because naive truncation dropped the useful prompt tail
+  - the generator now preserves both the instruction head and the token-array tail before appending the forced JSON prefix
+
+### Current Recommendation
+- Use `compact` request prompts for native teacher debugging, not the original verbose numbered-token prompt.
+- Use `float32` as the native CPU debug baseline.
+- Treat Hugging Face compact-prompt generation as the control path showing the micro model is at least capable of near-structured JSON.
+- Treat the native path as still failing at decode fidelity on full generation, even though short-prompt next-token parity improved substantially.
+
+### Open Issues
+- There is still no reusable automated HF-vs-native parity smoke script; the comparison is currently manual.
+- The native compact prompt is better than the verbose prompt, but it still does not yield parseable RE JSON on the held-out row.
+- The remaining gap now looks more like native full-generation behavior drift than a pure prompt-format issue.
+
+## 2026-03-15 — Exact-Token HF-vs-Native Parity Script
+
+### Objectives
+- Replace the manual parity checks with a reusable exact-token comparison harness.
+- Determine whether the remaining native generation mismatch is caused by tokenizer roundtrip issues or by true model-side divergence.
+
+### Changes Saved
+- Added [`scripts/compare_native_granite_hf.jl`](/home/christos/code/julia/Swamma/scripts/compare_native_granite_hf.jl):
+  - loads one request row from teacher-request JSONL
+  - builds the same prompt token sequence used by the native generator
+  - supports:
+    - `--plain-prompt`
+    - `--response-prefix`
+    - `--max-input-tokens`
+    - `--max-new-tokens`
+    - `--dtype`
+    - `--local-files-only`
+  - runs native greedy generation for `N` steps
+  - runs Hugging Face greedy generation on the exact same prompt token IDs
+  - prints a step-by-step token comparison table
+- Fixed two early script bugs while validating it:
+  - row loading from JSONL
+  - Julia-to-Python boolean interpolation
+
+### Key Experiment Outcomes
+- Exact-token parity run:
+  - command:
+    - `julia --project=. scripts/compare_native_granite_hf.jl --input /tmp/rebel_teacher_requests_native_compact_notitle.jsonl --row-index 1 --model ibm-granite/granite-4.0-micro --response-prefix '{"entities":[{"start":' --max-input-tokens 512 --max-new-tokens 8 --dtype float32 --plain-prompt --local-files-only`
+  - prompt token count: `308`
+  - result: native and HF diverge at the very first generated token
+- First 8-step comparison:
+  - native:
+    - `0`
+    - `":`
+    - `" "`
+    - `<|end_of_text|>`
+    - newline
+    - `]`
+    - triple backticks
+    - `json`
+  - HF:
+    - `1`
+    - `,"`
+    - `stop`
+    - `":`
+    - `2`
+    - `,"`
+    - `label`
+    - `":"`
+- Interpretation:
+  - this is no longer a tokenizer decode/re-encode artifact, because HF now consumes the exact same prompt token IDs as the native side
+  - the remaining blocker is a true long-context native inference mismatch, not merely prompt style, dtype choice, or tokenizer roundtripping
+
+### Current Recommendation
+- Keep using [`scripts/compare_native_granite_hf.jl`](/home/christos/code/julia/Swamma/scripts/compare_native_granite_hf.jl) as the primary debugging tool for the native teacher path.
+- Stop tuning prompts blindly until the native-vs-HF first-token divergence is reduced on the long RE prompt.
+- The next debugging target should be the remaining long-context model math, most likely around positional handling / long-sequence attention behavior rather than tokenizer plumbing.
+
+### Open Issues
+- The native model still diverges from Hugging Face on the first generated token for the tested 308-token RE prompt, even after the earlier Granite scaling fix.
+- Short-prompt next-token parity improved, but long-prompt generation parity is still broken.
+
+## 2026-03-15 — Long-Context Boundary Check + Decode Heuristic Probe
+
+### Objectives
+- Find the sequence-length region where native/HF generation parity first breaks.
+- Test whether a small amount of JSON-aware constrained decoding can overcome the remaining native long-context drift without changing the model.
+
+### Changes Saved
+- Extended [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - added lightweight JSON-aware decode heuristics
+  - new flag:
+    - `--disable-json-heuristics`
+  - heuristics currently:
+    - suppress `0` when a numeric span field has just opened
+    - suppress early EOS / code-fence / `json` tokens before the response has any chance to become valid
+    - suppress obvious quote-style continuations immediately after a numeric field value
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the boundary-length result and the constrained-decode probe outcome.
+
+### Key Experiment Outcomes
+- Exact-token parity length sweep using [`scripts/compare_native_granite_hf.jl`](/home/christos/code/julia/Swamma/scripts/compare_native_granite_hf.jl):
+  - `max_input_tokens=64`: first token matched (`0`)
+  - `max_input_tokens=128`: first token matched (`0`)
+  - `max_input_tokens=192`: first token matched (`0`)
+  - `max_input_tokens=256`: first token diverged
+    - native: `0`
+    - HF: `1`
+  - `max_input_tokens=308` / `512` effective prompt: still diverged on the first token
+- Boundary-logit inspection:
+  - HF at `256` tokens:
+    - token `1`: `26.68`
+    - token `0`: `26.28`
+    - interpretation: HF is only modestly preferring `1` over `0`
+  - native at `256` tokens:
+    - token `0`: `26.48`
+    - token `1`: `21.59`
+    - interpretation: native is not catastrophically wrong, but it is much more strongly biased toward invalid `0`
+  - native at `308` tokens:
+    - token `0`: `23.78`
+    - token `1`: `22.88`
+    - interpretation: the same skew remains at full prompt length
+- Heuristic native decode probe on the compact no-title request (`float32`, `512` token budget):
+  - before heuristics:
+    - response started with malformed `{"entities":[{"start":0"...`
+  - after the first heuristic pass:
+    - response started with `{"entities":[{"start":1"...`
+    - but then drifted into `"CBS"`/free-text style content
+  - after the second heuristic pass:
+    - response stayed more extraction-shaped, e.g.:
+      - `{"entities":[{"start":1","type":"ORG","text":"CBS",...`
+    - still not valid JSON under the expected schema
+- Interpretation:
+  - constrained decoding can push the model away from the most obviously wrong branch
+  - but it does not eliminate the underlying long-context native-vs-HF divergence
+
+### Current Recommendation
+- Keep the parity harness and the compact prompt path.
+- Do not rely on the current constrained-decoding heuristics as a final solution; they improve the branch but do not restore schema-faithful JSON generation.
+- The next serious debugging target should be long-context forward math in [`src/NativeTeacherLM.jl`](/home/christos/code/julia/Swamma/src/NativeTeacherLM.jl), now that the break window is bounded to somewhere between `192` and `256` prompt tokens.
+
+### Open Issues
+- Native/HF first-token parity still breaks once the prompt reaches the mid-length regime (`>=256` tokens in the current compact setup).
+- The current JSON-aware heuristics are helpful but insufficient; the native model still drifts into the wrong schema/content family under long prompts.
+
+## 2026-03-15 — RoPE Root Cause Fix + First Accepted Native RE Teacher Row
+
+### Objectives
+- Fix the actual long-context model-math bug rather than continuing to tune prompts around it.
+- Re-run exact-token parity after the fix.
+- Verify that the native RE teacher generator can now emit at least one accepted strict-JSON row end to end.
+
+### Changes Saved
+- Fixed [`src/NativeTeacherLM.jl`](/home/christos/code/julia/Swamma/src/NativeTeacherLM.jl):
+  - corrected RoPE application from adjacent even/odd rotation to Granite/LLaMA-style half-split rotation
+  - the native implementation now rotates the first half of each head against the second half, matching Hugging Face `rotate_half(...)` semantics
+- Added [`scripts/compare_native_granite_hidden_states.jl`](/home/christos/code/julia/Swamma/scripts/compare_native_granite_hidden_states.jl):
+  - compares native vs HF last-token hidden states layer by layer on the exact same prompt token IDs
+  - useful for identifying where drift starts as context length changes
+- Kept the compact request path and the exact-token generation parity harness from the prior steps.
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) to reflect that the long-context mismatch is now fixed and that the next phase is moving from one accepted row to consistent small-shard native generation.
+
+### Key Experiment Outcomes
+- Parse and tests stayed green after the RoPE fix:
+  - `julia --project=. -e 'include("src/Swamma.jl"); using .Swamma; println("parse-ok")'`
+  - `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `44/44` tests passed
+- Exact-token parity after the RoPE fix:
+  - `256`-token prompt:
+    - native and HF matched exactly for the first 8 greedy tokens:
+      - `1`, `,"`, `stop`, `":`, `3`, `,"`, `label`, `":"`
+  - `308`-token prompt:
+    - native and HF again matched exactly for the first 8 greedy tokens
+  - interpretation:
+    - the previously reported long-context first-token mismatch was caused by the incorrect RoPE rotation scheme
+- Hidden-state parity after the RoPE fix:
+  - `256`-token layerwise comparison shows near-exact agreement through almost the full stack
+  - representative values:
+    - block 1 cosine `~1.0`, L2 `~2e-5`
+    - block 20 cosine `~1.0`, L2 `~4.6e-5`
+    - block 39 cosine `~1.0`, L2 `~4.8e-4`
+  - the final reported stage still shows a large mismatch, but that appears to be an API/labeling mismatch in the comparison harness rather than a real forward discrepancy, because token-level parity is exact
+- First accepted native RE teacher row under strict JSON validation:
+  - command:
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_f32_postrope_256.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 1 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[{"start":' --dtype float32 --plain-prompt --disable-json-heuristics --verbose`
+  - result:
+    - `accepted=1`
+    - `failed=0`
+    - generation time for the row: `~74.96s`
+    - accepted response length: `541` chars
+- Downstream parser compatibility:
+  - `julia --project=. scripts/parse_rebel_teacher_responses.jl --input /tmp/rebel_teacher_raw_native_compact_notitle_f32_postrope_256.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_f32_postrope_256.jsonl --strict`
+  - result:
+    - parsed rows: `1`
+    - failed rows: `0`
+    - entities: `6`
+    - relations: `4`
+
+### Current Recommendation
+- Treat the RoPE issue as resolved.
+- Treat the native Granite path as now capable of producing valid strict-JSON RE teacher rows, at least on a one-row compact-prompt smoke.
+- The next step is no longer model-math debugging. It is a small consistency sweep:
+  - run a tiny compact-prompt shard
+  - measure accepted/failed rate under strict JSON gating
+  - then decide whether compact/no-title/`float32`/`512`/`256` is good enough for a first native teacher-corpus pilot
+
+### Open Issues
+- One accepted row is not yet enough to call the native teacher path production-ready.
+- The compact native path is still slow on CPU (`~33s` model load, `~75s` generation for one 256-token decode row).
+- The current native raw response still benefits from the compact no-title prompt and a relatively large decode budget; robustness on a small shard still needs to be measured.
+
+## 2026-03-15 — Relation-First Native RE Teacher Control Pass
+
+### Objectives
+- Move beyond the one-row strict-JSON success and test whether the native Granite path can hold up on a tiny multi-row shard.
+- Diagnose the broader-schema failure mode from the compact entity-first prompt.
+- Find the best current native control recipe for RE teacher generation and save it explicitly.
+
+### Changes Saved
+- Updated [`scripts/build_rebel_teacher_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_teacher_requests.jl):
+  - tightened the compact prompt with explicit anti-overgeneration rules
+  - added relation-oriented guidance:
+    - extract only high-confidence spans needed for allowed relations or clearly salient named mentions
+    - do not annotate every noun/token
+    - prefer fewer annotations and close the JSON object immediately
+- Updated [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - added soft decode-cap knobs:
+    - `--max-entities-hint`
+    - `--max-relations-hint`
+  - extended JSON heuristics to cover packed separator tokens such as `,{"`, `"},{"`, and `},{"`
+  - added response-resolution helpers so strict validation now tries:
+    - completion text alone
+    - prefixed completion text
+  - fixed the relation-first bug where the model restarted a full JSON object but the generator still prepended the response prefix, producing invalid duplicated JSON
+  - generalized response-resolution helpers to accept `AbstractString`
+  - hardened error previews so `nothing` no longer crashes the failure path
+  - added object-tail detection so packed close-and-reopen tokens can be suppressed before a standalone `}` is emitted
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the new best-current recipe and the current `2/3` tiny-shard result.
+
+### Key Experiment Outcomes
+- Broader-schema entity-first control on the 3-row compact/no-title shard failed badly even after prompt tightening:
+  - row 1 still ran for `~259.54s`
+  - failure mode changed from `CONCEPT` flooding to `DATE` flooding
+  - representative preview:
+    - `{"entities":[{"start":1,"stop":3,"label":"ORG"},{"start":9,"stop":9,"label":"DATE"}, ...`
+  - interpretation:
+    - entity-first decoding is the wrong control surface on the full six-label schema
+- Full non-JSON capture of that entity-first failure confirmed the decoder never reached `relations`:
+  - it kept enumerating `DATE` spans up through token `50`
+  - relation supervision would have been absent even if the text were repaired
+- Relation-first probe used this response prefix:
+  - `{"entities":[],"relations":[{"head_start":`
+- Before the response-assembly fix, relation-first already looked promising:
+  - row 1 failed in `17.78s`
+  - row 2 failed in `72.85s`
+  - those failures were fast because the model often restarted a full JSON object instead of continuing the prefix
+  - the generator was incorrectly prepending the prefix anyway, which made otherwise parseable JSON invalid
+- After the response-assembly fix:
+  - strict row-1 relation-first run:
+    - command:
+      - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_3_tight.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_3_tight_relfirst_row1_fixed.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 1 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+    - result:
+      - `accepted=1`
+      - generation time `~16.91s`
+      - strict downstream parse passed with:
+        - rows `1/1`
+        - entities `0`
+        - relations `1`
+- Tiny strict relation-first shard (`3` rows):
+  - command:
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_3_tight.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_3_tight_relfirst_3.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 3 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - results:
+    - row 1 accepted in `17.65s`
+    - row 2 accepted in `81.16s`
+    - row 3 failed
+    - overall strict acceptance: `2/3`
+- Downstream strict parser on the accepted relation-first rows:
+  - command:
+    - `julia --project=. scripts/parse_rebel_teacher_responses.jl --input /tmp/rebel_teacher_raw_native_compact_notitle_3_tight_relfirst_3.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_3_tight_relfirst_3.jsonl --strict`
+  - result:
+    - parsed rows `2`
+    - failed rows `0`
+    - entities total `0`
+    - relations total `9`
+- Hard-row diagnostic for row 3:
+  - non-JSON capture showed the model continuing mid-object relation lists such as:
+    - `1,"head_stop":3,"tail_start":5,"tail_stop":6,"label":"P17"},{"head_start":9,...`
+  - interpretation:
+    - row 3 is not a full-object restart case
+    - it is a continuation-only relation flood that still fails to close under the current greedy decode recipe
+
+### Best Current Recommendation
+- Best current native RE teacher recipe:
+  - compact prompt
+  - `--no-title`
+  - `float32`
+  - `--max-input-tokens 512`
+  - `--max-new-tokens 256`
+  - `--plain-prompt`
+  - relation-first response prefix:
+    - `{"entities":[],"relations":[{"head_start":`
+  - `--max-entities-hint 6`
+  - `--max-relations-hint 4`
+- Treat relation-first generation as the current default path for native RE teacher generation.
+- Treat entity-first generation on the broad schema as a dead end for now.
+
+### Open Issues
+- The current best native relation-first recipe is improved but not yet robust:
+  - tiny strict shard result is `2/3`, not `3/3`
+- Row 3 still produces a malformed continuation-only relation flood and never closes the JSON object under greedy decode.
+- The current accepted relation-first outputs contain relations only (`entities=[]`), which is usable for relation distillation but not yet ideal if we want teacher entity spans from the same pass.
+
+### Next Actions
+- Push the relation-first recipe from `2/3` to `3/3` on the tiny shard:
+  - either improve packed-token close-out for continuation-only relation floods
+  - or test a sampled relation-first decode recipe on the same rows
+- If relation-first can be stabilized on a 10-row shard, use that as the first native teacher-corpus pilot instead of returning to entity-first prompting.
+
+## 2026-03-16 — Relation-First Salvage Path + Tiny-Shard 3/3 Strict Acceptance
+
+### Objectives
+- Eliminate the remaining hard-row failure from the relation-first native RE teacher recipe.
+- Distinguish between true empty outputs and truncated-but-salvageable relation continuations.
+- Re-run the tiny strict shard after the fix and confirm whether the best current recipe is now stable enough for a larger pilot.
+
+### Changes Saved
+- Updated [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - added strict relation-only partial-JSON salvage:
+    - if full JSON validation fails, the generator now tries to recover complete top-level relation objects from a candidate of the form `{"entities":[],"relations":[...`
+    - the repaired object is closed as strict JSON and revalidated before acceptance
+  - added helpers:
+    - `extract_complete_top_level_objects(...)`
+    - `salvage_relation_only_json(...)`
+  - threaded `max_relations_hint` through `resolve_response_text(...)` so salvage respects the current decode cap
+  - kept the previously added relation-first response-resolution logic and error-preview hardening
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) to record that the tiny strict relation-first shard now reaches `3/3` acceptance.
+
+### Key Experiment Outcomes
+- Hard-row row-3 strict retry before salvage:
+  - command:
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_request_row3_relfirst.jsonl --output /tmp/rebel_teacher_raw_native_row3_relfirst_fixed2.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 1 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - result:
+    - still failed under strict JSON
+    - preview showed a continuation-only relation flood:
+      - `1,"head_stop":3,"tail_start":5,"tail_stop":6,"label":"P17"},{"head_start":9,...`
+  - interpretation:
+    - the model was producing useful complete relation objects, but truncation prevented closure
+- Row-3 non-JSON capture confirmed the above diagnosis:
+  - it produced a long sequence of relation objects and stopped mid-list
+  - this meant a relation-only salvage path was appropriate
+- Row-3 strict retry after salvage:
+  - command:
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_request_row3_relfirst.jsonl --output /tmp/rebel_teacher_raw_native_row3_relfirst_fixed3.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 1 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - result:
+    - `accepted=1`
+    - generation time `~20.03s`
+    - emitted strict response:
+      - `{"entities":[],"relations":[{"head_start":1,"head_stop":3,"tail_start":5,"tail_stop":6,"label":"P17"}]}`
+- Downstream parser verification for salvaged row 3:
+  - `julia --project=. scripts/parse_rebel_teacher_responses.jl --input /tmp/rebel_teacher_raw_native_row3_relfirst_fixed3.jsonl --output /tmp/rebel_teacher_parsed_native_row3_relfirst_fixed3.jsonl --strict`
+  - result:
+    - parsed rows `1`
+    - failed rows `0`
+    - entities `0`
+    - relations `1`
+- Full tiny strict shard rerun after salvage:
+  - command:
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_3_tight.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_3_tight_relfirst_3_fixed.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 3 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - result:
+    - row 1 accepted in `17.61s`
+    - row 2 accepted in `11.10s`
+    - row 3 accepted in `13.54s`
+    - overall strict acceptance: `3/3`
+- Downstream parser on the full fixed tiny shard:
+  - `julia --project=. scripts/parse_rebel_teacher_responses.jl --input /tmp/rebel_teacher_raw_native_compact_notitle_3_tight_relfirst_3_fixed.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_3_tight_relfirst_3_fixed.jsonl --strict`
+  - result:
+    - parsed rows `3`
+    - failed rows `0`
+    - entities total `0`
+    - relations total `3`
+
+### Best Current Recommendation
+- Best native RE teacher recipe remains:
+  - compact prompt
+  - `--no-title`
+  - `float32`
+  - `--max-input-tokens 512`
+  - `--max-new-tokens 256`
+  - `--plain-prompt`
+  - relation-first response prefix:
+    - `{"entities":[],"relations":[{"head_start":`
+  - `--max-entities-hint 6`
+  - `--max-relations-hint 4`
+- The key new recommendation is to keep the strict relation-only salvage path enabled for this recipe.
+- This is now good enough to justify a 10-row strict shard before attempting a larger native teacher-corpus pilot.
+
+### Open Issues
+- The current native relation-first path still emits relations only (`entities=[]`), so it is not yet a full teacher-entity generator.
+- The salvage path is pragmatic and effective, but it is still a control-time repair layer over a small teacher model rather than a proof that raw generation is schema-perfect.
+- Quality remains unvalidated beyond tiny-shard structural success; the current metrics are acceptance and parseability, not relation correctness.
+
+### Next Actions
+- Run a 10-row strict relation-first shard with the current recipe and measure:
+  - strict acceptance rate
+  - parse success
+  - relation count distribution
+- If the 10-row shard stays stable, use the relation-first native path as the first real RE teacher-corpus pilot and compare its utility against the external-teacher path.
+
+## 2026-03-16 — 10-Row Strict Relation-First Native Pilot
+
+### Objectives
+- Validate that the new relation-first native RE teacher recipe is not only a 3-row toy success.
+- Measure strict generation acceptance, strict downstream parse success, and basic relation-yield statistics on a 10-row shard.
+
+### Changes Saved
+- No new code paths were added in this step.
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) to record the 10-row pilot result and promote the next action to a larger `50-100` row shard.
+
+### Key Experiment Outcomes
+- Built a 10-row compact/no-title request shard:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_10.jsonl --max-rows 10 --prompt-style compact --no-title`
+- Ran strict native relation-first generation:
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_10.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_10_relfirst.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 10 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+- Strict generator results:
+  - accepted `10/10`
+  - failed `0/10`
+  - representative per-row generation times after model load:
+    - row 1: `17.84s`
+    - row 2: `12.22s`
+    - row 5: `15.76s`
+    - row 10: `18.47s`
+- Strict downstream parse:
+  - `julia --project=. scripts/parse_rebel_teacher_responses.jl --input /tmp/rebel_teacher_raw_native_compact_notitle_10_relfirst.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_10_relfirst.jsonl --strict`
+  - result:
+    - parsed rows `10`
+    - failed rows `0`
+    - entities total `0`
+    - relations total `7`
+- Basic output-size summary:
+  - rows `10`
+  - mean response chars `110.7`
+  - min chars `104`
+  - max chars `153`
+- Per-row parsed relation counts:
+  - non-empty relation rows:
+    - `docid:1755846-1` -> `1`
+    - `docid:1755846-2` -> `1`
+    - `docid:1701411-0` -> `1`
+    - `docid:1854133-1` -> `1`
+    - `docid:1872359-0` -> `1`
+    - `docid:1698102-0` -> `1`
+    - `docid:1698102-1` -> `1`
+  - empty-relation rows:
+    - `docid:1602703-0`
+    - `docid:1751944-0`
+    - `docid:1834314-0`
+
+### Best Current Recommendation
+- Promote the relation-first native recipe from “tiny-shard promising” to “pilot-ready for a larger shard”.
+- Keep the current best recipe unchanged:
+  - compact prompt
+  - `--no-title`
+  - `float32`
+  - `--max-input-tokens 512`
+  - `--max-new-tokens 256`
+  - `--plain-prompt`
+  - response prefix `{"entities":[],"relations":[{"head_start":`
+  - `--max-entities-hint 6`
+  - `--max-relations-hint 4`
+
+### Open Issues
+- Structural robustness now looks good, but semantic quality is still unverified.
+- Outputs are still relation-only (`entities=[]`), so teacher entity spans are not being produced by the native path yet.
+- Three of the ten parsed rows yielded empty relations; that may be correct or may indicate under-generation on some examples.
+
+### Next Actions
+- Run a `50-100` row relation-first pilot and inspect:
+  - acceptance / parse success
+  - non-empty relation yield
+  - label distribution
+  - obvious semantic failures from a manual spot check
+- If that larger pilot holds, use this native path to produce the first meaningful RE teacher corpus for distillation experiments.
+
+## 2026-03-16 — Semantic Gate + Label-Gloss Pilot Evaluation
+
+### Objectives
+- Distinguish structural robustness from semantic usefulness on the native relation-first pilot.
+- Tighten “strict” acceptance so out-of-schema labels no longer count as successes.
+- Test whether adding short natural-language glosses for Wikidata relation IDs improves label choice.
+- Add a reusable evaluator so future pilot sweeps do not require manual spot checks.
+
+### Changes Saved
+- Updated [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - strict validation now checks that emitted entity and relation labels belong to the row’s allowed `entity_labels` / `relation_labels`
+  - added helpers:
+    - `label_set_from_row(...)`
+    - `payload_labels_allowed(...)`
+  - threaded allowed label sets through:
+    - strict response validation
+    - relation-only salvage
+    - early-stop resolution
+- Updated [`scripts/build_rebel_teacher_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_teacher_requests.jl):
+  - added `REBEL_RELATION_GLOSSES` for the 32 REBEL relation IDs
+  - compact prompts now include concise relation meaning hints such as:
+    - `P127=owned by`
+    - `P159=headquarters location`
+    - `P571=inception`
+  - added an explicit instruction:
+    - choose the relation ID whose meaning best matches the spans; do not default to one label across rows
+- Added [`scripts/evaluate_rebel_teacher_pilot.jl`](/home/christos/code/julia/Swamma/scripts/evaluate_rebel_teacher_pilot.jl):
+  - compares parsed teacher outputs against gold REBEL rows
+  - reports:
+    - matched rows
+    - non-empty rate
+    - top-1 predicted label in gold-set rate
+    - exact predicted label-set match rate
+    - predicted/gold label histograms
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the new semantic metrics and the next control options.
+
+### Key Experiment Outcomes
+- Baseline structural pilot without label-aware validation looked overly good:
+  - 10-row strict relation-first shard: `10/10` accepted, `10/10` parsed
+  - but label inspection showed a collapse to a single invalid label family in earlier runs
+- After adding label-aware strict validation:
+  - 10-row relation-first shard on the pre-gloss prompt:
+    - accepted `7/10`
+    - failed `3/10`
+    - parsed `7/7`
+    - all accepted rows predicted the same label:
+      - `P161`
+- Gold comparison for the no-gloss label-gated run using [`scripts/evaluate_rebel_teacher_pilot.jl`](/home/christos/code/julia/Swamma/scripts/evaluate_rebel_teacher_pilot.jl):
+  - command:
+    - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_10_relfirst_labelgated.jsonl --max-rows 10`
+  - result:
+    - matched rows `7`
+    - non-empty rows `7`
+    - top-1 label in gold `0.0000`
+    - exact label-set match `0.0000`
+    - predicted label counts:
+      - `{"P161":7}`
+  - interpretation:
+    - structurally valid
+    - semantically degenerate
+- Glossed compact prompt pilot:
+  - built with:
+    - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_10_gloss.jsonl --max-rows 10 --prompt-style compact --no-title`
+  - generated with the same relation-first label-gated recipe
+  - result:
+    - accepted `7/10`
+    - failed `3/10`
+    - parsed `7/7`
+    - predicted label counts:
+      - `{"P127":3,"P161":2,"P57":1,"P136":1}`
+- Gold comparison for the glossed label-gated run:
+  - command:
+    - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_10_gloss_relfirst_labelgated.jsonl --max-rows 10`
+  - result:
+    - matched rows `7`
+    - non-empty rows `7`
+    - top-1 label in gold `0.1429`
+    - exact label-set match `0.1429`
+    - only `docid:1755846-1` matched the gold top label exactly (`P127`)
+  - interpretation:
+    - glosses broke the single-label collapse
+    - but semantic quality is still poor overall
+
+### Best Current Recommendation
+- Keep the relation-first structural recipe.
+- Keep label-aware strict validation enabled; it prevents misleading “success” metrics.
+- Keep the relation glosses; they provide a measurable improvement over bare property IDs.
+- Do not treat the current native teacher path as ready for corpus-scale distillation yet; semantic quality is still too weak.
+
+### Open Issues
+- Structural robustness is now much better than semantic accuracy.
+- Even with glosses, the 10-row pilot only reaches:
+  - top-1 label in gold `0.1429`
+  - exact label-set match `0.1429`
+- The model still emits only one relation per accepted row in these pilots, and still produces `entities=[]`.
+
+### Next Actions
+- Add a stronger semantic control step for relation-label selection:
+  - either constrained label decoding at `label` fields
+  - or a two-stage natural-language relation-name -> Wikidata-ID mapping path
+- Re-run the 10-row pilot after that change and use [`scripts/evaluate_rebel_teacher_pilot.jl`](/home/christos/code/julia/Swamma/scripts/evaluate_rebel_teacher_pilot.jl) as the acceptance gate before scaling back up to `50-100` rows.
+
+## 2026-03-16 — Decode-Time Label Constraint Probe
+
+### Objectives
+- Test whether constraining relation `label` fields at decode time improves semantic accuracy beyond prompt glosses alone.
+- Compare this constrained run directly against the glossed label-gated 10-row pilot.
+
+### Changes Saved
+- Updated [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - added `RelationLabelConstraint`
+  - added `build_relation_label_constraint(...)`
+  - added `current_open_label_prefix(...)`
+  - added `apply_relation_label_constraint(...)`
+  - when the decoder is inside an open relation `label` field, logits are now restricted to token continuations that correspond to the row’s allowed relation IDs, plus the closing quote when a full allowed ID is complete
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the constrained-vs-unconstrained comparison result.
+
+### Key Experiment Outcomes
+- Glossed relation-first prompt remained the better prompt baseline:
+  - accepted `7/10`
+  - top-1 label in gold `0.1429`
+  - exact label-set match `0.1429`
+- Constrained-label glossed pilot:
+  - command:
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_10_gloss.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_10_gloss_relfirst_labelconstrained.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 10 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - result:
+    - accepted `6/10`
+    - failed `4/10`
+    - parsed `6/6`
+    - predicted label counts:
+      - `{"P127":2,"P57":1,"P136":1,"P161":2}`
+- Gold comparison for the constrained-label run:
+  - command:
+    - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_10_gloss_relfirst_labelconstrained.jsonl --max-rows 10`
+  - result:
+    - matched rows `6`
+    - non-empty rows `6`
+    - top-1 label in gold `0.0000`
+    - exact label-set match `0.0000`
+- Interpretation:
+  - token-level label constraints did not solve the semantic problem
+  - they reduced acceptance from `7/10` to `6/10`
+  - they did not improve gold-label agreement
+  - the prompt glosses alone remain strictly better than adding this constrained label-selection layer
+
+### Best Current Recommendation
+- Keep:
+  - relation-first generation
+  - label-aware strict validation
+  - relation glosses in the compact prompt
+- Do not keep pushing the current token-level relation-label constraint path as the main solution.
+
+### Open Issues
+- The native path is structurally stable but semantically weak.
+- Prompt glosses help somewhat, but semantic accuracy remains poor.
+- Token-level label constraints are not the right next lever.
+
+### Next Actions
+- Move to a stronger semantic-control design:
+  - prefer a two-stage natural-language relation-name -> Wikidata-ID mapping path
+  - or another semantic reranking step that reasons over gloss text instead of raw ID tokens
+
+## 2026-03-16 — Name-Canonicalization Variant Probe
+
+### Objectives
+- Test whether relaxing the label surface form from raw Wikidata IDs to human-readable relation names helps semantic accuracy.
+- Compare three semantic-control variants on the same 10-row slice:
+  - glossed ID prompt
+  - glossed `id_or_name` prompt
+  - glossed `name`-only prompt
+
+### Changes Saved
+- Updated [`scripts/parse_rebel_teacher_responses.jl`](/home/christos/code/julia/Swamma/scripts/parse_rebel_teacher_responses.jl):
+  - added REBEL relation gloss -> ID canonicalization
+  - parsed relation labels can now be:
+    - raw Wikidata IDs such as `P127`
+    - human-readable names such as `owned by`
+  - normalization maps both forms back to the canonical Wikidata ID
+- Updated [`scripts/generate_rebel_teacher_responses_native.jl`](/home/christos/code/julia/Swamma/scripts/generate_rebel_teacher_responses_native.jl):
+  - strict validation now treats either canonical IDs or canonicalizable relation names as acceptable for relation labels
+- Updated [`scripts/build_rebel_teacher_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_teacher_requests.jl):
+  - added `--relation-label-mode <id|id_or_name|name>`
+  - `id`:
+    - relation label must be the Wikidata ID
+  - `id_or_name`:
+    - relation label may be either the ID or the glossed name
+  - `name`:
+    - relation label must be the exact glossed relation name, not the ID
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the new variant comparison.
+
+### Key Experiment Outcomes
+- `id_or_name` variant:
+  - built with the glossed compact prompt allowing either ID or exact relation name
+  - 10-row result:
+    - accepted `3/10`
+    - failed `7/10`
+    - parsed rows `3`
+    - total predicted relations `1`
+  - evaluation:
+    - matched rows `3`
+    - non-empty rows `1`
+    - top-1 label in gold `0.0000`
+    - exact label-set match `0.0000`
+  - interpretation:
+    - too brittle
+    - not competitive with the glossed ID baseline
+- `name`-only variant:
+  - built with:
+    - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_10_nameonly.jsonl --max-rows 10 --prompt-style compact --no-title --relation-label-mode name`
+  - generated with the same relation-first recipe
+  - 10-row result:
+    - accepted `5/10`
+    - failed `5/10`
+    - parsed rows `5`
+    - total predicted relations `5`
+  - evaluation:
+    - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_10_nameonly_relfirst.jsonl --max-rows 10`
+    - matched rows `5`
+    - non-empty rows `5`
+    - top-1 label in gold `0.2000`
+    - exact label-set match `0.2000`
+    - predicted label counts:
+      - `{"P127":2,"P31":1,"P161":2}`
+- Comparison against the glossed ID baseline from the previous step:
+  - glossed ID baseline:
+    - accepted `7/10`
+    - top-1 label in gold `0.1429`
+    - exact label-set match `0.1429`
+  - key takeaway:
+    - `name`-only improves the *rate* slightly (`0.2000` vs `0.1429`)
+    - but because it accepts fewer rows (`5` vs `7`), it does not improve the absolute count of correct rows
+    - `id_or_name` is worse than both
+
+### Best Current Recommendation
+- Keep the glossed ID prompt as the best current single-pass native recipe.
+- Keep downstream canonicalization of relation names; it is useful infrastructure for future multi-stage approaches.
+- Do not switch the main pilot path to `id_or_name` or `name` mode in the current single-pass setup.
+
+### Open Issues
+- The semantic problem remains unresolved:
+  - glossed ID mode is still weak
+  - `id_or_name` is too brittle
+  - `name`-only does not improve absolute correctness enough to justify the lower acceptance
+- The current native path still emits `entities=[]` and mostly single-relation outputs.
+
+### Next Actions
+- Stop treating prompt-surface variations as the main lever.
+- Move to an explicit two-stage semantic-control design:
+  - generate relation meaning/name first
+  - then map or rerank against the allowed Wikidata IDs using the gloss table
+
+## 2026-03-16 — Two-Stage Relabel Scale Check
+
+### Objectives
+- Test whether the new two-stage native relation-label relabeling path still helps on a larger `50`-row shard.
+- Compare two operating points:
+  - glossed single-pass stage 1 plus two-stage relabel
+  - no-gloss high-coverage stage 1 plus two-stage relabel
+- Decide which architecture should be treated as the current best native RE teacher path.
+
+### Changes Saved
+- No code or config changes in this segment.
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) to record the `50`-row pilot results and promote the new preferred sequencing.
+
+### Experiment Commands And Key Metrics
+- Built the glossed `50`-row compact no-title request shard:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_50_gloss.jsonl --max-rows 50 --prompt-style compact --no-title --relation-label-mode id`
+- Ran glossed single-pass stage 1:
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_50_gloss.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_50_gloss_relfirst_labelgated.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 50 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - result:
+    - accepted `24/50`
+    - failed `26/50`
+    - parsed rows `24`
+    - predicted relations `22`
+    - top-1 label in gold `0.0455`
+    - exact label-set match `0.0000`
+    - label collapse shifted mostly to `P106`
+- Ran the glossed two-stage relabel path:
+  - `julia --project=. scripts/build_rebel_relation_label_requests.jl --requests /tmp/rebel_teacher_requests_native_compact_notitle_50_gloss.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_gloss_relfirst_labelgated.jsonl --output /tmp/rebel_relation_label_requests_50_gloss.jsonl`
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_relation_label_requests_50_gloss.jsonl --output /tmp/rebel_relation_label_raw_50_gloss.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 22 --max-input-tokens 512 --max-new-tokens 128 --response-prefix '{"label":"' --dtype float32 --plain-prompt --verbose --allow-non-json --disable-stop-on-complete-json`
+  - `julia --project=. scripts/apply_rebel_relation_label_selections.jl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_gloss_relfirst_labelgated.jsonl --selections /tmp/rebel_relation_label_raw_50_gloss.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_50_gloss_relfirst_relabel2stage.jsonl --response-prefix '{"label":"'`
+  - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_gloss_relfirst_relabel2stage.jsonl --max-rows 50`
+  - result:
+    - matched rows `24`
+    - non-empty rows `22`
+    - predicted relations `22`
+    - top-1 label in gold `0.3636`
+    - exact label-set match `0.0455`
+    - predicted labels became meaningfully distributed: `P31/P276/P17/P571/P159/P138/P403`
+- Evaluated the older no-gloss high-coverage stage-1 baseline:
+  - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_relfirst.jsonl --max-rows 50`
+  - result:
+    - matched rows `50`
+    - non-empty rows `29`
+    - predicted relations `29`
+    - top-1 label in gold `0.0345`
+    - exact label-set match `0.0000`
+    - all predicted labels collapsed to `P106`
+- Ran two-stage relabel on the no-gloss stage-1 baseline:
+  - `julia --project=. scripts/build_rebel_relation_label_requests.jl --requests /tmp/rebel_teacher_requests_native_compact_notitle_50.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_relfirst.jsonl --output /tmp/rebel_relation_label_requests_50_nogloss.jsonl`
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_relation_label_requests_50_nogloss.jsonl --output /tmp/rebel_relation_label_raw_50_nogloss.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 29 --max-input-tokens 512 --max-new-tokens 128 --response-prefix '{"label":"' --dtype float32 --plain-prompt --verbose --allow-non-json --disable-stop-on-complete-json`
+  - `julia --project=. scripts/apply_rebel_relation_label_selections.jl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_relfirst.jsonl --selections /tmp/rebel_relation_label_raw_50_nogloss.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_50_relfirst_relabel2stage.jsonl --response-prefix '{"label":"'`
+  - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_relfirst_relabel2stage.jsonl --max-rows 50`
+  - result:
+    - matched rows `50`
+    - non-empty rows `29`
+    - predicted relations `29`
+    - top-1 label in gold `0.4483`
+    - exact label-set match `0.1379`
+    - predicted labels spread across `P31/P276/P17/P571/P159/P138/P50/P19/P641/P403/P47`
+
+### Best Current Recommendation
+- The best current native RE teacher architecture is:
+  - stage 1: simple compact no-title relation-first extraction without glossed stage-1 label hints
+  - stage 2: separate native relation-label selection over the predicted spans, using glossed natural-language choices and downstream canonicalization back to Wikidata IDs
+- This is better than the glossed single-pass path on both coverage and semantics:
+  - glossed single-pass + relabel: `24` matched rows, top-1 `0.3636`
+  - no-gloss single-pass + relabel: `50` matched rows, top-1 `0.4483`
+
+### Unresolved Issues
+- Stage 1 still emits `entities=[]` and relation spans only; the current gain is almost entirely from label correction, not fuller structured extraction.
+- No-gloss stage 1 keeps high row coverage, but non-empty relation yield is still only `29/50`.
+- The evaluation so far is still pilot-scale; this is enough to choose direction, not enough to claim corpus readiness.
+
+### Next Actions
+- Keep the no-gloss stage-1 + two-stage relabel stack as the promoted pilot path.
+- Improve stage-1 relation yield without reintroducing the glossed acceptance collapse.
+- Rerun the promoted two-stage stack on a `100`-row shard and inspect:
+  - acceptance
+  - non-empty relation yield
+  - top-1 label-in-gold
+  - exact label-set match
+- If the `100`-row pilot holds up, use that path for the first real native teacher-corpus build.
+
+## 2026-03-16 — No-Schema Stage-1 Upgrade
+
+### Objectives
+- Improve stage-1 relation yield without giving up the high acceptance of the promoted native two-stage path.
+- Test whether a shorter compact prompt with `--no-schema` improves stage-1 coverage.
+- Validate the new operating point on both `50`-row and `100`-row shards with the full stage-2 relabel pass.
+
+### Changes Saved
+- Updated [`scripts/build_rebel_teacher_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_teacher_requests.jl):
+  - request JSONL now always includes `entity_labels` and `relation_labels` metadata, even when `--no-schema` is used
+  - this keeps strict validation and stage-2 relabeling intact while allowing the prompt text itself to shrink
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the new promoted no-schema results.
+
+### Experiment Commands And Key Metrics
+- Built the no-schema `50`-row request shard:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_50_noschema.jsonl --max-rows 50 --prompt-style compact --no-title --no-schema --relation-label-mode id`
+  - first-row prompt shrank from about `1707` chars to about `960` chars while keeping label metadata in the JSONL
+- Ran no-schema stage 1 on `50` rows:
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_50_noschema.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_50_noschema_relfirst.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 50 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - parse/eval:
+    - matched rows `50`
+    - non-empty rows `50`
+    - predicted relations `50`
+    - top-1 label in gold `0.1000`
+    - exact label-set match `0.0200`
+- Ran no-schema stage 2 on `50` rows:
+  - `julia --project=. scripts/build_rebel_relation_label_requests.jl --requests /tmp/rebel_teacher_requests_native_compact_notitle_50_noschema.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_noschema_relfirst.jsonl --output /tmp/rebel_relation_label_requests_50_noschema.jsonl`
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_relation_label_requests_50_noschema.jsonl --output /tmp/rebel_relation_label_raw_50_noschema.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 50 --max-input-tokens 512 --max-new-tokens 128 --response-prefix '{"label":"' --dtype float32 --plain-prompt --verbose --allow-non-json --disable-stop-on-complete-json`
+  - `julia --project=. scripts/apply_rebel_relation_label_selections.jl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_noschema_relfirst.jsonl --selections /tmp/rebel_relation_label_raw_50_noschema.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_50_noschema_relfirst_relabel2stage.jsonl --response-prefix '{"label":"'`
+  - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_noschema_relfirst_relabel2stage.jsonl --max-rows 50`
+  - result:
+    - matched rows `50`
+    - non-empty rows `50`
+    - predicted relations `50`
+    - top-1 label in gold `0.3800`
+    - exact label-set match `0.1000`
+    - relabel updated `47/50` relations
+- Extended the same path to `100` rows using resume:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_100_noschema.jsonl --max-rows 100 --prompt-style compact --no-title --no-schema --relation-label-mode id`
+  - seeded stage-1 raw file with the `50`-row output and resumed:
+    - `cp /tmp/rebel_teacher_raw_native_compact_notitle_50_noschema_relfirst.jsonl /tmp/rebel_teacher_raw_native_compact_notitle_100_noschema_relfirst.jsonl`
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_100_noschema.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_100_noschema_relfirst.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --resume --max-rows 100 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - stage-1 `100`-row result:
+    - matched rows `100`
+    - non-empty rows `100`
+    - predicted relations `100`
+    - top-1 label in gold `0.1200`
+    - exact label-set match `0.0200`
+  - seeded stage-2 raw file with the `50`-row output and resumed:
+    - `cp /tmp/rebel_relation_label_raw_50_noschema.jsonl /tmp/rebel_relation_label_raw_100_noschema.jsonl`
+    - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_relation_label_requests_100_noschema.jsonl --output /tmp/rebel_relation_label_raw_100_noschema.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --resume --max-rows 100 --max-input-tokens 512 --max-new-tokens 128 --response-prefix '{"label":"' --dtype float32 --plain-prompt --verbose --allow-non-json --disable-stop-on-complete-json`
+  - final merged `100`-row result:
+    - matched rows `100`
+    - non-empty rows `100`
+    - predicted relations `100`
+    - top-1 label in gold `0.3800`
+    - exact label-set match `0.0800`
+    - relabel updated `95/100` relations
+
+### Best Current Recommendation
+- Promote the native teacher pilot path to:
+  - stage 1: compact no-title no-schema relation-first extraction
+  - stage 2: separate native relation-label relabeling with glossed natural-language choices and downstream canonicalization to Wikidata IDs
+- Why this is now preferred:
+  - it keeps full row coverage on the tested shards
+  - it raises stage-1 relation yield from `29/50` to `50/50`
+  - after relabeling, it holds `0.3800` top-1 label-in-gold on both `50` and `100` row pilots
+- Compared with the prior no-gloss relabel path:
+  - prior `50`-row no-gloss relabel: `29` predicted relations, top-1 `0.4483`, exact `0.1379`
+  - current `50`-row no-schema relabel: `50` predicted relations, top-1 `0.3800`, exact `0.1000`
+  - verdict: the no-schema path gives better absolute semantic yield because it keeps all rows non-empty
+
+### Unresolved Issues
+- Stage-2 relabel does not update every relation candidate yet:
+  - `47/50` updates on the `50`-row no-schema pilot
+  - `95/100` updates on the `100`-row no-schema pilot
+- Exact label-set match is still modest.
+- The pipeline still produces relation-only outputs with `entities=[]`; this is enough for the current distillation experiment path, but not a full extraction-quality solution.
+
+### Next Actions
+- Inspect the small residual tail of unlabeled / un-updated stage-2 candidates and make the relabel merge fully saturated.
+- Run a sampled-vs-greedy comparison on the promoted no-schema path to see whether label accuracy can be lifted without losing the `100/100` non-empty rate.
+- If that does not materially improve the metrics, use the current no-schema two-stage pipeline to build the first larger native teacher corpus for distillation.
+
+## 2026-03-16 — Residual Relabel Tail Inspection
+
+### Objectives
+- Determine why the no-schema two-stage relabel path still misses a small tail of candidates.
+- Separate merge/parser problems from true stage-2 semantic drift.
+- Apply only safe repairs, not speculative label remapping.
+
+### Changes Saved
+- Updated [`scripts/apply_rebel_relation_label_selections.jl`](/home/christos/code/julia/Swamma/scripts/apply_rebel_relation_label_selections.jl):
+  - added a fallback that extracts the `"label"` field directly from truncated / malformed selection text
+  - added a small safe alias map for obvious near-glosses such as `headquartered in -> P159`
+  - restricted merge-time canonicalization to the selection row’s allowed relation-label set
+- Updated [`scripts/build_rebel_relation_label_requests.jl`](/home/christos/code/julia/Swamma/scripts/build_rebel_relation_label_requests.jl):
+  - strengthened the stage-2 prompt to forbid free-form type outputs such as `city`, `single`, and `nickname`
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the repaired tail counts.
+
+### Experiment Commands And Key Metrics
+- Reapplied the repaired merge to the no-schema pilots:
+  - `julia --project=. scripts/apply_rebel_relation_label_selections.jl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_50_noschema_relfirst.jsonl --selections /tmp/rebel_relation_label_raw_50_noschema.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_50_noschema_relfirst_relabel2stage_v2.jsonl --response-prefix '{"label":"'`
+  - `julia --project=. scripts/apply_rebel_relation_label_selections.jl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_100_noschema_relfirst.jsonl --selections /tmp/rebel_relation_label_raw_100_noschema.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_100_noschema_relfirst_relabel2stage_v2.jsonl --response-prefix '{"label":"'`
+  - result:
+    - `50`-row updated relations improved from `47/50` to `48/50`
+    - `100`-row updated relations improved from `95/100` to `96/100`
+    - evaluation metrics stayed effectively flat:
+      - `50`-row top-1 label-in-gold `0.3800`, exact label-set `0.1000`
+      - `100`-row top-1 label-in-gold `0.3800`, exact label-set `0.0800`
+- Inspected the remaining failed raw stage-2 responses on the `100`-row pilot:
+  - parser/merge-safe salvage fixed cases like:
+    - `headquartered in`
+    - truncated `instance of`
+  - the residual bad labels were true semantic drifts such as:
+    - `city`
+    - `single`
+    - `nickname`
+- Rebuilt the stage-2 prompt with explicit anti-drift wording and retried only the three failing candidates:
+  - `julia --project=. scripts/build_rebel_relation_label_requests.jl --requests /tmp/rebel_teacher_requests_native_compact_notitle_100_noschema.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_100_noschema_relfirst.jsonl --output /tmp/rebel_relation_label_requests_100_noschema_v2.jsonl`
+  - generated retry-only labels for:
+    - `docid:158185-3#rel1`
+    - `docid:172898-1#rel1`
+    - `docid:47862814-3#rel1`
+  - retry outcome:
+    - `city -> country`
+    - `nickname -> country`
+    - `single` remained unresolved
+- Merged the retry outputs back into the `100`-row label file:
+  - updated relations improved again from `96/100` to `98/100`
+  - final merged `100`-row metrics remained:
+    - top-1 label-in-gold `0.3800`
+    - exact label-set match `0.0800`
+
+### Best Current Recommendation
+- Keep the promoted no-schema two-stage path unchanged as the main pilot:
+  - stage 1: compact no-title no-schema relation-first extraction
+  - stage 2: native relabeling with glossed choices
+- The remaining relabel misses are no longer a blocking infrastructure issue.
+- They are now a narrow semantic-control issue at the label-choice stage.
+
+### Unresolved Issues
+- A very small residual tail remains even after safe salvage and targeted retry.
+- The dominant remaining hard failure mode is free-form type/category output, especially cases like `single`, that do not map cleanly onto an allowed relation gloss.
+- Fixing the residual tail alone is unlikely to move the global pilot metrics much unless it comes with better semantic accuracy overall.
+
+### Next Actions
+- Prefer improving stage-2 semantic choice quality over adding more merge-side heuristics.
+- Run a sampled-vs-greedy stage-2 comparison on the promoted no-schema path and measure whether the `0.3800` top-1 rate can move without losing the `100/100` non-empty stage-1 property.
+- If sampling does not improve the label metrics, proceed to building the first larger no-schema two-stage native teacher corpus and use that path for distillation experiments.
+
+## 2026-03-16 — Sampled Stage-2 Comparison
+
+### Objectives
+- Compare greedy vs sampled stage-2 relabeling on the promoted `100`-row no-schema stack.
+- Check whether extra decode entropy improves label accuracy or only increases off-target continuation text.
+- Harden the merge step against malformed sampled payloads if needed.
+
+### Changes Saved
+- Updated [`scripts/apply_rebel_relation_label_selections.jl`](/home/christos/code/julia/Swamma/scripts/apply_rebel_relation_label_selections.jl):
+  - merge no longer crashes when a sampled row contains malformed JSON
+  - it now falls back cleanly from failed `JSON3.read(...)` to direct `"label"` extraction
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the greedy-vs-sampled outcome.
+
+### Experiment Commands And Key Metrics
+- Ran sampled stage-2 relabeling on the promoted `100`-row no-schema request set:
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_relation_label_requests_100_noschema_v2.jsonl --output /tmp/rebel_relation_label_raw_100_noschema_sampled_t07_p09.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --overwrite --max-rows 100 --max-input-tokens 512 --max-new-tokens 128 --response-prefix '{"label":"' --dtype float32 --plain-prompt --verbose --allow-non-json --disable-stop-on-complete-json --do-sample --temperature 0.7 --top-p 0.9 --seed 42`
+  - generation result:
+    - accepted `100/100`
+    - failed `0/100`
+    - several rows emitted much longer suffixes than greedy (`8` rows over `120` chars)
+- First merge attempt exposed a robustness bug:
+  - one sampled response contained malformed JSON-like text
+  - the merge script crashed while trying to parse it as a JSON object
+- After hardening the merge path, sampled merge completed successfully:
+  - `julia --project=. scripts/apply_rebel_relation_label_selections.jl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_100_noschema_relfirst.jsonl --selections /tmp/rebel_relation_label_raw_100_noschema_sampled_t07_p09.jsonl --output /tmp/rebel_teacher_parsed_native_compact_notitle_100_noschema_relfirst_relabel2stage_sampled_t07_p09.jsonl --response-prefix '{"label":"'`
+  - updated relations `100/100`
+- Sampled evaluation:
+  - `julia --project=. scripts/evaluate_rebel_teacher_pilot.jl --gold data/rebel/train.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_100_noschema_relfirst_relabel2stage_sampled_t07_p09.jsonl --max-rows 100`
+  - result:
+    - matched rows `100`
+    - non-empty rows `100`
+    - predicted relations `100`
+    - top-1 label in gold `0.2700`
+    - exact label-set match `0.0600`
+- Greedy baseline for the same stack remained better:
+  - matched rows `100`
+  - non-empty rows `100`
+  - predicted relations `100`
+  - top-1 label in gold `0.3800`
+  - exact label-set match `0.0800`
+
+### Best Current Recommendation
+- Keep greedy stage-2 relabeling as the default on the promoted no-schema stack.
+- Sampling is not the right next lever:
+  - it preserves coverage
+  - it increases verbose off-target continuations
+  - it reduces semantic accuracy on the tested `100`-row shard
+
+### Unresolved Issues
+- The stage-2 model still drifts into verbose explanations or loosely related label choices under higher decode entropy.
+- The main remaining issue is semantic label choice quality, not structural acceptance or merge robustness.
+
+### Next Actions
+- Stop spending time on generic sampling sweeps for the current stage-2 relabel path.
+- Use the greedy no-schema two-stage pipeline as the current production candidate for the first larger native teacher corpus.
+- If label quality still needs improvement after a larger corpus pilot, move to stronger semantic control rather than sampling:
+  - constrained reranking against allowed glosses
+  - or another explicit label-choice scoring step
+
+## 2026-03-16 — 250-Row Gate And Full-Corpus Launch
+
+### Objectives
+- Stop drifting on pilot-scale decode tweaks and force a concrete step toward training.
+- Validate the greedy no-schema two-stage pipeline on a materially larger `250`-row shard.
+- If the `250`-row gate is good enough, freeze the recipe and launch full-train stage-1 corpus generation.
+
+### Changes Saved
+- No new model-logic changes in this segment.
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md) with the `250`-row gate results and the explicit corpus-to-training sequence.
+
+### Experiment Commands And Key Metrics
+- Built the `250`-row no-schema request shard:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_250_noschema.jsonl --max-rows 250 --prompt-style compact --no-title --no-schema --relation-label-mode id`
+- Extended stage 1 from the validated `100`-row seed:
+  - `cp /tmp/rebel_teacher_raw_native_compact_notitle_100_noschema_relfirst.jsonl /tmp/rebel_teacher_raw_native_compact_notitle_250_noschema_relfirst.jsonl`
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_250_noschema.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_250_noschema_relfirst.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --resume --max-rows 250 --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 4`
+  - stage-1 result:
+    - resumed extension `150/150` accepted
+    - full shard `250/250` matched
+    - `250/250` non-empty rows
+    - top-1 label in gold `0.1400`
+    - exact label-set match `0.0320`
+- Extended greedy stage 2 from the repaired `100`-row seed:
+  - `julia --project=. scripts/build_rebel_relation_label_requests.jl --requests /tmp/rebel_teacher_requests_native_compact_notitle_250_noschema.jsonl --teacher /tmp/rebel_teacher_parsed_native_compact_notitle_250_noschema_relfirst.jsonl --output /tmp/rebel_relation_label_requests_250_noschema.jsonl`
+  - `cp /tmp/rebel_relation_label_raw_100_noschema_mergedretry.jsonl /tmp/rebel_relation_label_raw_250_noschema.jsonl`
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_relation_label_requests_250_noschema.jsonl --output /tmp/rebel_relation_label_raw_250_noschema.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --resume --max-rows 250 --max-input-tokens 512 --max-new-tokens 128 --response-prefix '{"label":"' --dtype float32 --plain-prompt --verbose --allow-non-json --disable-stop-on-complete-json`
+  - merge/eval:
+    - updated relations `245/250`
+    - matched rows `250`
+    - non-empty rows `250`
+    - predicted relations `250`
+    - top-1 label in gold `0.3480`
+    - exact label-set match `0.1000`
+
+### Best Current Recommendation
+- Freeze the current recipe and step into corpus production:
+  - stage 1: compact no-title no-schema relation-first generation
+  - stage 2: greedy relabel with glossed natural-language choices
+- The `250`-row gate is good enough to stop more pilot-only drift:
+  - full coverage survived
+  - stage-2 semantic quality stayed in the same regime as the successful smaller pilots
+
+### Concrete Step Toward Training
+- Built the full-train no-schema request corpus:
+  - `julia --project=. scripts/build_rebel_teacher_requests.jl --input data/rebel/train.jsonl --output /tmp/rebel_teacher_requests_native_compact_notitle_full_noschema.jsonl --prompt-style compact --no-title --no-schema --relation-label-mode id`
+- Launched full-train stage-1 generation from the validated `250`-row seed:
+  - `cp /tmp/rebel_teacher_raw_native_compact_notitle_250_noschema_relfirst.jsonl /tmp/rebel_teacher_raw_native_compact_notitle_full_noschema_relfirst.jsonl`
+  - `julia --project=. scripts/generate_rebel_teacher_responses_native.jl --input /tmp/rebel_teacher_requests_native_compact_notitle_full_noschema.jsonl --output /tmp/rebel_teacher_raw_native_compact_notitle_full_noschema_relfirst.jsonl --teacher-model ibm-granite/granite-4.0-micro --local-files-only --resume --max-input-tokens 512 --max-new-tokens 256 --response-prefix '{"entities":[],"relations":[{"head_start":' --dtype float32 --plain-prompt --verbose --max-entities-hint 6 --max-relations-hint 6`
+  - confirmed live progress reached row `251` in this session
+
+### Unresolved Issues
+- Full-train stage-1 generation is still in progress.
+- Full-train stage-2 relabel has not started yet because it depends on the completed stage-1 raw corpus.
+- Distillation training has not started yet; this segment was the freeze-and-launch step that makes it the next concrete action instead of another research branch.
+
+### Next Actions
+- Let full-train stage-1 generation complete.
+- Run full-train greedy stage-2 relabel on the completed raw corpus.
+- Merge the resulting teacher annotations back into the REDFM train split.
+- Start the first matched-budget `base` vs `distill` training comparison on that merged corpus.
+
+## 2026-03-16 — CLAUDE.md Drift Cleanup
+
+### Objectives
+- Bring [`CLAUDE.md`](/home/christos/code/julia/Swamma/CLAUDE.md) back in line with the current repository structure and active workflows.
+- Remove stale references to the old `Samba2` / OSSM-only layout and the obsolete autonomous single-task training directive.
+
+### Changes Saved
+- Rewrote [`CLAUDE.md`](/home/christos/code/julia/Swamma/CLAUDE.md) to reflect the current `Swamma` codebase.
+- Updated the guide to describe the active model surfaces:
+  - core `Swamma` block/classifier stack
+  - `SwammaNER`
+  - relation extraction
+  - `LLaDA`
+  - drafter / TiDAR / MoET research paths
+  - serving / monitoring modules
+- Replaced outdated file references such as `src/attention.jl` and `src/ossm.jl` with the actual current source map.
+- Replaced the stale "autonomous GPU training mode" section with current test-lane commands, common entry-point scripts, and repo-specific documentation expectations.
+
+### Experiment Commands And Key Metrics
+- Inspected current repo state and doc targets:
+  - `git status --short`
+  - `sed -n '1,240p' CLAUDE.md`
+  - `sed -n '1,260p' README.md`
+  - `sed -n '1,220p' Project.toml`
+  - `sed -n '1,260p' src/Swamma.jl`
+  - `sed -n '1,220p' test/runtests.jl`
+  - `sed -n '1,220p' docs/CI.md`
+  - `rg --files configs`
+- Validation:
+  - `git diff -- CLAUDE.md`
+- Key metrics:
+  - no model training or benchmark runs in this session
+  - no tests run because the change was documentation-only
+
+### Best Current Checkpoint/Config Recommendation
+- No checkpoint or config recommendation changed in this session.
+- Treat this as a documentation-alignment cleanup only.
+
+### Unresolved Issues And Next Actions
+- `CLAUDE.md` is now aligned at a high level, but it may need periodic refreshes as the active RE and distillation workflows keep moving.
+- Next actions:
+  - keep `CLAUDE.md` aligned with promoted workflows in [`README.md`](/home/christos/code/julia/Swamma/README.md)
+  - update it again whenever a major entry point, canonical naming convention, or test-lane policy changes
+
+## 2026-03-16 — CLAUDE.md Minimal Trim
+
+### Objectives
+- Remove unnecessary detail from [`CLAUDE.md`](/home/christos/code/julia/Swamma/CLAUDE.md) after the larger drift cleanup.
+- Keep only the repository-specific guidance that is still useful during coding sessions.
+
+### Changes Saved
+- Trimmed [`CLAUDE.md`](/home/christos/code/julia/Swamma/CLAUDE.md) to a smaller set of instructions.
+- Removed sections that mostly duplicated `README.md`:
+  - detailed source map
+  - long active-surface inventory
+  - explicit script entry-point examples
+- Kept only the high-signal repo rules:
+  - canonical naming
+  - avoid old `Samba2` / `ossm` references
+  - repo is not NER-only
+  - `scripts/train_re_gpu.jl` is the active RE control surface
+  - test-lane reminders
+  - mandatory session report requirement
+
+### Experiment Commands And Key Metrics
+- Inspected current doc state:
+  - `sed -n '1,240p' CLAUDE.md`
+  - `tail -n 80 docs/SESSION_REPORT.md`
+- Validation:
+  - diff reviewed after trimming
+- Key metrics:
+  - no tests run because the change was documentation-only
+  - no training or benchmark runs in this session
+
+### Best Current Checkpoint/Config Recommendation
+- No checkpoint or config recommendation changed in this session.
+
+### Unresolved Issues And Next Actions
+- `CLAUDE.md` is now intentionally minimal, so future additions should stay limited to repo-specific rules rather than general project description.
+- Next actions:
+  - only add new entries to `CLAUDE.md` when they encode stable guidance not already covered by `README.md`
+
+## 2026-03-16 — External Tool Install (Winx And DOMShell)
+
+### Objectives
+- Install the external repositories requested by the user:
+  - `gabrielmaialva33/winx-code-agent`
+  - `apireno/DOMShell`
+- Verify whether they could be installed as Codex skills or needed a source install instead.
+
+### Changes Saved
+- No project code changed for the tool installs.
+- Installed source checkouts under:
+  - `/home/christos/.local/src/winx-code-agent`
+  - `/home/christos/.local/src/DOMShell`
+- Built `winx-code-agent` from source and linked the binary at:
+  - `/home/christos/.local/bin/winx-code-agent`
+- Built the DOMShell extension bundle under:
+  - `/home/christos/.local/src/DOMShell/dist`
+
+### Experiment Commands And Key Metrics
+- Verified the two GitHub repos do not expose Codex skill folders with `SKILL.md`, so they were not installable through the skill installer as skills.
+- Installed and built Winx:
+  - `git clone https://github.com/gabrielmaialva33/winx-code-agent.git /home/christos/.local/src/winx-code-agent`
+  - `cargo build --release`
+  - `ln -sf /home/christos/.local/src/winx-code-agent/target/release/winx-code-agent /home/christos/.local/bin/winx-code-agent`
+  - verification:
+    - `/home/christos/.local/bin/winx-code-agent --help`
+  - result:
+    - release build completed successfully in `53.31s`
+    - binary is callable and reports `serve` as its main command
+- Installed and built DOMShell:
+  - `git clone https://github.com/apireno/DOMShell.git /home/christos/.local/src/DOMShell`
+  - `npm install`
+  - `npm run build`
+  - verification:
+    - inspected `/home/christos/.local/src/DOMShell/dist`
+  - result:
+    - production bundle built successfully
+    - emitted extension artifacts including `manifest.json`, `background.js`, and `sidepanel.html`
+    - `npm install` reported `1` high-severity upstream vulnerability in the dependency tree
+
+### Best Current Checkpoint/Config Recommendation
+- No model checkpoint or training config recommendation changed in this session.
+
+### Unresolved Issues And Next Actions
+- These repositories are installed as local source trees, not as Codex skills.
+- DOMShell still requires browser-side manual setup to become active:
+  - load `/home/christos/.local/src/DOMShell/dist` as an unpacked Chrome extension, or install from the Chrome Web Store
+- Winx is built locally, but MCP client integration is still manual if the user wants it added to a Claude Desktop or other MCP config.

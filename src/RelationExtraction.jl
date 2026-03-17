@@ -10,6 +10,7 @@ import CUDA
 import ChainRulesCore
 
 import ..Swamma: SwammaBlock, SwammaBlockConfig, LocalWaveRefinementBlock, LinearLocalRefinementBlock, LuxLayer, sinkhorn_bistochastic
+import ..Swamma.DeepScaling: HierarchicalFrequencyConfig, compute_layer_frequencies
 
 detach_constant(x) = ChainRulesCore.ignore_derivatives() do
     x
@@ -81,6 +82,12 @@ Base.@kwdef struct RelationExtractionConfig
     span_context_layers::Int = 0
     span_context_neighbor_radius::Int = 1
     span_context_topk::Int = 4
+    # Hierarchical per-layer wave-gate frequencies
+    use_hierarchical_frequencies::Bool = false
+    hierarchical_freq_base_min::Float32 = 0.005f0
+    hierarchical_freq_base_max::Float32 = 50.0f0
+    hierarchical_freq_decay_rate::Float32 = 3.0f0
+    hierarchical_freq_scaling::Symbol = :exponential
 end
 
 struct PairRetrievalHead{HP,TP,DE,FP,OP} <: LuxLayer
@@ -418,6 +425,16 @@ struct EvidenceAwareRelationDecoderHead{BH,PP,GP} <: LuxLayer
     GateProjection::GP
 end
 
+struct PairOnlyRelationDecoderHead{PP} <: LuxLayer
+    num_relations::Int
+    PairProjection::PP
+end
+
+struct PairEvidenceOnlyRelationDecoderHead{PP} <: LuxLayer
+    num_relations::Int
+    PairProjection::PP
+end
+
 function EvidenceAwareRelationDecoderHead(
     embedding_dimension::Int,
     num_relations::Int;
@@ -563,6 +580,72 @@ function (layer::FusedRelationDecoderHead)(inputs::Tuple, params, state)
         GateProjection = gate_state,
     )
     return fused_logits, new_state
+end
+
+function PairOnlyRelationDecoderHead(
+    embedding_dimension::Int,
+    num_relations::Int,
+)
+    hidden_dim = max(embedding_dimension, 1)
+    return PairOnlyRelationDecoderHead(
+        num_relations,
+        Lux.Chain(
+            Lux.LayerNorm((4 * embedding_dimension + 1,)),
+            Lux.Dense(4 * embedding_dimension + 1 => hidden_dim, gelu; use_bias = false),
+            Lux.Dense(hidden_dim => num_relations; use_bias = false),
+        ),
+    )
+end
+
+function Lux.initialparameters(rng::Random.AbstractRNG, layer::PairOnlyRelationDecoderHead)
+    return (PairProjection = Lux.initialparameters(rng, layer.PairProjection),)
+end
+
+function Lux.initialstates(rng::Random.AbstractRNG, layer::PairOnlyRelationDecoderHead)
+    return (PairProjection = Lux.initialstates(rng, layer.PairProjection),)
+end
+
+function (layer::PairOnlyRelationDecoderHead)(inputs::Tuple, params, state)
+    _, _, pair_features, retrieval_logits = inputs
+    logits, pair_state = layer.PairProjection(
+        vcat(pair_features, retrieval_logits),
+        params.PairProjection,
+        state.PairProjection,
+    )
+    return logits, (PairProjection = pair_state,)
+end
+
+function PairEvidenceOnlyRelationDecoderHead(
+    embedding_dimension::Int,
+    num_relations::Int,
+)
+    hidden_dim = max(embedding_dimension, 1)
+    return PairEvidenceOnlyRelationDecoderHead(
+        num_relations,
+        Lux.Chain(
+            Lux.LayerNorm((5 * embedding_dimension + 1,)),
+            Lux.Dense(5 * embedding_dimension + 1 => hidden_dim, gelu; use_bias = false),
+            Lux.Dense(hidden_dim => num_relations; use_bias = false),
+        ),
+    )
+end
+
+function Lux.initialparameters(rng::Random.AbstractRNG, layer::PairEvidenceOnlyRelationDecoderHead)
+    return (PairProjection = Lux.initialparameters(rng, layer.PairProjection),)
+end
+
+function Lux.initialstates(rng::Random.AbstractRNG, layer::PairEvidenceOnlyRelationDecoderHead)
+    return (PairProjection = Lux.initialstates(rng, layer.PairProjection),)
+end
+
+function (layer::PairEvidenceOnlyRelationDecoderHead)(inputs::Tuple, params, state)
+    _, _, pair_features, evidence_summary, retrieval_logits = inputs
+    logits, pair_state = layer.PairProjection(
+        vcat(pair_features, evidence_summary, retrieval_logits),
+        params.PairProjection,
+        state.PairProjection,
+    )
+    return logits, (PairProjection = pair_state,)
 end
 
 struct SparsePairProposalHead{HP,TP,BP} <: LuxLayer
@@ -823,6 +906,15 @@ function load_relation_extraction_config(path::String)::RelationExtractionConfig
             raw isa Symbol ? raw : Symbol(raw)
         end,
         mention_score_learned_weight = Float32(get(relation, "mention_score_learned_weight", 0.25)),
+        # Hierarchical per-layer wave-gate frequencies
+        use_hierarchical_frequencies = get(osc, "use_hierarchical_frequencies", false),
+        hierarchical_freq_base_min = Float32(get(osc, "hierarchical_base_min", 0.005)),
+        hierarchical_freq_base_max = Float32(get(osc, "hierarchical_base_max", 50.0)),
+        hierarchical_freq_decay_rate = Float32(get(osc, "hierarchical_decay_rate", 3.0)),
+        hierarchical_freq_scaling = begin
+            raw = get(osc, "hierarchical_scaling", "exponential")
+            raw isa Symbol ? raw : Symbol(raw)
+        end,
     )
 end
 
@@ -943,28 +1035,45 @@ function SwammaRelationExtractor(config::RelationExtractionConfig)
         throw(ArgumentError("This mHC implementation currently supports hyper_connection_width = 2."))
     end
 
-    block_config = SwammaBlockConfig(
-        embedding_dimension = config.embedding_dimension,
-        sequence_length = config.max_sequence_length,
-        number_of_heads = config.number_of_heads,
-        time_dimension = config.time_dimension,
-        state_dimension = state_dimension,
-        window_size = config.window_size,
-        local_operator = config.local_operator,
-        residual_mode = :plain,
-        min_frequency = config.min_frequency,
-        max_frequency = config.max_frequency,
-        default_time_step = config.default_time_step,
-        dropout_rate = config.dropout_rate,
-        use_ffn = config.use_ffn,
-        ffn_expansion = config.ffn_expansion,
-        use_output_projection = config.use_output_projection,
-        use_parallel_scan = config.use_parallel_scan,
-        parallel_chunk_size = config.parallel_chunk_size,
-        use_vector_gains = config.use_vector_gains,
-        use_per_head_alpha = config.use_per_head_alpha,
-        use_branch_projections = config.use_branch_projections,
-    )
+    # Build per-layer frequency ranges (hierarchical or uniform)
+    freq_config = config.use_hierarchical_frequencies ?
+        HierarchicalFrequencyConfig(
+            base_min_freq = config.hierarchical_freq_base_min,
+            base_max_freq = config.hierarchical_freq_base_max,
+            decay_rate = config.hierarchical_freq_decay_rate,
+            scaling_type = config.hierarchical_freq_scaling,
+        ) : nothing
+
+    function layer_block_config(layer_idx::Int)
+        min_f, max_f = if freq_config !== nothing
+            compute_layer_frequencies(layer_idx, config.number_of_layers, freq_config)
+        else
+            (config.min_frequency, config.max_frequency)
+        end
+        return SwammaBlockConfig(
+            embedding_dimension = config.embedding_dimension,
+            sequence_length = config.max_sequence_length,
+            number_of_heads = config.number_of_heads,
+            time_dimension = config.time_dimension,
+            state_dimension = state_dimension,
+            window_size = config.window_size,
+            local_operator = config.local_operator,
+            residual_mode = :plain,
+            min_frequency = min_f,
+            max_frequency = max_f,
+            default_time_step = config.default_time_step,
+            dropout_rate = config.dropout_rate,
+            use_ffn = config.use_ffn,
+            ffn_expansion = config.ffn_expansion,
+            use_output_projection = config.use_output_projection,
+            use_parallel_scan = config.use_parallel_scan,
+            parallel_chunk_size = config.parallel_chunk_size,
+            use_vector_gains = config.use_vector_gains,
+            use_per_head_alpha = config.use_per_head_alpha,
+            use_branch_projections = config.use_branch_projections,
+        )
+    end
+
     local_wave_positions = config.use_interleaved_local_wave ?
         Set(interleaved_local_wave_positions(config.number_of_layers, config.local_wave_ratio)) :
         Set{Int}()
@@ -998,7 +1107,7 @@ function SwammaRelationExtractor(config::RelationExtractionConfig)
                 throw(ArgumentError("Unsupported interleaved_block_type=$(repr(config.interleaved_block_type))."))
             end
         else
-            SwammaBlock(block_config)
+            SwammaBlock(layer_block_config(i))
         end
         for i in 1:config.number_of_layers
     ])
@@ -1132,14 +1241,30 @@ function SwammaRelationExtractor(config::RelationExtractionConfig)
                     rank = min(config.biaffine_rank, d),
                     residual_scale = config.relation_decoder_residual_scale,
                 )
+            elseif config.relation_decoder_mode == :pair_mlp
+                PairOnlyRelationDecoderHead(
+                    d,
+                    config.num_relations,
+                )
+            elseif config.relation_decoder_mode == :pair_evidence_mlp
+                PairEvidenceOnlyRelationDecoderHead(
+                    d,
+                    config.num_relations,
+                )
             else
                 throw(ArgumentError(
-                    "Unsupported relation_decoder_mode=$(repr(config.relation_decoder_mode)). Expected :biaffine, :fused_residual, or :fused_evidence."
+                    "Unsupported relation_decoder_mode=$(repr(config.relation_decoder_mode)). Expected :biaffine, :fused_residual, :fused_evidence, :pair_mlp, or :pair_evidence_mlp."
                 ))
             end
         end,
         begin
-            confidence_input_dim = config.relation_decoder_mode == :fused_evidence ? 5 * d + 1 : 4 * d
+            confidence_input_dim = if config.relation_decoder_mode in (:fused_evidence, :pair_evidence_mlp)
+                5 * d + 1
+            elseif config.relation_decoder_mode == :pair_mlp
+                4 * d + 1
+            else
+                4 * d
+            end
             Lux.Chain(
                 Lux.LayerNorm((confidence_input_dim,)),
                 Lux.Dense(confidence_input_dim => d ÷ 2, gelu; use_bias = false),
@@ -2844,7 +2969,7 @@ function (model::SwammaRelationExtractor)(inputs::NamedTuple, params, state)
     evidence_attention_max_weight = evidence_outputs.attention_max_weight
     evidence_summary_flat = reshape(evidence_summary, d, :)
 
-    relation_logits_flat, relation_state = if model.relation_decoder_mode == :fused_evidence
+    relation_logits_flat, relation_state = if model.relation_decoder_mode in (:fused_evidence, :pair_evidence_mlp)
         model.RelationHead(
             (
                 head_vectors,
@@ -2868,8 +2993,10 @@ function (model::SwammaRelationExtractor)(inputs::NamedTuple, params, state)
             state.RelationHead,
         )
     end
-    confidence_inputs = if model.relation_decoder_mode == :fused_evidence
+    confidence_inputs = if model.relation_decoder_mode in (:fused_evidence, :pair_evidence_mlp)
         vcat(pair_features, evidence_summary_flat, retrieval_flat)
+    elseif model.relation_decoder_mode == :pair_mlp
+        vcat(pair_features, retrieval_flat)
     else
         pair_features
     end
@@ -2978,7 +3105,18 @@ function ChainRulesCore.rrule(::typeof(boundary_bce), logits, targets; ignore_in
     return value, boundary_bce_pullback
 end
 
-function relation_cross_entropy(logits, labels, mask; ignore_index::Int = -100, null_relation_weight::Float32 = 1.0f0)
+function relation_cross_entropy(
+    logits,
+    labels,
+    mask;
+    ignore_index::Int = -100,
+    null_relation_weight::Float32 = 1.0f0,
+    positive_relation_weight::Float32 = 1.0f0,
+    no_relation_id::Int = 1,
+    focal_gamma::Float32 = 0.0f0,
+    logit_adjustment_tau::Float32 = 0.0f0,
+    logit_adjustment::Union{Nothing,AbstractVector} = nothing,
+)
     num_relations = size(logits, 1)
     logits_flat = reshape(logits, num_relations, :)
     labels_flat = vec(detach_constant(labels))
@@ -2986,15 +3124,31 @@ function relation_cross_entropy(logits, labels, mask; ignore_index::Int = -100, 
     valid_mask = mask_flat .& (labels_flat .!= ignore_index)
     valid_count = Int(sum(valid_mask))
     valid_count == 0 && return 0.0f0
-    log_probs = NNlib.logsoftmax(logits_flat, dims=1)
+    adjusted_logits = logits_flat
+    if logit_adjustment_tau > 0.0f0 && logit_adjustment !== nothing
+        length(logit_adjustment) == num_relations ||
+            error("logit_adjustment length $(length(logit_adjustment)) does not match num_relations $(num_relations)")
+        adjustment = reshape(Float32.(logit_adjustment), :, 1)
+        if logits_flat isa CUDA.CuArray && !(adjustment isa CUDA.CuArray)
+            adjustment = CUDA.CuArray(adjustment)
+        end
+        adjusted_logits = logits_flat .- logit_adjustment_tau .* adjustment
+    end
+    log_probs = NNlib.logsoftmax(adjusted_logits, dims=1)
     safe_labels = clamp.(labels_flat, 1, num_relations)
     label_ids = reshape(collect(1:num_relations), :, 1)
     if logits_flat isa CUDA.CuArray
         label_ids = CUDA.CuArray(label_ids)
     end
     selected = sum(log_probs .* (label_ids .== reshape(safe_labels, 1, :)), dims = 1)
-    weights = Float32.(valid_mask) .* ifelse.(safe_labels .== 1, null_relation_weight, 1.0f0)
-    total = -sum(vec(selected) .* weights)
+    weights = Float32.(valid_mask) .* ifelse.(safe_labels .== no_relation_id, null_relation_weight, positive_relation_weight)
+    focal_factor = if focal_gamma > 0.0f0
+        pt = exp.(selected)
+        (1.0f0 .- pt) .^ focal_gamma
+    else
+        (selected .* 0.0f0) .+ 1.0f0
+    end
+    total = -sum(vec(selected .* focal_factor) .* weights)
     total_weight = sum(weights)
     return total_weight > 0 ? total / total_weight : 0.0f0
 end
@@ -3244,6 +3398,69 @@ function sample_negative_pairs!(
     return pair_idx
 end
 
+@inline function normalize_rebel_span_indices(start_raw::Int, stop_raw::Int, limit::Int)
+    offset = (start_raw == 0 || stop_raw == 0) ? 1 : 0
+    start_idx = clamp(start_raw + offset, 1, limit)
+    stop_idx = clamp(stop_raw + offset, start_idx, limit)
+    return start_idx, stop_idx
+end
+
+function relation_endpoint_span(rel, prefix::Symbol, seq_len::Int)
+    seq_len > 0 || return nothing
+    start_key = Symbol(String(prefix) * "_start")
+    stop_key = Symbol(String(prefix) * "_stop")
+    end_key = Symbol(String(prefix) * "_end")
+    span_key = Symbol(String(prefix) * "_span")
+
+    if haskey(rel, start_key)
+        start_raw = Int(rel[start_key])
+        stop_raw = if haskey(rel, stop_key)
+            Int(rel[stop_key])
+        elseif haskey(rel, end_key)
+            Int(rel[end_key])
+        else
+            start_raw
+        end
+        return normalize_rebel_span_indices(start_raw, stop_raw, seq_len)
+    elseif haskey(rel, span_key)
+        span = rel[span_key]
+        start_raw = Int(getproperty(span, :start))
+        stop_raw = if haskey(span, :stop)
+            Int(span[:stop])
+        elseif haskey(span, :end)
+            Int(span[:end])
+        elseif haskey(span, :end_)
+            Int(span[:end_])
+        else
+            start_raw
+        end
+        return normalize_rebel_span_indices(start_raw, stop_raw, seq_len)
+    end
+
+    return nothing
+end
+
+function resolve_teacher_relation_pair(
+    rel,
+    entity_count::Int,
+    seq_len::Int,
+    span_to_entity_index::Dict{Tuple{Int,Int},Int},
+)
+    head_span = relation_endpoint_span(rel, :head, seq_len)
+    tail_span = relation_endpoint_span(rel, :tail, seq_len)
+    if head_span !== nothing || tail_span !== nothing
+        head_span === nothing && return 0, 0
+        tail_span === nothing && return 0, 0
+        return get(span_to_entity_index, head_span, 0), get(span_to_entity_index, tail_span, 0)
+    end
+
+    entity_count > 0 || return 0, 0
+    head_raw = Int(rel.head)
+    tail_raw = Int(rel.tail)
+    offset = (head_raw == 0 || tail_raw == 0) ? 1 : 0
+    return head_raw + offset, tail_raw + offset
+end
+
 function prepare_rebel_batch(
     rows,
     vocab::Dict{String, Int},
@@ -3265,13 +3482,20 @@ function prepare_rebel_batch(
     boundary_labels = fill(-100, 2, max_len, batch_size)
     spans = zeros(Int, 2, max_candidate_spans, batch_size)
     span_mask = falses(max_candidate_spans, batch_size)
+    span_supervision_mask = falses(max_candidate_spans, batch_size)
     mention_spans = zeros(Int, 2, max_candidate_spans, batch_size)
     mention_mask = falses(max_candidate_spans, batch_size)
     mention_labels = zeros(Float32, max_candidate_spans, batch_size)
     relation_pairs = zeros(Int, 2, max_candidate_pairs, batch_size)
     relation_labels = fill(-100, max_candidate_pairs, batch_size)
     relation_mask = falses(max_candidate_pairs, batch_size)
+    relation_supervision_mask = falses(max_candidate_pairs, batch_size)
     relation_targets = zeros(Float32, max_candidate_pairs, batch_size)
+    teacher_entity_labels = fill(-100, max_len, batch_size)
+    teacher_relation_labels = fill(-100, max_candidate_pairs, batch_size)
+    teacher_relation_mask = falses(max_candidate_pairs, batch_size)
+    teacher_confidence_targets = zeros(Float32, max_candidate_pairs, batch_size)
+    teacher_confidence_mask = falses(max_candidate_pairs, batch_size)
     no_relation_id = get(relation_label_to_id, "NO_RELATION", 1)
 
     for (b, row) in enumerate(rows)
@@ -3295,13 +3519,12 @@ function prepare_rebel_batch(
 
         entities = haskey(row, :entities) ? collect(row.entities) : Any[]
         positive_mentions = Tuple{Int, Int}[]
+        span_to_entity_index = Dict{Tuple{Int,Int},Int}()
         for (i, entity) in enumerate(entities)
             i > max_candidate_spans && break
             start_raw = Int(entity.start)
             stop_raw = entity_span_end(entity)
-            offset = start_raw == 0 || stop_raw == 0 ? 1 : 0
-            start_idx = clamp(start_raw + offset, 1, seq_len)
-            stop_idx = clamp(stop_raw + offset, start_idx, seq_len)
+            start_idx, stop_idx = normalize_rebel_span_indices(start_raw, stop_raw, seq_len)
             label = uppercase(String(entity.label))
             entity_labels[start_idx, b] = entity_label_to_id["B-$label"]
             for pos in (start_idx + 1):stop_idx
@@ -3312,11 +3535,13 @@ function prepare_rebel_batch(
             spans[1, i, b] = start_idx
             spans[2, i, b] = stop_idx
             span_mask[i, b] = true
+            span_supervision_mask[i, b] = true
             mention_spans[1, i, b] = start_idx
             mention_spans[2, i, b] = stop_idx
             mention_mask[i, b] = true
             mention_labels[i, b] = 1.0f0
             push!(positive_mentions, (start_idx, stop_idx))
+            span_to_entity_index[(start_idx, stop_idx)] = i
         end
 
         positive_mention_set = Set(positive_mentions)
@@ -3342,6 +3567,36 @@ function prepare_rebel_batch(
                     mention_spans[1, mention_idx, b] = start_idx
                     mention_spans[2, mention_idx, b] = stop_idx
                     mention_mask[mention_idx, b] = true
+                end
+            end
+        end
+
+        if haskey(row, :teacher_entities)
+            teacher_entities = collect(row.teacher_entities)
+            teacher_entity_labels[1:seq_len, b] .= entity_label_to_id["O"]
+            for entity in teacher_entities
+                start_raw = Int(entity.start)
+                stop_raw = entity_span_end(entity)
+                start_idx, stop_idx = normalize_rebel_span_indices(start_raw, stop_raw, seq_len)
+                label = uppercase(String(entity.label))
+                b_label = "B-$label"
+                i_label = "I-$label"
+                haskey(entity_label_to_id, b_label) || continue
+                haskey(entity_label_to_id, i_label) || continue
+                teacher_entity_labels[start_idx, b] = entity_label_to_id[b_label]
+                for pos in (start_idx + 1):stop_idx
+                    teacher_entity_labels[pos, b] = entity_label_to_id[i_label]
+                end
+                span = (start_idx, stop_idx)
+                if !haskey(span_to_entity_index, span)
+                    next_idx = findfirst(!, @view(span_mask[:, b]))
+                    if next_idx !== nothing
+                        idx = next_idx::Int
+                        spans[1, idx, b] = start_idx
+                        spans[2, idx, b] = stop_idx
+                        span_mask[idx, b] = true
+                        span_to_entity_index[span] = idx
+                    end
                 end
             end
         end
@@ -3396,6 +3651,61 @@ function prepare_rebel_batch(
                 rng,
             )
         end
+        relation_supervision_mask[:, b] .= relation_mask[:, b]
+
+        if haskey(row, :teacher_relations)
+            teacher_relations = collect(row.teacher_relations)
+            if !isempty(teacher_relations)
+                pair_to_index = Dict{Tuple{Int,Int},Int}()
+                for idx in 1:max_candidate_pairs
+                    relation_mask[idx, b] || continue
+                    head_idx = relation_pairs[1, idx, b]
+                    tail_idx = relation_pairs[2, idx, b]
+                    pair_to_index[(head_idx, tail_idx)] = idx
+                    teacher_relation_labels[idx, b] = no_relation_id
+                    teacher_relation_mask[idx, b] = true
+                    teacher_confidence_targets[idx, b] = 0.0f0
+                    teacher_confidence_mask[idx, b] = true
+                end
+
+                for rel in teacher_relations
+                    head_idx, tail_idx = resolve_teacher_relation_pair(
+                        rel,
+                        entity_count,
+                        seq_len,
+                        span_to_entity_index,
+                    )
+                    if !(1 <= head_idx <= entity_count && 1 <= tail_idx <= entity_count) || head_idx == tail_idx
+                        continue
+                    end
+                    pair_idx_teacher = get(pair_to_index, (head_idx, tail_idx), 0)
+                    if pair_idx_teacher == 0 && pair_idx < max_candidate_pairs
+                        pair_idx += 1
+                        pair_idx_teacher = pair_idx
+                        relation_pairs[1, pair_idx_teacher, b] = head_idx
+                        relation_pairs[2, pair_idx_teacher, b] = tail_idx
+                        relation_labels[pair_idx_teacher, b] = no_relation_id
+                        relation_targets[pair_idx_teacher, b] = 0.0f0
+                        relation_mask[pair_idx_teacher, b] = true
+                        teacher_relation_labels[pair_idx_teacher, b] = no_relation_id
+                        teacher_relation_mask[pair_idx_teacher, b] = true
+                        teacher_confidence_targets[pair_idx_teacher, b] = 0.0f0
+                        teacher_confidence_mask[pair_idx_teacher, b] = true
+                        pair_to_index[(head_idx, tail_idx)] = pair_idx_teacher
+                    end
+                    pair_idx_teacher > 0 || continue
+                    teacher_relation_labels[pair_idx_teacher, b] = get(relation_label_to_id, String(rel.label), no_relation_id)
+                    confidence = if haskey(rel, :confidence)
+                        Float32(rel.confidence)
+                    elseif haskey(rel, :score)
+                        Float32(rel.score)
+                    else
+                        1.0f0
+                    end
+                    teacher_confidence_targets[pair_idx_teacher, b] = clamp(confidence, 0.0f0, 1.0f0)
+                end
+            end
+        end
     end
 
     return (
@@ -3406,13 +3716,20 @@ function prepare_rebel_batch(
         boundary_labels = boundary_labels,
         spans = spans,
         span_mask = span_mask,
+        span_supervision_mask = span_supervision_mask,
         mention_spans = mention_spans,
         mention_mask = mention_mask,
         mention_labels = mention_labels,
         relation_pairs = relation_pairs,
         relation_labels = relation_labels,
         relation_mask = relation_mask,
+        relation_supervision_mask = relation_supervision_mask,
         relation_targets = relation_targets,
+        teacher_entity_labels = teacher_entity_labels,
+        teacher_relation_labels = teacher_relation_labels,
+        teacher_relation_mask = teacher_relation_mask,
+        teacher_confidence_targets = teacher_confidence_targets,
+        teacher_confidence_mask = teacher_confidence_mask,
     )
 end
 

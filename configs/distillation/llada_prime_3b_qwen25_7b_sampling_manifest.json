@@ -1,0 +1,23 @@
+{
+  "teacher_model": "Qwen/Qwen2.5-7B-Instruct",
+  "teacher_revision": "",
+  "teacher_fallback_model": "ibm-granite/granite-3.3-8b-instruct",
+  "teacher_runtime": {
+    "device": "auto",
+    "dtype": "auto",
+    "trust_remote_code": false,
+    "plain_prompt": false
+  },
+  "generation": {
+    "max_input_tokens": 2048,
+    "max_new_tokens": 512,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "do_sample": true,
+    "stop_sequences": []
+  },
+  "sharding": {
+    "num_shards": 1,
+    "shard_id": 0
+  }
+}

@@ -1,0 +1,11 @@
+timestamp_utc,architecture,context_length,init_mode,text_loss,text_ppl,text_acc,text_acc_early,text_acc_middle,text_acc_late,needle_acc,device,run_note,checkpoint_error
+2026-03-14T22:53:50.585,swamma,1024,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T22:54:39.278,swamma,2048,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T22:56:22.929,swamma,4096,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T22:59:49.673,swamma,8192,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T23:06:33.128,swamma,16384,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T23:06:56.699,transformer,1024,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T23:07:43.168,transformer,2048,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T23:09:29.001,transformer,4096,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T23:14:51.451,transformer,8192,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,
+2026-03-14T23:34:18.053,transformer,16384,random_init,NaN,NaN,NaN,NaN,NaN,NaN,0.000000,gpu,,

@@ -1,0 +1,49 @@
+# PRIME/LLaDA 3B-class configuration for meaningful distilled training on this machine.
+# Approximate parameter count in current Swamma LLaDA implementation: ~3.0B.
+# This preset starts at 2048 context for a safer first training run.
+
+[model]
+vocab_size = 32000
+max_sequence_length = 2048
+embedding_dimension = 2560
+number_of_heads = 20
+number_of_layers = 32
+
+[model.prime]
+prime_subtoken_length = 4
+prime_subtoken_base = 16
+
+[model.dimensions]
+time_dimension = 384
+state_dimension = 2560
+
+[model.attention]
+window_size = 256
+
+[model.wave_gate]
+min_frequency = 0.01
+max_frequency = 10.0
+default_time_step = 0.05
+
+[generation]
+default_num_steps = 28
+default_temperature = 1.0
+
+[training]
+batch_size = 1
+learning_rate = 1e-4
+min_learning_rate = 1e-6
+warmup_steps = 2000
+total_steps = 100000
+gradient_clip = 1.0
+mask_schedule = "cosine"
+
+[training.checkpoints]
+eval_every = 250
+log_every = 25
+save_every = 500
+
+[data]
+train_path = "data/train.txt"
+val_path = "data/val.txt"
+tokenizer_model = "ibm-granite/granite-4.0-micro"

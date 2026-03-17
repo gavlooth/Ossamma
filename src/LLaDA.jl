@@ -17,6 +17,7 @@ using ChainRulesCore
 
 # Import parent module components
 using ..Swamma: SwammaBlock, LuxLayer
+using ..EngramMod: EngramModule, subtokens_to_token_ids
 
 # Helper to detect and transfer to GPU arrays without requiring CUDA at compile time
 function to_device_like(target, x::AbstractArray)
@@ -139,6 +140,14 @@ Base.@kwdef struct LLaDAConfig
     # MDM-Prime style sub-token parameterization
     prime_subtoken_length::Int = 4
     prime_subtoken_base::Int = 16
+
+    # Engram conditional memory (Ma et al., 2026)
+    use_engram::Bool = false
+    engram_layers::Vector{Int} = Int[]       # which layers get engram; empty = auto-select
+    engram_num_heads::Int = 8                # hash heads per N-gram order
+    engram_ngram_orders::Vector{Int} = [2, 3] # N-gram granularities
+    engram_table_size::Int = 65536           # entries per hash head
+    engram_head_dim::Int = 0                 # 0 = auto (embedding_dim ÷ num_heads)
 end
 
 """
@@ -189,6 +198,13 @@ function config_from_dict(data::Dict)
         flat[:mask_schedule] = Symbol(flat[:mask_schedule])
     end
 
+    # Convert vector fields from TOML (Vector{Any} → Vector{Int})
+    for key in (:engram_layers, :engram_ngram_orders)
+        if haskey(flat, key) && flat[key] isa Vector
+            flat[key] = Int.(flat[key])
+        end
+    end
+
     # Build config with defaults for missing keys
     return LLaDAConfig(;
         vocab_size = get(flat, :vocab_size, 32000),
@@ -207,6 +223,13 @@ function config_from_dict(data::Dict)
         mask_schedule = get(flat, :mask_schedule, :uniform),
         prime_subtoken_length = Int(get(flat, :prime_subtoken_length, 4)),
         prime_subtoken_base = Int(get(flat, :prime_subtoken_base, 16)),
+        # Engram
+        use_engram = get(flat, :use_engram, false),
+        engram_layers = Int.(get(flat, :engram_layers, Int[])),
+        engram_num_heads = Int(get(flat, :engram_num_heads, 8)),
+        engram_ngram_orders = Int.(get(flat, :engram_ngram_orders, [2, 3])),
+        engram_table_size = Int(get(flat, :engram_table_size, 65536)),
+        engram_head_dim = Int(get(flat, :engram_head_dim, 0)),
     )
 end
 
@@ -447,7 +470,7 @@ end
 # ============================================================================
 # LLaDA Model: Full text diffusion architecture
 # ============================================================================
-struct LLaDAModel{S,P,T,B,N,O,M,V} <: LuxLayer
+struct LLaDAModel{S,P,T,B,N,O,M,V,E} <: LuxLayer
     vocab_size::Int
     max_sequence_length::Int
     embedding_dimension::Int
@@ -471,6 +494,11 @@ struct LLaDAModel{S,P,T,B,N,O,M,V} <: LuxLayer
     # Output
     FinalNorm::N
     OutputHead::O
+
+    # Engram conditional memory
+    use_engram::Bool
+    engram_layer_map::Vector{Int}   # length = number_of_layers; value = engram index (0 = none)
+    EngramModules::E                # Tuple of EngramModule or nothing
 end
 
 """
@@ -495,6 +523,13 @@ function LLaDAModel(config::LLaDAConfig)
         default_time_step = config.default_time_step,
         prime_subtoken_length = config.prime_subtoken_length,
         prime_subtoken_base = config.prime_subtoken_base,
+        # Engram
+        use_engram = config.use_engram,
+        engram_layers = config.engram_layers,
+        engram_num_heads = config.engram_num_heads,
+        engram_ngram_orders = config.engram_ngram_orders,
+        engram_table_size = config.engram_table_size,
+        engram_head_dim = config.engram_head_dim,
     )
 end
 
@@ -522,6 +557,13 @@ function LLaDAModel(;
     default_time_step::Float32 = 0.1f0,
     prime_subtoken_length::Int = 4,
     prime_subtoken_base::Int = 16,
+    # Engram
+    use_engram::Bool = false,
+    engram_layers::Vector{Int} = Int[],
+    engram_num_heads::Int = 8,
+    engram_ngram_orders::Vector{Int} = [2, 3],
+    engram_table_size::Int = 65536,
+    engram_head_dim::Int = 0,
 )
     resolved_subtoken_base = 0
     resolved_subtoken_length = 0
@@ -566,6 +608,44 @@ function LLaDAModel(;
         for _ in 1:number_of_layers
     ])
 
+    # Build engram modules if enabled
+    resolved_engram_layers = if use_engram
+        if isempty(engram_layers)
+            # Auto-select: early layer + ~42% depth (paper: layers 2 and 15 of 36 ≈ 6%/42%)
+            first_layer = min(2, number_of_layers)
+            mid = max(first_layer + 1, round(Int, 0.42 * number_of_layers))
+            auto = Int[first_layer]
+            if mid <= number_of_layers
+                push!(auto, mid)
+            end
+            auto
+        else
+            filter(l -> 1 <= l <= number_of_layers, engram_layers)
+        end
+    else
+        Int[]
+    end
+
+    engram_layer_map = zeros(Int, number_of_layers)
+    for (idx, layer_num) in enumerate(resolved_engram_layers)
+        engram_layer_map[layer_num] = idx
+    end
+
+    engram_modules = if use_engram && !isempty(resolved_engram_layers)
+        Tuple([
+            EngramModule(
+                embedding_dimension;
+                num_heads = engram_num_heads,
+                ngram_orders = engram_ngram_orders,
+                table_size = engram_table_size,
+                head_dim = engram_head_dim,
+            )
+            for _ in 1:length(resolved_engram_layers)
+        ])
+    else
+        nothing
+    end
+
     return LLaDAModel(
         vocab_size,
         max_sequence_length,
@@ -587,6 +667,10 @@ function LLaDAModel(;
         # Output
         Lux.LayerNorm((embedding_dimension,)),
         Lux.Dense(embedding_dimension => vocab_size; use_bias = false),
+        # Engram
+        use_engram,
+        engram_layer_map,
+        engram_modules,
     )
 end
 
@@ -601,11 +685,21 @@ function Lux.initialparameters(rng::Random.AbstractRNG, model::LLaDAModel)
     )
     subtoken_params = NamedTuple{keys}(vals)
 
+    engram_params = if model.use_engram && model.EngramModules !== nothing
+        num_engrams = length(model.EngramModules)
+        NamedTuple{ntuple(i -> Symbol("Engram_$i"), num_engrams)}(
+            Tuple(Lux.initialparameters(rng, mod) for mod in model.EngramModules)
+        )
+    else
+        NamedTuple()
+    end
+
     return (
         SubtokenEmbeddings = subtoken_params,
         PositionEmbedding = Lux.initialparameters(rng, model.PositionEmbedding),
         TimeEmbedding = Lux.initialparameters(rng, model.TimeEmbedding),
         Blocks = block_params,
+        Engrams = engram_params,
         FinalNorm = Lux.initialparameters(rng, model.FinalNorm),
         OutputHead = Lux.initialparameters(rng, model.OutputHead),
     )
@@ -622,11 +716,21 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::LLaDAModel)
     )
     subtoken_states = NamedTuple{keys}(vals)
 
+    engram_states = if model.use_engram && model.EngramModules !== nothing
+        num_engrams = length(model.EngramModules)
+        NamedTuple{ntuple(i -> Symbol("Engram_$i"), num_engrams)}(
+            Tuple(Lux.initialstates(rng, mod) for mod in model.EngramModules)
+        )
+    else
+        NamedTuple()
+    end
+
     return (
         SubtokenEmbeddings = subtoken_states,
         PositionEmbedding = Lux.initialstates(rng, model.PositionEmbedding),
         TimeEmbedding = Lux.initialstates(rng, model.TimeEmbedding),
         Blocks = block_states,
+        Engrams = engram_states,
         FinalNorm = Lux.initialstates(rng, model.FinalNorm),
         OutputHead = Lux.initialstates(rng, model.OutputHead),
     )
@@ -748,13 +852,39 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     time_emb, time_state = model.TimeEmbedding(t_input, params.TimeEmbedding, state.TimeEmbedding)
 
     # =========================================================================
-    # 5. Process through SwammaBlocks (Zygote-compatible using foldl)
+    # 5. Reconstruct token IDs for engram (if enabled)
+    # =========================================================================
+    token_ids_for_engram = if model.use_engram && model.EngramModules !== nothing
+        ChainRulesCore.ignore_derivatives() do
+            subtokens_to_token_ids(Array(subtoken_state_batched), model.prime_subtoken_base)
+        end
+    else
+        nothing
+    end
+
+    # =========================================================================
+    # 6. Process through SwammaBlocks (Zygote-compatible using foldl)
     # =========================================================================
     # Use foldl to avoid mutation (push!) which Zygote doesn't support
     (hidden, block_states) = foldl(
         enumerate(model.Blocks);
         init = (hidden, ())
     ) do (h, states), (i, block)
+        # Apply engram before block at selected layers
+        h = if model.use_engram && model.EngramModules !== nothing && model.engram_layer_map[i] > 0
+            engram_idx = model.engram_layer_map[i]
+            engram_key = Symbol("Engram_$engram_idx")
+            engram_mod = model.EngramModules[engram_idx]
+            h_new, _ = engram_mod(
+                (token_ids_for_engram, h),
+                params.Engrams[engram_key],
+                state.Engrams[engram_key],
+            )
+            h_new
+        else
+            h
+        end
+
         block_key = Symbol("Block_$i")
         block_params = params.Blocks[block_key]
         block_state = state.Blocks[block_key]
@@ -764,7 +894,7 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     end
 
     # =========================================================================
-    # 6. Final Normalization
+    # 7. Final Normalization
     # =========================================================================
     # LayerNorm expects 2D input, flatten 3D → 2D → normalize → reshape back
     hidden_shape = size(hidden)
@@ -773,7 +903,7 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     normalized = reshape(normalized_flat, hidden_shape)
 
     # =========================================================================
-    # 7. Output Head → Logits
+    # 8. Output Head → Logits
     # =========================================================================
     # Dense layer can handle 3D input directly
     logits, out_state = model.OutputHead(normalized, params.OutputHead, state.OutputHead)
@@ -782,18 +912,29 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     final_logits = was_unbatched ? dropdims(logits, dims = 3) : logits
 
     # =========================================================================
-    # 8. Update State
+    # 9. Update State
     # =========================================================================
     # block_states is already a tuple from foldl
     new_block_states = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.number_of_layers)}(
         block_states
     )
 
+    # Engram states are read-only (hash multipliers), pass through unchanged
+    engram_states_out = if model.use_engram && model.EngramModules !== nothing
+        num_engrams = length(model.EngramModules)
+        NamedTuple{ntuple(i -> Symbol("Engram_$i"), num_engrams)}(
+            ntuple(i -> state.Engrams[Symbol("Engram_$i")], num_engrams)
+        )
+    else
+        NamedTuple()
+    end
+
     new_state = (
         SubtokenEmbeddings = subtoken_states_out,
         PositionEmbedding = pos_state,
         TimeEmbedding = time_state,
         Blocks = new_block_states,
+        Engrams = engram_states_out,
         FinalNorm = norm_state,
         OutputHead = out_state,
     )
