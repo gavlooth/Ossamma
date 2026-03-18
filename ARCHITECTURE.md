@@ -11,6 +11,161 @@ The old legacy state-space path is no longer part of the active block design.
 
 ---
 
+## Theoretical Foundations
+
+### The Wave-PDE Layer
+
+The core computational primitive in Swamma is a differentiable simulation of the 1D damped wave equation:
+
+```
+∂ₜₜ u = c²(x) ∂ₓₓ u − γ(x) ∂ₜ u
+```
+
+where u(x,t) is the hidden state (field displacement), c(x) is the spatially varying wave speed, and γ(x) is the damping coefficient. Both c(x) and γ(x) are **learnable parameters** of the layer, produced by 1×1 convolutions followed by softplus activation to ensure positivity.
+
+**Integration scheme.** To ensure stable, energy-preserving integration, we use the symplectic velocity-Verlet scheme. Given the state (u, v) where v = ∂ₜu is the field velocity, a single step over learnable time-step Δt > 0 is:
+
+```
+v_{t+½}  = v_t + ½ Δt (c² ⊙ ∇²u_t − γ ⊙ v_t)
+u_{t+1}  = u_t + Δt · v_{t+½}
+v_{t+1}  = v_{t+½} + ½ Δt (c² ⊙ ∇²u_{t+1} − γ ⊙ v_{t+½})
+```
+
+These equations are unrolled for a fixed number of steps k = τ/Δt. Symplectic integrators preserve the geometric structure of Hamiltonian systems, leading to superior long-term stability without energy drift [Hairer et al., 2006].
+
+**Spectral Laplacian.** The spatial Laplacian ∇²u = ∂ₓₓu is computed in the Fourier domain for global interactions in O(n log n) complexity via FFT [Cooley & Tukey, 1965]:
+
+```
+1. û = FFT(u)
+2. ∇̂²u = −k² ⊙ û    (k = frequency modes)
+3. ∇²u = IFFT(∇̂²u)
+```
+
+This spectral method is exact for periodic boundary conditions and avoids the locality constraints and numerical dispersion of finite-difference stencils.
+
+### Universal Approximation
+
+**Theorem** (Vejendla, 2025): Let C([0,1]^m, R) be the space of continuous functions. For any f ∈ C and ε > 0, there exist piecewise-constant c, γ and virtual time τ such that a single Wave-PDE layer followed by a linear readout approximates f within ε in the sup-norm.
+
+The proof connects the expressivity of the Wave-PDE layer to classical controllability results for the wave equation [Lions, 1988]. By framing the layer's operation as a control system where c(x) and γ(x) act as controls manipulating the propagation of an initial state u₀(x), controllability theory establishes that the system can be steered from a fixed initial state to a set of final states that is dense in L²([0,1]^m). The Stone-Weierstrass theorem then completes the universality argument.
+
+This is a stronger result than typical neural network universality [Cybenko, 1989; Hornik et al., 1989] because the approximation mechanism is physically grounded — it derives from the **controllability of wave dynamics**, not merely from parameter counting.
+
+### Why Second-Order Dynamics Matter
+
+State-space models like S4 [Gu et al., 2022] and Mamba [Gu & Dao, 2023] are **first-order** systems modeling ∂ₜu = Au. Information in these systems decays exponentially (diffusive/dissipative dynamics). The Wave-PDE is a **second-order** system — information propagates bidirectionally as waves with energy conserved by the symplectic integrator. This gives a fundamentally different inductive bias:
+
+| Property | First-order SSMs (S4, Mamba) | Second-order (Wave-PDE) |
+|---|---|---|
+| Dynamics | Diffusive, dissipative | Oscillatory, energy-preserving |
+| Information flow | Exponential decay | Bidirectional wave propagation |
+| Long-range signal | Must fight exponential forgetting | Natural resonance at learned frequencies |
+| Stability | Requires careful eigenvalue init (HiPPO) | Symplectic integrator preserves energy |
+| Interpretability | Hidden state (opaque) | c(x) = local processing time, γ(x) = boundary markers |
+
+Empirically, the Wave-PDE Net matches Transformer perplexity (18.49 vs 18.52 on WikiText-103) while reducing wall-clock time by 30% and peak memory by 25%, and outperforms both S4 and Mamba [Vejendla, 2025].
+
+### The SwammaBlock GLU Design
+
+Swamma extends the vanilla Wave-PDE layer into a composite block with a **Gated Linear Unit (GLU)** structure [Dauphin et al., 2017; Shazeer, 2020]:
+
+```
+input → Dense(d → 2d) → split
+                          ├── content path: LinearAttention → RMSNorm
+                          └── gate path:    WavePDE → RMSNorm → σ
+                                                     ↓
+                          output = content ⊙ σ(gate)
+```
+
+**Why two branches?** The branches capture fundamentally different things:
+
+- **Content branch (LinearAttention)** — smooth, global features via O(n) kernel-approximated attention [Katharopoulos et al., 2020]. Captures: semantic similarity, long-range co-reference, distributional patterns. Answers: "what information is relevant here?"
+
+- **Gate branch (WavePDE)** — oscillatory, frequency-selective sharpness via spectral wave propagation. The paper confirms: c(x) slows near important tokens (nouns, verbs), effectively increasing local processing time; γ(x) spikes at punctuation to absorb energy and delimit semantic phrases. Answers: "how important/sharp is this position?"
+
+The element-wise multiply `content ⊙ σ(gate)` means the wave dynamics decide **which** global features to keep and **how strongly** — analogous to how attention computes both values (content) and weights (sharpness), but through physics rather than dot-products.
+
+### Local-Global Adaptive Mixing
+
+Beyond the GLU, each SwammaBlock has a **local-sharp branch** using sliding window attention [Beltagy et al., 2020] for exact softmax within a window of w tokens. The global GLU output conditions the local branch via an input gate, and the final output is an adaptive per-token mix:
+
+```
+output = α(h) · GLU_global + (1 − α(h)) · SWAttn_local
+```
+
+where α = σ(W_α · h + b_α) is learned per-token. This allows the model to route tokens to whichever branch is more appropriate — global for long-range dependencies, local for sharp nearby patterns.
+
+### Comparison to Transformers
+
+| Property | Transformer | SwammaBlock |
+|---|---|---|
+| Sequence complexity | O(n²d) | O(nd log n) + O(nwd) |
+| Global receptive field | Full attention (exact) | FFT spectral (exact) + LinearAttn (approx) |
+| Local sharpness | Implicit in attention weights | Explicit sliding window (exact softmax) |
+| Inductive bias | None (learn everything) | Physical: wave propagation, energy conservation |
+| Stability at depth | Degrades without careful init | Symplectic integrator preserves energy |
+| Interpretability | Attention maps (post-hoc) | c(x) = processing time, γ(x) = boundary markers |
+| Memory (training) | O(n²) for attention matrix | O(n log n) for FFT |
+| Gating mechanism | None (or optional MoE) | Structured: WavePDE gate selects features |
+
+### ReasoningDrafterBlock
+
+The ReasoningDrafter variant replaces the plain WavePDE gate with a **RuleConditionedWavePDE** that learns discrete reasoning situations via a VQ codebook, and adds an **AlgebraicCircuitLayer** (sum-product network) for consistency verification:
+
+```
+ReasoningDrafterBlock (per layer):
+  RMSNorm
+    → RuleConditionedWavePDE (VQ situation → rule → modulated wave dynamics)
+    → GLU(LinAttn content ⊙ sigmoid(WavePDE gate))
+    → Residual
+    → AlgebraicCircuit (SPN consistency check)
+    → LayerNorm
+```
+
+### References
+
+**Wave-PDE architecture and universality:**
+- Vejendla (2025). [Wave-PDE Nets: Trainable Wave-Equation Layers as an Alternative to Attention](https://arxiv.org/abs/2510.04304). PRICAI 2025 Oral.
+
+**Controllability of the wave equation:**
+- Lions (1988). [Exact Controllability, Stabilization and Perturbations for Distributed Systems](https://epubs.siam.org/doi/10.1137/1030001). SIAM Review 30, 1-68.
+
+**Classical universal approximation:**
+- Cybenko (1989). Approximation by Superpositions of a Sigmoidal Function. Math. Control, Signals and Systems 2(4), 303-314.
+- Hornik, Stinchcombe, White (1989). Multilayer Feedforward Networks Are Universal Approximators. Neural Networks 2(5), 359-366.
+
+**Neural ODEs and continuous-depth universal approximation:**
+- Chen et al. (2018). [Neural Ordinary Differential Equations](https://arxiv.org/abs/1806.07366). NeurIPS.
+- Ruiz-Balet & Zuazua (2023). [Neural ODE Control for Classification, Approximation, and Transport](https://epubs.siam.org/doi/10.1137/21M1411433). SIAM Review.
+- Cuchiero et al. (2020). [Deep Neural Networks, Generic Universal Interpolation, and Controlled ODEs](https://epubs.siam.org/doi/10.1137/19M1284117). SIAM J. Math. Data Sci.
+
+**Nonlinear diffusion PDE universal approximation:**
+- [Universal Approximation Property of a Continuous Neural Network Based on a Nonlinear Diffusion Equation](https://link.springer.com/article/10.1186/s13662-023-03787-z). Adv. Continuous and Discrete Models (2023).
+
+**Symplectic integration and gradient stability:**
+- Hairer, Lubich, Wanner (2006). Geometric Numerical Integration. 2nd ed. Springer.
+- Galimberti et al. (2024). [Symplectic Methods in Deep Learning](https://arxiv.org/abs/2406.04104).
+
+**Linear attention:**
+- Katharopoulos et al. (2020). [Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention](https://arxiv.org/abs/2006.16236). ICML.
+
+**GLU / SwiGLU:**
+- Dauphin et al. (2017). Language Modeling with Gated Convolutional Networks. ICML.
+- Shazeer (2020). [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202).
+
+**Sliding window attention:**
+- Beltagy, Peters, Cohan (2020). [Longformer: The Long-Document Transformer](https://arxiv.org/abs/2004.05150).
+
+**State space models:**
+- Gu, Goel, Ré (2022). [Efficiently Modeling Long Sequences with Structured State Spaces (S4)](https://arxiv.org/abs/2111.00396). ICLR.
+- Gu & Dao (2023). [Mamba: Linear-Time Sequence Modeling with Selective State Spaces](https://arxiv.org/abs/2312.00752).
+
+**Spectral methods:**
+- Cooley & Tukey (1965). An Algorithm for the Machine Calculation of Complex Fourier Series. Mathematics of Computation 19(90), 297-301.
+- Trefethen (2000). Spectral Methods in MATLAB. SIAM.
+
+---
+
 ## LLaDA Model (Text Diffusion LLM)
 
 The main model to be trained is **LLaDAModel** - a discrete text diffusion language model using Swamma architecture.

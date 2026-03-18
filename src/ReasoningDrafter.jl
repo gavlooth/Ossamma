@@ -30,11 +30,12 @@ using Lux
 using Random
 using NNlib
 using LinearAlgebra
+using ChainRulesCore
 
 using ..Swamma: LuxLayer, RMSNorm, to_device_like
 using ..LinearAttention: LinearAttentionLayer
 using ..WavePDE: WavePDELayer
-using ..RuleConditionedWavePDEMod: RuleConditionedWavePDE
+using ..RuleConditionedWavePDEMod: RuleConditionedWavePDE, apply_rc_ema_codebook!
 using ..CircuitLayerMod: AlgebraicCircuitLayer
 
 # ============================================================================
@@ -175,81 +176,79 @@ Forward pass:
 5. AlgebraicCircuit (structural consistency check)
 6. LayerNorm (output stabilization)
 """
-function (block::ReasoningDrafterBlock)(inputs::Tuple, ps, st)
-    hidden, time_emb = inputs
+function _block_forward(block::ReasoningDrafterBlock, hidden, time_emb, ps, st)
     dim = block.embedding_dimension
-    residual = hidden
 
     # 1. Pre-norm
     normed, norm_st = block.Norm(hidden, ps.Norm, st.Norm)
 
-    # 2. RuleConditionedWavePDE: quantize situation → retrieve rule →
-    #    modulate wave speed/damping → PDE integration → gated inject
+    # 2. RuleConditionedWavePDE
     normed, rc_st = block.RuleWave(normed, ps.RuleWave, st.RuleWave)
 
-    # 3. GLU core: project → split → content/gate paths → multiply
+    # 3. GLU core
     projected, glu_st = block.GluProjection(normed, ps.GluProjection, st.GluProjection)
     content_half = copy(selectdim(projected, 1, 1:dim))
     gate_half = copy(selectdim(projected, 1, (dim + 1):(2 * dim)))
 
-    # Content path: LinearAttention (sequence mixing)
     content_out, la_st = block.LinAttn((content_half, time_emb), ps.LinAttn, st.LinAttn)
     content_out, cn_st = block.ContentNorm(content_out, ps.ContentNorm, st.ContentNorm)
 
-    # Gate path: WavePDE (unmodulated — frequency-selective gating)
     gate_out, wg_st = block.WaveGate(gate_half, ps.WaveGate, st.WaveGate)
     gate_out, gn_st = block.GateNorm(gate_out, ps.GateNorm, st.GateNorm)
 
-    # GLU: content ⊙ sigmoid(gate)
     glu_out = content_out .* NNlib.sigmoid.(gate_out)
 
     # 4. Residual
-    hidden = residual .+ glu_out
+    h = hidden .+ glu_out
 
-    # 5. AlgebraicCircuit: SPN consistency verification
-    #    Apply leaf input header if adapters are active (transforms what leaves see)
+    # 5. AlgebraicCircuit
     circuit_input = if block.use_adapters && ps.CircuitLeafHeaderWeight !== nothing
-        h_flat = reshape(hidden, dim, :)
+        h_flat = reshape(h, dim, :)
         adapted = ps.CircuitLeafHeaderWeight * h_flat .+ ps.CircuitLeafHeaderBias
-        reshape(adapted, size(hidden))
+        reshape(adapted, size(h))
     else
-        hidden
+        h
     end
 
     circuit_out, cl_st = block.Circuit(circuit_input, ps.Circuit, st.Circuit)
 
-    # Apply circuit gate bias shift if adapters are active
-    hidden = if block.use_adapters && ps.CircuitGateBiasShift !== nothing
-        # The circuit already applied its internal gate. We add a post-hoc
-        # bias shift to adjust injection strength for the new domain.
-        # circuit_out = hidden_in + gate * projected (from inside Circuit)
-        # We modulate the residual: hidden + shift * (circuit_out - hidden)
-        delta = circuit_out .- hidden
+    h = if block.use_adapters && ps.CircuitGateBiasShift !== nothing
+        delta = circuit_out .- h
         shift = NNlib.sigmoid.(ps.CircuitGateBiasShift)
-        shift_broadcast = reshape(shift, dim, ntuple(_ -> 1, ndims(hidden) - 1)...)
-        hidden .+ shift_broadcast .* delta
+        shift_broadcast = reshape(shift, dim, ntuple(_ -> 1, ndims(h) - 1)...)
+        h .+ shift_broadcast .* delta
     else
         circuit_out
     end
 
     # 6. Output normalization
-    hidden_flat = reshape(hidden, dim, :)
-    hidden_flat, on_st = block.OutputNorm(hidden_flat, ps.OutputNorm, st.OutputNorm)
-    hidden = reshape(hidden_flat, size(residual))
+    h_flat = reshape(h, dim, :)
+    h_flat, on_st = block.OutputNorm(h_flat, ps.OutputNorm, st.OutputNorm)
+    h = reshape(h_flat, size(hidden))
 
     new_st = (
-        Norm = norm_st,
-        RuleWave = rc_st,
-        GluProjection = glu_st,
-        LinAttn = la_st,
-        WaveGate = wg_st,
-        ContentNorm = cn_st,
-        GateNorm = gn_st,
-        Circuit = cl_st,
-        OutputNorm = on_st,
+        Norm = norm_st, RuleWave = rc_st, GluProjection = glu_st,
+        LinAttn = la_st, WaveGate = wg_st, ContentNorm = cn_st,
+        GateNorm = gn_st, Circuit = cl_st, OutputNorm = on_st,
     )
+    return h, new_st
+end
 
-    return hidden, new_st
+function (block::ReasoningDrafterBlock)(inputs::Tuple, ps, st)
+    hidden, time_emb = inputs
+
+    # Run the full block forward pass inside ignore_derivatives to prevent
+    # Zygote from building an AD tape over FFTs, leapfrog loops, etc.
+    # Use straight-through estimator: gradients pass through as if f(x) = x.
+    block_out, new_st = ChainRulesCore.ignore_derivatives() do
+        _block_forward(block, hidden, time_emb, ps, st)
+    end
+
+    # Straight-through: gradient of (hidden + (block_out - hidden)) w.r.t. hidden = I
+    # but forward value = block_out. This lets the residual stream carry gradients.
+    result = hidden .+ (block_out .- ChainRulesCore.ignore_derivatives(hidden))
+
+    return result, new_st
 end
 
 # ============================================================================
@@ -309,6 +308,19 @@ function Lux.initialstates(rng::Random.AbstractRNG, model::ReasoningDrafter)
     )
 end
 
+function _apply_reasoning_blocks(model::ReasoningDrafter, hidden, time_emb, ps_blocks, st_blocks, i::Int = 1)
+    if i > model.config.number_of_layers
+        return hidden, ()
+    end
+
+    key = Symbol("Block_$i")
+    next_hidden, block_state = model.Blocks[i]((hidden, time_emb), ps_blocks[key], st_blocks[key])
+    final_hidden, remaining_states = _apply_reasoning_blocks(
+        model, next_hidden, time_emb, ps_blocks, st_blocks, i + 1
+    )
+    return final_hidden, (block_state, remaining_states...)
+end
+
 """
     (model::ReasoningDrafter)(token_ids, ps, st) → (logits, state)
 
@@ -320,13 +332,17 @@ function (model::ReasoningDrafter)(token_ids::AbstractArray{<:Integer}, ps, st)
     was_unbatched = ndims(token_ids) == 1
     tokens = was_unbatched ? reshape(token_ids, :, 1) : token_ids
     seq_len, batch_size = size(tokens)
+    seq_len <= model.config.max_sequence_length || throw(ArgumentError(
+        "ReasoningDrafter received seq_len=$(seq_len), but max_sequence_length=$(model.config.max_sequence_length). " *
+        "Truncate or pad inputs before calling the model."
+    ))
 
     # 1. Token + position embeddings
     tok_flat = vec(tokens)
     tok_emb_flat, tok_st = model.TokenEmbedding(tok_flat, ps.TokenEmbedding, st.TokenEmbedding)
     tok_emb = reshape(tok_emb_flat, model.config.embedding_dimension, seq_len, batch_size)
 
-    pos_indices = collect(1:min(seq_len, model.config.max_sequence_length))
+    pos_indices = collect(1:seq_len)
     pos_emb_raw, pos_st = model.PositionEmbedding(pos_indices, ps.PositionEmbedding, st.PositionEmbedding)
     pos_emb = reshape(pos_emb_raw, model.config.embedding_dimension, seq_len, 1)
 
@@ -336,12 +352,7 @@ function (model::ReasoningDrafter)(token_ids::AbstractArray{<:Integer}, ps, st)
     time_emb = repeat(reshape(ps.TimeEmbedding, :, 1), 1, batch_size)
 
     # 3. Blocks
-    block_states = Vector{Any}(undef, model.config.number_of_layers)
-    for (i, block) in enumerate(model.Blocks)
-        key = Symbol("Block_$i")
-        hidden, block_state = block((hidden, time_emb), ps.Blocks[key], st.Blocks[key])
-        block_states[i] = block_state
-    end
+    hidden, block_states = _apply_reasoning_blocks(model, hidden, time_emb, ps.Blocks, st.Blocks)
 
     # 4. Final norm
     hidden, fn_st = model.FinalNorm(hidden, ps.FinalNorm, st.FinalNorm)
@@ -357,7 +368,7 @@ function (model::ReasoningDrafter)(token_ids::AbstractArray{<:Integer}, ps, st)
         TokenEmbedding = tok_st,
         PositionEmbedding = pos_st,
         Blocks = NamedTuple{ntuple(i -> Symbol("Block_$i"), model.config.number_of_layers)}(
-            Tuple(block_states)
+            block_states
         ),
         FinalNorm = fn_st,
         OutputHead = oh_st,
@@ -456,11 +467,32 @@ function estimate_drafter_parameters(config::ReasoningDrafterConfig)
     return embed + config.number_of_layers * per_block + final_norm + head + time_emb
 end
 
+"""
+    apply_reasoning_drafter_ema_codebook!(ps, st, model; laplace_smoothing=1f-5)
+
+Apply `RuleConditionedWavePDE` EMA statistics back into each block's active
+codebook after a training step.
+"""
+function apply_reasoning_drafter_ema_codebook!(
+    ps, st, model::ReasoningDrafter; laplace_smoothing::Float32 = 1f-5
+)
+    for (i, block) in enumerate(model.Blocks)
+        key = Symbol("Block_$i")
+        apply_rc_ema_codebook!(
+            ps.Blocks[key].RuleWave,
+            st.Blocks[key].RuleWave,
+            block.RuleWave;
+            laplace_smoothing = laplace_smoothing,
+        )
+    end
+    return ps
+end
+
 # ============================================================================
 # Exports
 # ============================================================================
 
 export ReasoningDrafterConfig, ReasoningDrafterBlock, ReasoningDrafter
-export draft_reasoning_tokens, estimate_drafter_parameters
+export draft_reasoning_tokens, estimate_drafter_parameters, apply_reasoning_drafter_ema_codebook!
 
 end # module

@@ -29,6 +29,7 @@ Usage:
 
 using Swamma
 using Swamma.ReasoningDrafterMod
+using Swamma.ReasoningDrafterMod: apply_reasoning_drafter_ema_codebook!
 using Swamma.RuleConditionedWavePDEMod
 using Swamma.ReasoningDataset
 using Swamma.NativeTeacherLM
@@ -214,6 +215,7 @@ function train_phase3b(;
             opt_state, drafter_ps = Optimisers.update(opt_state, drafter_ps, grads)
             grads = nothing
             drafter_st = new_st
+            apply_reasoning_drafter_ema_codebook!(drafter_ps, drafter_st, drafter_model)
 
             epoch_loss += Float64(loss_val)
 
@@ -223,7 +225,7 @@ function train_phase3b(;
 
             if global_step % checkpoint_every == 0
                 cp_path = joinpath(output_dir, "step_$(global_step).jld2")
-                ps_cpu = Lux.cpu(drafter_ps)
+                ps_cpu = cpu_device()(drafter_ps)
                 JLD2.@save cp_path ps_cpu config global_step epoch
                 println("Checkpoint: $cp_path")
             end
@@ -235,7 +237,7 @@ function train_phase3b(;
         if avg_loss < best_loss
             best_loss = avg_loss
             best_path = joinpath(output_dir, "best.jld2")
-            ps_cpu = Lux.cpu(drafter_ps)
+            ps_cpu = cpu_device()(drafter_ps)
             JLD2.@save best_path ps_cpu config global_step epoch
             println("  New best! Saved to $best_path")
         end

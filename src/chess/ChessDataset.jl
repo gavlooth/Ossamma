@@ -19,7 +19,7 @@ using JSON3
 using ..ChessTokenizer
 
 export LichessEvalReader, read_positions, prepare_batch
-export normalize_eval, load_lichess_jsonl
+export normalize_eval, load_lichess_jsonl, iterate_batches, StreamingBatchIterator, next_batch!
 
 # ============================================================================
 # Evaluation normalization
@@ -214,5 +214,51 @@ function iterate_batches(positions::Vector{ChessPosition}, batch_size::Int;
 end
 
 using Random
+
+# ============================================================================
+# Streaming batch iterator (reads from disk, no preload)
+# ============================================================================
+
+mutable struct StreamingBatchIterator
+    path::String
+    batch_size::Int
+    min_depth::Int
+    max_positions::Int
+    io::Union{IOStream, Nothing}
+    positions_read::Int
+end
+
+function StreamingBatchIterator(path::String; batch_size::Int=64, min_depth::Int=10, max_positions::Int=typemax(Int))
+    StreamingBatchIterator(path, batch_size, min_depth, max_positions, nothing, 0)
+end
+
+function _open_stream!(it::StreamingBatchIterator)
+    it.io !== nothing && close(it.io)
+    it.io = open(it.path, "r")
+    it.positions_read = 0
+end
+
+"""
+    next_batch!(it::StreamingBatchIterator) → Union{NamedTuple, Nothing}
+
+Read the next batch from disk. Returns nothing at end of file/max_positions.
+Call `_open_stream!` to reset for a new epoch.
+"""
+function next_batch!(it::StreamingBatchIterator)
+    it.io === nothing && _open_stream!(it)
+    buf = ChessPosition[]
+    while length(buf) < it.batch_size
+        it.positions_read >= it.max_positions && break
+        eof(it.io) && break
+        line = readline(it.io)
+        pos = parse_lichess_eval_line(line)
+        pos === nothing && continue
+        pos.depth < it.min_depth && continue
+        push!(buf, pos)
+        it.positions_read += 1
+    end
+    isempty(buf) && return nothing
+    return prepare_batch(buf)
+end
 
 end # module

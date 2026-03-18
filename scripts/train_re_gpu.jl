@@ -4648,20 +4648,6 @@ function main()
 
                 if step % run_config.save_every == 0
                     save_re_checkpoint(
-                        joinpath(run_config.checkpoint_dir, "checkpoint_step_$(step).jls");
-                        params = params,
-                        state = state,
-                        opt_state = opt_state,
-                        step = step,
-                        epoch = epoch,
-                        loss = recent_mean(recent_losses, run_config.log_every),
-                        vocab = vocab,
-                        entity_label_to_id = entity_label_to_id,
-                        relation_label_to_id = relation_label_to_id,
-                        run_config = run_config,
-                        model_config = model_config,
-                    )
-                    save_re_checkpoint(
                         joinpath(run_config.checkpoint_dir, "checkpoint_last.jls");
                         params = params,
                         state = state,

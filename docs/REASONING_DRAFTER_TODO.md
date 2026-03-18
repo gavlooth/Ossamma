@@ -4,6 +4,32 @@ Target verifier: **Granite** (via NativeTeacherLM, already in codebase)
 
 ---
 
+## Immediate Stabilization Blockers
+
+These items block Phase 3a from being a reliable training path and should be
+completed before more reasoning runs are scheduled.
+
+- [x] Make `ReasoningDrafter` differentiable under Zygote
+  - Replaced the mutable `Vector{Any}` block-state accumulation in `src/ReasoningDrafter.jl`
+  - Kept state reconstruction purely functional so `Zygote.withgradient` now works through the drafter
+  - Added a regression test that computes a gradient through a small `ReasoningDrafter`
+- [x] Fix overlength sequence handling in `ReasoningDrafter`
+  - Chosen policy: fail fast with `ArgumentError` when `seq_len > config.max_sequence_length`
+  - Aligned `scripts/train_reasoning_language.jl` dataset `max_seq_length` with `config.max_sequence_length` via clamping
+  - Added a regression test covering `seq_len > config.max_sequence_length`
+- [x] Wire `RuleConditionedWavePDE` codebook learning into training
+  - Added a reusable `apply_reasoning_drafter_ema_codebook!` helper for post-step EMA application
+  - Chosen update rule: hybrid, with normal optimizer updates plus explicit EMA codebook refresh after each training step
+  - Wired EMA application into Phase 1, Phase 3a, and Phase 3b training loops
+  - Preserved Phase 1 drafter state and checkpointed it so EMA statistics survive resume
+  - Added regression tests showing active codebook values change after EMA application
+- [x] Add a minimal Phase 3a trainability smoke test
+  - Added `test/test_reasoning_trainability.jl`
+  - Runs `2` optimizer steps on a tiny synthetic reasoning batch
+  - Verified: forward pass succeeds, gradient step succeeds, loss is finite, parameters move, and checkpoint save succeeds
+  - Added the smoke gate to `test/runtests.jl`
+  - Use this smoke test as the gate before launching larger reasoning jobs
+
 ## Phase 1: Chess Pre-Training
 
 - [ ] Wait for Lichess eval DB download to finish (~19GB zst → ~30GB jsonl)

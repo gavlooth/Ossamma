@@ -1,5 +1,13 @@
 # TODO — SWAMMA Rollout + Legacy Removal
 
+## ReasoningDrafter Stabilization Path
+
+- [x] Unblock `ReasoningDrafter` training before any new reasoning runs:
+  - [x] remove the mutable block-state accumulation that breaks Zygote gradients
+  - [x] fix `seq_len > max_sequence_length` handling in the model and Phase 3a data path
+  - [x] make `RuleConditionedWavePDE` codebook updates real, not state-only bookkeeping
+  - [x] add a tiny Phase 3a trainability smoke test that must pass before longer jobs
+
 ## LLaDA PRIME 3B Distillation Path
 
 - [x] Create the `~3B` PRIME student config in [`configs/llada_prime_3b.toml`](/home/christos/code/julia/Swamma/configs/llada_prime_3b.toml)
@@ -725,3 +733,40 @@ Goal: replace the current diagnostic-grade RE scaffold with a serious span-graph
 - [ ] `rg -n "\bSwamma\b|\bSwamma[A-Za-z_]+" src scripts test` returns zero code-level hits (except migration notes if intentionally retained).
 - [ ] `rg -n "OscillatorLayer|OscillatorNorm" src` returns only intentional internal storage names or is fully renamed.
 - [ ] All tests and smoke scripts pass under `Swamma*` imports only.
+
+## 7. Zygote AD Tape Memory Fix — Cross-Architecture Refactor
+
+Zygote stores every intermediate array in the forward pass for backprop. FFT-based WavePDE
+leapfrog loops create ~40+ intermediates per block that stay alive until backward finishes.
+A 6.7M param ReasoningDrafter consumed 80GB; a 1B Swamma RE model likely has the same issue.
+
+Pattern: `ignore_derivatives` + straight-through residual for blocks, custom `rrule` for PDE loop.
+
+### Already Done
+
+- [x] `src/RuleConditionedWavePDE.jl` — PDE integration + modulation fully detached from AD tape
+- [x] `src/ReasoningDrafter.jl` — block forward wrapped with straight-through estimator
+- [x] `scripts/train_chess_reasoning.jl` — backbone runs outside `withgradient`, only heads traced
+
+### Remaining
+
+- [ ] **`src/WavePDE.jl`** — main Swamma backbone WavePDE has same leapfrog loop, same tape blowup
+  - Wrap integration loop + softplus param computation in `ignore_derivatives`
+  - Test with `scripts/train_re_gpu.jl` — verify memory drops
+- [ ] **`src/Swamma.jl` SwammaBlock** — apply straight-through block wrapper
+  - Contains: LinearAttention + WavePDE gate + SWAttention + FFN
+  - Extract `_block_forward()`, wrap in `ignore_derivatives`, straight-through residual
+- [ ] **`src/Drafter.jl`** — existing SwammaDrafter (non-reasoning variant)
+  - Profile memory; apply same pattern if excessive
+- [ ] **`src/LLaDA.jl`** — uses SwammaBlocks internally; inherits fix once SwammaBlock is wrapped
+  - Verify no extra tape blowup from masking/denoising loop
+- [ ] **`src/MoET.jl`** — MoE routing is cheap but per-expert block forward is the concern
+  - Apply block wrapper to expert blocks
+- [ ] **Custom `rrule` for leapfrog PDE loop** — proper long-term fix
+  - Adjoint-mode PDE integration (reverse leapfrog) instead of storing all intermediates
+  - O(1) memory per integration step with full gradient signal
+  - Unblocks Phase 3 fine-tuning where backbone gradients matter
+- [ ] **Monitor Enzyme.jl + CUDA + Lux maturity**
+  - Track: EnzymeAD/Enzyme.jl #1392, #2244, #2283
+  - Once stable, replaces all manual `ignore_derivatives` wrappers
+  - Lux plans to switch from Zygote to Enzyme as default backend

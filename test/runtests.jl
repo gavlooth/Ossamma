@@ -18,6 +18,7 @@ medium_suite = full_suite || get(ENV, "SWAMMA_TEST_MEDIUM", "0") == "1"
 include_test("test_attention.jl")
 include_test("test_router.jl")
 include_test("test_llada_training.jl")
+include_test("test_reasoning_trainability.jl")
 
 # Medium suite is opt-in and intended for broader but still practical coverage.
 if medium_suite

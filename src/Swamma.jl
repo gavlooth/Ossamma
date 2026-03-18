@@ -1388,7 +1388,7 @@ using .MoET: MoETConfig, ExpertTower, MoETModel
 # ============================================================================
 include("ReasoningDrafter.jl")
 using .ReasoningDrafterMod: ReasoningDrafterConfig, ReasoningDrafterBlock, ReasoningDrafter
-using .ReasoningDrafterMod: draft_reasoning_tokens, estimate_drafter_parameters
+using .ReasoningDrafterMod: draft_reasoning_tokens, estimate_drafter_parameters, apply_reasoning_drafter_ema_codebook!
 
 # ============================================================================
 # Native Teacher LM (Lux-native causal decoder foundation)
@@ -1586,7 +1586,7 @@ export ChessTokenizer, ChessDataset, ReasoningDataset
 # Reasoning Drafter exports
 export ReasoningDrafterMod
 export ReasoningDrafterConfig, ReasoningDrafterBlock, ReasoningDrafter
-export draft_reasoning_tokens, estimate_drafter_parameters
+export draft_reasoning_tokens, estimate_drafter_parameters, apply_reasoning_drafter_ema_codebook!
 
 # Native teacher LM exports
 export NativeTeacherLM

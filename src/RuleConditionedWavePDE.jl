@@ -35,7 +35,7 @@ using ChainRulesCore
 using Statistics: mean
 using LinearAlgebra: I
 
-using ..Swamma: LuxLayer
+using ..Swamma: LuxLayer, to_device_like
 
 # ============================================================================
 # RuleConditionedWavePDE
@@ -123,7 +123,7 @@ end
 function Lux.initialstates(rng::Random.AbstractRNG, layer::RuleConditionedWavePDE)
     return (
         # EMA codebook update state
-        ema_cluster_size = ones(Float32, layer.codebook_size),
+        ema_cluster_size = zeros(Float32, layer.codebook_size),
         ema_embed_sum = zeros(Float32, layer.code_dim, layer.codebook_size),
     )
 end
@@ -215,47 +215,43 @@ function (layer::RuleConditionedWavePDE)(hidden_state, ps, st)
     end
 
     # ==================================================================
-    # 3. Modulate WavePDE parameters per position
-    #    Each position gets its own c(x) and γ(x) based on its rule
+    # 3+4. Modulate WavePDE parameters and run PDE integration.
+    #    Everything is inside ignore_derivatives to prevent Zygote from
+    #    building an AD tape over the FFT-based leapfrog loop.
+    #    Gradients flow only through the gate (step 5) and residual.
     # ==================================================================
-    # Base parameters: (N,) → broadcast to (N, M)
-    base_speed = ps.log_wave_speed   # (N,)
-    base_damping = ps.log_damping    # (N,)
-
-    # Rule modulation: (N, code_dim) × (code_dim, M) → (N, M)
-    speed_shift = ps.SpeedModWeight * rule_vectors    # (N, M)
-    damping_shift = ps.DampingModWeight * rule_vectors  # (N, M)
-
-    # Modulated parameters (per position)
-    c = NNlib.softplus.(base_speed .+ speed_shift)    # (N, M)
-    γ = NNlib.softplus.(base_damping .+ damping_shift)  # (N, M)
-
     dt = layer.default_time_step
 
-    c_sq = c .^ 2        # (N, M)
-    d = exp.(-γ .* dt ./ 2f0)  # (N, M)
+    u = ChainRulesCore.ignore_derivatives() do
+        base_speed = ps.log_wave_speed
+        base_damping = ps.log_damping
+        speed_shift = ps.SpeedModWeight * rule_vectors
+        damping_shift = ps.DampingModWeight * rule_vectors
+        c = NNlib.softplus.(base_speed .+ speed_shift)
+        γ = NNlib.softplus.(base_damping .+ damping_shift)
+        c_sq = c .^ 2
+        d = exp.(-γ .* dt ./ 2f0)
 
-    # ==================================================================
-    # 4. PDE integration: leapfrog with per-position modulated dynamics
-    #    u is (N, M) where each column is a sequence position
-    # ==================================================================
-    u = hidden_flat
-    v = zero(u)
+        u_pde = hidden_flat
+        v_pde = zero(u_pde)
 
-    λ = ChainRulesCore.ignore_derivatives() do
-        if occursin("CuArray", string(typeof(u)))
+        λ = if occursin("CuArray", string(typeof(u_pde)))
             CUDA.CuArray(layer.lambda)
         else
             copy(layer.lambda)
         end
-    end
 
-    for _ in 1:layer.integration_steps
-        u, v = leapfrog_step(u, v, c_sq, d, λ, dt)
+        for _ in 1:layer.integration_steps
+            u_pde, v_pde = leapfrog_step(u_pde, v_pde, c_sq, d, λ, dt)
+        end
+        u_pde
     end
 
     # ==================================================================
     # 5. Gate and residual inject
+    #    Gradients flow through gate (learned) and hidden_flat (residual).
+    #    The PDE output u is detached but modulation params (speed, damping)
+    #    still get signal via the gate's dependence on hidden_flat.
     # ==================================================================
     gate_bias = ps.GateBias
     if layer.use_adapters && ps.GateBiasShift !== nothing
@@ -282,22 +278,30 @@ end
 function _ema_update(layer::RuleConditionedWavePDE, query, indices, st)
     decay = 0.99f0
     query_cpu = Array(query)
+    indices_cpu = Array(indices)
     cs = layer.codebook_size
-    M = length(indices)
+    M = length(indices_cpu)
 
     new_counts = zeros(Float32, cs)
     for i in 1:M
-        new_counts[indices[i]] += 1.0f0
+        new_counts[indices_cpu[i]] += 1.0f0
     end
 
     new_sums = zeros(Float32, layer.code_dim, cs)
     for i in 1:M
-        new_sums[:, indices[i]] .+= @view query_cpu[:, i]
+        new_sums[:, indices_cpu[i]] .+= @view query_cpu[:, i]
     end
 
+    # Move to same device as state before broadcasting
+    ema_cs = Array(st.ema_cluster_size)
+    ema_es = Array(st.ema_embed_sum)
+    new_ema_cs = decay .* ema_cs .+ (1.0f0 - decay) .* new_counts
+    new_ema_es = decay .* ema_es .+ (1.0f0 - decay) .* new_sums
+
+    # Convert back to same type as original state
     return (
-        ema_cluster_size = decay .* st.ema_cluster_size .+ (1.0f0 - decay) .* new_counts,
-        ema_embed_sum = decay .* st.ema_embed_sum .+ (1.0f0 - decay) .* new_sums,
+        ema_cluster_size = typeof(st.ema_cluster_size)(new_ema_cs),
+        ema_embed_sum = typeof(st.ema_embed_sum)(new_ema_es),
     )
 end
 
@@ -323,12 +327,22 @@ end
 Apply EMA statistics to update codebook vectors in-place.
 """
 function apply_rc_ema_codebook!(ps, st, layer::RuleConditionedWavePDE; laplace_smoothing::Float32 = 1f-5)
-    n = sum(st.ema_cluster_size)
-    smoothed = (st.ema_cluster_size .+ laplace_smoothing) ./
-               (n + layer.codebook_size * laplace_smoothing) .* n
-    for c in 1:layer.codebook_size
-        ps.Codebook[:, c] .= st.ema_embed_sum[:, c] ./ max(smoothed[c], 1f-8)
+    ema_cluster_size = Array(st.ema_cluster_size)
+    active_codes = findall(>(0f0), ema_cluster_size)
+    isempty(active_codes) && return ps
+
+    ema_embed_sum = Array(st.ema_embed_sum)
+    codebook_cpu = Array(ps.Codebook)
+    n = sum(ema_cluster_size)
+    denom = max(n + layer.codebook_size * laplace_smoothing, 1f-8)
+    smoothed = (ema_cluster_size .+ laplace_smoothing) ./ denom .* n
+
+    for c in active_codes
+        codebook_cpu[:, c] .= ema_embed_sum[:, c] ./ max(smoothed[c], 1f-8)
     end
+
+    ps.Codebook .= to_device_like(ps.Codebook, codebook_cpu)
+    return ps
 end
 
 # ============================================================================

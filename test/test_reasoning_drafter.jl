@@ -3,6 +3,7 @@ using Swamma.ReasoningDrafterMod
 using Swamma.RuleConditionedWavePDEMod
 using Random
 using Lux
+using Zygote
 using Test
 
 @testset "RuleConditionedWavePDE" begin
@@ -73,6 +74,20 @@ using Test
         hidden = randn(rng, Float32, 64, 8, 2)
         _, st2 = rc(hidden, ps, st)
         @test st2.ema_cluster_size !== st.ema_cluster_size
+        @test sum(st2.ema_cluster_size) > 0
+    end
+
+    @testset "EMA application mutates active codebook" begin
+        rc = RuleConditionedWavePDE(64; code_dim=32, codebook_size=128)
+        ps = Lux.initialparameters(rng, rc)
+        st = Lux.initialstates(rng, rc)
+
+        hidden = randn(rng, Float32, 64, 8, 2)
+        _, st2 = rc(hidden, ps, st)
+        codebook_before = copy(ps.Codebook)
+        apply_rc_ema_codebook!(ps, st2, rc)
+
+        @test codebook_before != ps.Codebook
     end
 
     @testset "different rules produce different dynamics" begin
@@ -144,6 +159,15 @@ end
         @test all(isfinite, logits)
     end
 
+    @testset "overlength input throws" begin
+        model = ReasoningDrafter(config)
+        ps = Lux.initialparameters(rng, model)
+        st = Lux.initialstates(rng, model)
+
+        tokens = rand(rng, 1:config.vocab_size, config.max_sequence_length + 1, 2)
+        @test_throws ArgumentError model(tokens, ps, st)
+    end
+
     @testset "draft generation" begin
         model = ReasoningDrafter(config)
         ps = Lux.initialparameters(rng, model)
@@ -156,6 +180,39 @@ end
         @test length(draft_tokens) == 12
         @test length(draft_logits) == 4
         @test all(1 .<= draft_tokens .<= config.vocab_size)
+    end
+
+    @testset "gradient pass succeeds" begin
+        model = ReasoningDrafter(config)
+        ps = Lux.initialparameters(rng, model)
+        st = Lux.initialstates(rng, model)
+
+        tokens = rand(rng, 1:config.vocab_size, 16, 2)
+
+        loss, grads = Zygote.withgradient(ps) do p
+            logits, _ = model(tokens, p, st)
+            sum(abs2, logits)
+        end
+        grad_ps = grads[1]
+
+        @test isfinite(loss)
+        @test grad_ps !== nothing
+        @test grad_ps.OutputHead.weight !== nothing
+        @test size(grad_ps.OutputHead.weight) == size(ps.OutputHead.weight)
+        @test all(isfinite, grad_ps.OutputHead.weight)
+    end
+
+    @testset "drafter EMA helper updates block codebook" begin
+        model = ReasoningDrafter(config)
+        ps = Lux.initialparameters(rng, model)
+        st = Lux.initialstates(rng, model)
+
+        tokens = rand(rng, 1:config.vocab_size, 16, 2)
+        _, st2 = model(tokens, ps, st)
+        codebook_before = copy(ps.Blocks.Block_1.RuleWave.Codebook)
+        apply_reasoning_drafter_ema_codebook!(ps, st2, model)
+
+        @test codebook_before != ps.Blocks.Block_1.RuleWave.Codebook
     end
 
     @testset "parameter estimate" begin

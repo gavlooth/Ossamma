@@ -4196,3 +4196,375 @@ Move development to NVIDIA Spark GB10. Run `./scripts/launch_reasoning_pipeline.
 - Lichess download not yet complete
 - Granite tokenizer integration for Phase 3 (currently using char-level)
 - Acceptance rate evaluation framework not yet built
+
+## 2026-03-17 — Reasoning Module Evaluation
+
+### Objectives
+- Evaluate the reasoning module implementation, with focus on `ReasoningDrafter` and `RuleConditionedWavePDE`
+- Check whether the dedicated reasoning tests cover training-time and sequence-boundary behavior
+- Produce review findings without changing code
+
+### Changes Made
+- No code or config files were changed in this session
+- Inspected:
+  - `src/ReasoningDrafter.jl`
+  - `src/RuleConditionedWavePDE.jl`
+  - `src/chess/ReasoningDataset.jl`
+  - `scripts/train_reasoning_language.jl`
+  - `test/test_reasoning_drafter.jl`
+  - `test/test_chess_pipeline.jl`
+
+### Experiment Commands And Key Metrics
+- Verified reasoning tests pass:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `14/14` tests passed
+- Verified chess integration tests pass:
+  - `julia --project=. test/test_chess_pipeline.jl`
+  - result: `48/48` aggregate checks passed across tokenizer, dataset, and drafter integration testsets
+- Reproduced overlength-sequence failure:
+  - `julia --project=. -e 'using Swamma, Lux, Random; using Swamma.ReasoningDrafterMod; ...; m(tokens,ps,st)'`
+  - result: `DimensionMismatch: new dimensions (8, 5, 1) must be consistent with array length 32`
+- Reproduced training-time autodiff failure:
+  - `julia --project=. -e 'using Swamma, Lux, Random, Zygote; using Swamma.ReasoningDrafterMod; ...; Zygote.gradient(ps) do p; logits,_=m(tokens,p,st); sum(logits) end'`
+  - result: Zygote fails with `Mutating arrays is not supported -- called setindex!(Vector{Any}, ...)`
+- Searched for EMA codebook application:
+  - `rg -n "apply_rc_ema_codebook!|rc_wavepde_commitment_loss" scripts src test`
+  - result: `apply_rc_ema_codebook!` is defined/exported but not called; `rc_wavepde_commitment_loss` is defined/exported but not used in training
+
+### Best Current Checkpoint/Config Recommendation
+- Do not start Phase 3a reasoning fine-tuning from the current code as-is.
+- First priority is to make `ReasoningDrafter` differentiable under Zygote.
+- Second priority is to align dataset sequence length with `config.max_sequence_length` or add explicit truncation/padding inside the model path.
+- Third priority is to wire codebook learning into training, either by calling `apply_rc_ema_codebook!` on schedule or by redesigning the forward/loss so `Codebook` receives intentional updates.
+
+### Unresolved Issues And Next Actions
+- `ReasoningDrafter` forward currently mutates `block_states`, which blocks gradient-based training.
+- `ReasoningDrafter` crashes when `seq_len > config.max_sequence_length` because position embeddings are truncated before a reshape to full sequence length.
+- `RuleConditionedWavePDE` updates EMA statistics in state, but the active codebook parameters are never refreshed during training.
+- Current tests validate forward inference only; they do not cover:
+  - gradient computation
+  - overlength inputs
+  - codebook update application during training
+
+## 2026-03-17 — Reasoning Module TODO Follow-Up
+
+### Objectives
+- Turn the reasoning-module review findings into concrete repository TODO items
+- Put the work in the existing trackers used by this repo
+
+### Changes Made
+- Updated [`docs/REASONING_DRAFTER_TODO.md`](/home/christos/code/julia/Swamma/docs/REASONING_DRAFTER_TODO.md)
+  - added an `Immediate Stabilization Blockers` section
+  - broke the review findings into actionable checkbox items
+  - added explicit regression-test and trainability-smoke-test tasks
+- Updated [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md)
+  - added a top-level `ReasoningDrafter Stabilization Path` section
+  - summarized the four high-priority blockers for visibility in the shared tracker
+
+### Experiment Commands And Key Metrics
+- Inspected tracker locations:
+  - `rg --files docs | sort`
+  - `rg -n "TODO|todo|Next actions|Unresolved" docs README.md src test scripts`
+- Read existing tracker content:
+  - `sed -n '1,220p' docs/REASONING_DRAFTER_TODO.md`
+  - `sed -n '1,220p' TODO.md`
+- No model training or test execution in this follow-up session
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the reasoning path blocked on stabilization work first.
+- Use the new `Immediate Stabilization Blockers` section in `docs/REASONING_DRAFTER_TODO.md` as the execution order for the next implementation session.
+
+### Unresolved Issues And Next Actions
+- Implement the Zygote-safe `ReasoningDrafter` state path first.
+- Then fix overlength sequence behavior and align Phase 3a sequence lengths.
+- Then wire codebook updates into real training behavior and add the missing regression coverage.
+
+## 2026-03-17 — Reasoning Module Stabilization: Zygote Trainability
+
+### Objectives
+- Complete the first `ReasoningDrafter` stabilization TODO item
+- Make the drafter forward path differentiable under Zygote
+- Add regression coverage so the failure mode stays fixed
+
+### Changes Made
+- Updated [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - replaced mutable `Vector{Any}` block-state accumulation with a recursive functional helper `_apply_reasoning_blocks`
+  - rebuilt `Blocks` state directly from the returned tuple instead of mutating intermediate storage
+- Updated [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - added `using Zygote`
+  - added a `gradient pass succeeds` regression test that differentiates through the full `ReasoningDrafter`
+- Updated tracker state:
+  - marked the first item complete in [`docs/REASONING_DRAFTER_TODO.md`](/home/christos/code/julia/Swamma/docs/REASONING_DRAFTER_TODO.md)
+  - marked the corresponding sub-item complete in [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md)
+
+### Experiment Commands And Key Metrics
+- Full reasoning test file:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `19/19` tests passed
+- Standalone gradient probe:
+  - `julia --project=. -e 'using Swamma, Lux, Random, Zygote; ...; Zygote.withgradient(...)'`
+  - result: gradient evaluation completed successfully
+  - observed loss: `317.37946`
+  - observed gradient tensor shape: `OutputHead.weight => (20, 8)`
+
+### Best Current Checkpoint/Config Recommendation
+- The original Zygote mutation blocker in `ReasoningDrafter` is resolved.
+- Next implementation target should be the overlength-sequence handling item, because it is the next hard runtime failure on the Phase 3a path.
+
+### Unresolved Issues And Next Actions
+- `ReasoningDrafter` still crashes on `seq_len > config.max_sequence_length`.
+- `RuleConditionedWavePDE` codebook updates are still state-only and not yet integrated into real training behavior.
+- Phase 3a still needs a tiny end-to-end trainability smoke test before larger runs.
+
+## 2026-03-17 — Reasoning Module Stabilization: Overlength Handling
+
+### Objectives
+- Complete the second `ReasoningDrafter` stabilization TODO item
+- Define and implement a consistent overlength-sequence policy
+- Align the Phase 3a data path with the model sequence limit
+
+### Changes Made
+- Updated [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - added a fail-fast `ArgumentError` when `seq_len > config.max_sequence_length`
+  - simplified position embedding lookup to use `1:seq_len` once the precondition is satisfied
+- Updated [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - computed `effective_max_seq_length = min(requested, config.max_sequence_length)`
+  - added an explicit clamp log message when the requested dataset length exceeds model capacity
+  - loaded reasoning datasets using the effective sequence length
+- Updated [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - added an `overlength input throws` regression test
+- Updated tracker state:
+  - marked the overlength-handling item complete in [`docs/REASONING_DRAFTER_TODO.md`](/home/christos/code/julia/Swamma/docs/REASONING_DRAFTER_TODO.md)
+  - marked the corresponding sub-item complete in [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md)
+
+### Experiment Commands And Key Metrics
+- Full reasoning test file:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `20/20` tests passed
+- Direct overlength repro:
+  - `julia --project=. -e 'using Swamma, Lux, Random; ...; m(tokens, ps, st)'`
+  - result: explicit `ArgumentError`
+  - message: `ReasoningDrafter received seq_len=5, but max_sequence_length=4. Truncate or pad inputs before calling the model.`
+
+### Best Current Checkpoint/Config Recommendation
+- Overlength inputs now fail cleanly at the model boundary, and Phase 3a clamps dataset preparation to the checkpoint limit.
+- The next blocking item is the `RuleConditionedWavePDE` codebook update path, which still needs to affect active training parameters.
+
+### Unresolved Issues And Next Actions
+- `RuleConditionedWavePDE` codebook updates are still state-only and not yet integrated into real training behavior.
+- Phase 3a still needs a tiny end-to-end trainability smoke test before larger runs.
+
+## 2026-03-17 — Reasoning Module Stabilization: Codebook Updates And Smoke Gate
+
+### Objectives
+- Make `RuleConditionedWavePDE` codebook updates real and reusable across reasoning training flows
+- Integrate the EMA codebook application into active training scripts
+- Add a minimal Phase 3a trainability smoke test and use it as the launch gate
+
+### Changes Made
+- Updated [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+  - changed EMA state initialization to zero counts so unseen codes are not treated as already-active
+  - made `apply_rc_ema_codebook!` device-safe by doing the codebook refresh on CPU and copying back to the active device
+  - kept inactive codebook entries untouched during EMA application
+- Updated [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - added reusable `apply_reasoning_drafter_ema_codebook!` for post-step EMA refresh across all drafter blocks
+- Updated [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl)
+  - re-exported `apply_reasoning_drafter_ema_codebook!`
+- Updated training scripts:
+  - [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl): apply drafter EMA codebook refresh after each optimizer step
+  - [`scripts/distill_granite.jl`](/home/christos/code/julia/Swamma/scripts/distill_granite.jl): apply drafter EMA codebook refresh after each optimizer step
+  - [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl): preserve drafter state through training, apply EMA codebook refresh each step, and save/load `st_cpu` in checkpoints
+- Added regression and smoke coverage:
+  - [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl): added EMA codebook mutation checks for both the RC layer and full drafter helper
+  - [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl): new `2` step Phase 3a trainability smoke test with checkpoint round-trip
+  - [`test/runtests.jl`](/home/christos/code/julia/Swamma/test/runtests.jl): added the trainability smoke test to the default lane
+- Updated tracker state:
+  - marked the remaining reasoning stabilization items complete in [`docs/REASONING_DRAFTER_TODO.md`](/home/christos/code/julia/Swamma/docs/REASONING_DRAFTER_TODO.md)
+  - marked the top-level stabilization path complete in [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md)
+
+### Experiment Commands And Key Metrics
+- Core reasoning tests:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `21/21` tests passed
+- Phase 3a smoke gate:
+  - `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `17/17` tests passed
+  - runtime: about `44.4s`
+- Default test driver:
+  - `julia --project=. test/runtests.jl`
+  - result: passed after isolating the smoke test in its own module
+- Smoke gate behavior:
+  - completed multiple optimizer steps
+  - kept loss finite
+  - applied EMA codebook refresh after optimizer steps
+  - wrote a checkpoint successfully to a temporary directory
+
+### Best Current Checkpoint/Config Recommendation
+- The reasoning stabilization path is now in a materially better state for experimentation:
+  - Zygote-safe drafter forward path
+  - explicit overlength handling
+  - active EMA codebook refresh after training steps
+  - a Phase 3a smoke test that must pass before longer jobs
+- Before launching larger runs, use:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - `julia --project=. test/test_reasoning_trainability.jl`
+
+### Unresolved Issues And Next Actions
+- The reasoning pipeline still lacks real checkpointed training results; the next step is an actual short reasoning fine-tune run now that the smoke gate passes.
+- Granite distillation and full pipeline evaluation remain unverified end to end.
+- Chess Phase 1 and Phase 3a/3b training loops should be exercised on small real-data slices to confirm the new EMA refresh logic behaves well under longer runs.
+
+## 2026-03-18 — Reasoning Pipeline: Phase 2 Compatibility Fix And Phase 3a Real-Data Smoke
+
+### Objectives
+- Continue from stabilization into executable reasoning pipeline work
+- Produce the missing Phase 2 surgery checkpoint from the existing Phase 1 checkpoint
+- Run the first real-data Phase 3a smoke adaptation on a small reasoning subset
+
+### Changes Made
+- Updated [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+  - added compatibility handling for Phase 1 checkpoints that save wrapped chess params under `ps_cpu.Drafter`
+  - transfer surgery now accepts both bare-drafter and wrapped-chess checkpoint layouts
+- Updated [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - replaced the CUDA-incompatible `CartesianIndex` next-token gather with a GPU-safe target-onehot loss path built outside gradient
+  - replaced `Lux.cpu(...)` checkpoint export with `cpu_device()(...)`
+- Updated [`scripts/distill_granite.jl`](/home/christos/code/julia/Swamma/scripts/distill_granite.jl)
+  - replaced `Lux.cpu(...)` checkpoint export with `cpu_device()(...)` for consistency with the current environment
+- Created a small real-data smoke subset:
+  - `data/reasoning_smoke/gsm8k.jsonl` with `64` rows
+  - `data/reasoning_smoke/reclor.jsonl` with `64` rows
+
+### Experiment Commands And Key Metrics
+- Narrow repository inspection:
+  - confirmed existing Phase 1 checkpoint: `checkpoints/reasoning_drafter/phase1/best.jld2`
+  - confirmed partial reasoning data present: `data/reasoning/gsm8k.jsonl`, `data/reasoning/reclor.jsonl`
+- Phase 2 surgery:
+  - `julia --project=. scripts/transfer_surgery.jl --input checkpoints/reasoning_drafter/phase1/best.jld2 --output checkpoints/reasoning_drafter/phase2/surgery.jld2 --target-vocab 49160`
+  - result: succeeded
+  - artifact: [`checkpoints/reasoning_drafter/phase2/surgery.jld2`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter/phase2/surgery.jld2)
+  - total params: `26.981M`
+- Phase 3a smoke dataset preparation:
+  - `head -n 64 data/reasoning/gsm8k.jsonl > data/reasoning_smoke/gsm8k.jsonl`
+  - `head -n 64 data/reasoning/reclor.jsonl > data/reasoning_smoke/reclor.jsonl`
+  - result: `128` total examples
+- First Phase 3a real-data smoke run:
+  - `julia --project=. scripts/train_reasoning_language.jl --checkpoint checkpoints/reasoning_drafter/phase2/surgery.jld2 --data-dir data/reasoning_smoke --output-dir checkpoints/reasoning_drafter/phase3a_smoke --epochs 1`
+  - first attempt exposed a CUDA compilation failure in the loss path due to `CartesianIndex` gather on GPU
+  - second attempt exposed a checkpoint export failure due to `Lux.cpu`
+  - final rerun succeeded
+  - metric: `avg_loss = 10.3654` for `Epoch 1/1`
+  - artifact: [`checkpoints/reasoning_drafter/phase3a_smoke/best.jld2`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter/phase3a_smoke/best.jld2)
+
+### Best Current Checkpoint/Config Recommendation
+- The current best executable reasoning path is now:
+  - Phase 1 checkpoint: [`checkpoints/reasoning_drafter/phase1/best.jld2`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter/phase1/best.jld2)
+  - Phase 2 surgery checkpoint: [`checkpoints/reasoning_drafter/phase2/surgery.jld2`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter/phase2/surgery.jld2)
+  - Phase 3a smoke checkpoint: [`checkpoints/reasoning_drafter/phase3a_smoke/best.jld2`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter/phase3a_smoke/best.jld2)
+- For the next run, use the same Phase 3a script but increase data size before increasing epochs.
+
+### Unresolved Issues And Next Actions
+- Reasoning data on disk is still partial; only GSM8K and ReClor were available during this session.
+- The next practical step is a larger Phase 3a run on the full downloaded reasoning set once the missing datasets are present.
+- Granite distillation (`Phase 3b`) is still untested end to end and should be exercised only after a larger Phase 3a checkpoint exists.
+
+## 2026-03-18 — Chess Phase 1 Full Training Setup & GPU Bug Fixes
+
+### Objectives
+- Increase batch size and checkpoint frequency for RE training
+- Run the full reasoning drafter pipeline (Phase 1 chess → full)
+- Fix GPU compilation errors blocking chess reasoning training
+- Set up auto-restart with resume for crash resilience
+
+### Changes Made
+- **`configs/redfm_1b_distill_qwen7b.toml`**: batch_size 2→4, save_every 2500→300
+- **`scripts/train_re_gpu.jl`**: checkpoint saves now overwrite `checkpoint_last.jls` only (no per-step accumulation)
+- **`src/chess/ChessDataset.jl`**: exported `iterate_batches` (was missing)
+- **`src/RuleConditionedWavePDE.jl`**: fixed `_ema_update` — was broadcasting CPU `Vector{Float32}` with GPU `CuArray` state; now does all computation on CPU and converts back to original device type
+- **`scripts/train_chess_reasoning.jl`**:
+  - Fixed Zygote-incompatible `CartesianIndex` indexing in `chess_loss` — replaced with one-hot matrix multiply built outside gradient
+  - Fixed Zygote mutation error — removed `Vector{Any}` block state accumulation in `forward_chess`
+  - Fixed `Lux.cpu()` → `cpu_device()()` for checkpoint serialization
+  - Added `--resume` CLI flag and full resume support (params + optimizer state + step + epoch)
+  - Checkpoint now saves `opt_state_cpu` for proper optimizer resume
+- **`scripts/train_reasoning_language.jl`**: checkpoint_every 200→300, overwrite-only saves
+- **`scripts/restart_chess_training.sh`**: new auto-restart script with resume detection (50 retries, 5s cooldown)
+- **`scripts/download_reasoning_datasets.sh`**: ran successfully, downloaded GSM8K (7,473) and ReClor (4,638) = 12,111 total examples
+- Downloaded full Lichess eval DB: **362.7M positions** (19GB compressed → 94GB uncompressed)
+
+### Commands Run And Key Metrics
+- Smoke training (1000 synthetic positions): loss 10.88→7.13 over 5 epochs, GPU confirmed working
+- Full Lichess training launched (10M positions) but session lost before step 300 checkpoint
+
+### Best Current Recommendation
+- Relaunch `./scripts/restart_chess_training.sh data/chess/lichess_db_eval.jsonl 10000000`
+- Restart script will auto-resume from `checkpoint_last.jld2` on crash
+- All three training scripts now use overwrite-only checkpoints every 300 steps
+
+### Unresolved Issues And Next Actions
+- Full Phase 1 training needs to complete (10M positions, 10 epochs)
+- Phase 2 surgery checkpoint exists from prior session; reusable once Phase 1 completes with full data
+- Phase 3a ready with 12,111 reasoning examples (GSM8K + ReClor)
+- 3 HuggingFace datasets failed to download (PrOntoQA, BoardgameQA not found; FOLIO gated; LogiQA script unsupported)
+
+## 2026-03-18 — GPU Memory Crisis: Zygote AD Tape Fix For ReasoningDrafter
+
+### Objectives
+- Fix 80GB+ GPU memory usage for a 6.7M param model during Phase 1 chess training
+- Get full Lichess data training running stably on Spark GB10
+- Investigate Enzyme.jl as potential replacement for Zygote
+
+### Root Cause Analysis
+Zygote builds an AD tape storing every intermediate array for backprop. The ReasoningDrafterBlock contains:
+- RuleConditionedWavePDE: FFT-based leapfrog loop (4-8 integration steps × 2 FFTs each)
+- WavePDE gate: another FFT-based PDE loop
+- LinearAttention with feature projections
+- AlgebraicCircuitLayer with sum-product networks
+
+Each block creates ~40+ large GPU intermediates that all stay alive until backward finishes. With 2 layers, this consumed 80GB for a 6.7M model.
+
+### Changes Made
+- **`src/RuleConditionedWavePDE.jl`**: wrapped modulation + leapfrog PDE integration entirely inside `ChainRulesCore.ignore_derivatives()` — all speed/damping computation and FFT steps are now detached from the AD tape
+- **`src/ReasoningDrafter.jl`**:
+  - Added `using ChainRulesCore`
+  - Extracted block internals to `_block_forward()`
+  - Wrapped entire block forward pass in `ignore_derivatives` with straight-through estimator: `hidden + (block_out - detach(hidden))` — gradients flow through residual stream only
+- **`scripts/train_chess_reasoning.jl`**:
+  - Added `forward_chess_backbone()` — runs backbone completely outside `withgradient`
+  - Training loop now only differentiates through MoveHead + EvalHead Dense layers
+  - Switched to streaming disk reads (`StreamingBatchIterator`) — no preloading positions into RAM
+  - Reduced to 3 epochs, batch_size=64 for practical Spark training time
+  - Added `using ChainRulesCore`
+
+### Memory Progression
+| Change | GPU MEM |
+|---|---|
+| Original (Zygote traces everything) | **80+ GB** (OOM killed) |
+| `ignore_derivatives` around PDE only | 70 GB |
+| Straight-through block wrapper | 28 GB |
+| Backbone outside `withgradient` | 26 GB |
+
+The remaining 26GB is CUDA memory pool holding freed allocations, not active usage.
+
+### Enzyme.jl Investigation
+- Enzyme.jl would solve this properly (LLVM-level AD, recomputes instead of storing)
+- As of early 2026: Enzyme + CUDA + Lux still has excessive compile times and runtime failures
+- Issues #1392, #2244, #2283 on EnzymeAD/Enzyme.jl track the blockers
+- Lux plans to switch from Zygote to Enzyme but hasn't yet
+- **Verdict**: correct long-term fix, not usable today
+
+### Training Status
+- Phase 1 chess training running on full Lichess data (500K positions, 3 epochs, batch_size=64)
+- Resumed from step ~27,000, loss ~4.2-4.8 (down from 8.5)
+- Checkpointing every 300 steps with auto-restart and resume
+- ETA: ~2.5 hours remaining
+
+### Best Current Recommendation
+- Let Phase 1 finish, then run Phase 2 surgery + Phase 3a language fine-tuning
+- The `ignore_derivatives` + straight-through pattern should be applied to main Swamma training if memory becomes an issue there too
+- Consider writing a custom `rrule` for `leapfrog_step` loop to get proper gradients without the full tape
+
+### Unresolved Issues And Next Actions
+- Apply the same AD tape fix to `src/WavePDE.jl` (main Swamma backbone) — same memory problem exists there
+- The straight-through estimator means backbone params only learn via EMA codebook updates, not gradient — acceptable for Phase 1 pre-training but needs revisiting for Phase 3
+- Refactor other Swamma-based architectures to use the same memory-efficient pattern
+- Monitor Enzyme.jl + CUDA + Lux maturity for eventual migration

@@ -100,7 +100,7 @@ seed = 42
 [training.checkpoints]
 eval_every = 5000
 log_every = 25
-save_every = 2500
+save_every = 300
 
 [data]
 train_path = "data/rebel_full/train.jsonl"

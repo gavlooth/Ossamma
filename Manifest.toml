@@ -1,6 +1,6 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.4"
+julia_version = "1.12.5"
 manifest_format = "2.0"
 project_hash = "bf6a4141176e7d7aff74892038caa5bf28f691e6"
 
@@ -1384,7 +1384,7 @@ uuid = "bea87d4a-7f5b-5778-9afe-8cc45184846c"
 version = "7.8.3+2"
 
 [[deps.Swamma]]
-deps = ["ArgParse", "CUDA", "ChainRulesCore", "Dates", "Downloads", "FFTW", "GPUArrays", "HTTP", "JSON3", "LinearAlgebra", "Lux", "LuxCUDA", "LuxCore", "MLStyle", "NNlib", "OpenCL", "Optimisers", "Printf", "ProgressMeter", "PyCall", "Random", "Revise", "Serialization", "Sockets", "Statistics", "TOML", "Zygote", "oneAPI"]
+deps = ["ArgParse", "CUDA", "ChainRulesCore", "Dates", "Downloads", "FFTW", "GPUArrays", "HTTP", "JLD2", "JSON3", "LinearAlgebra", "Lux", "LuxCUDA", "LuxCore", "MLStyle", "NNlib", "OpenCL", "Optimisers", "Printf", "ProgressMeter", "PyCall", "Random", "Revise", "Serialization", "Sockets", "Statistics", "TOML", "Zygote", "oneAPI"]
 path = "."
 uuid = "21ef6326-9699-446c-bc99-5de46acc82b6"
 version = "0.1.0"

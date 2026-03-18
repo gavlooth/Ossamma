@@ -38,6 +38,7 @@ Usage:
 
 using Swamma
 using Swamma.ReasoningDrafterMod
+using Swamma.ReasoningDrafterMod: apply_reasoning_drafter_ema_codebook!
 using Swamma.RuleConditionedWavePDEMod
 using Swamma.ReasoningDataset
 
@@ -153,28 +154,41 @@ function _scale_nested!(x, s::Float32)
     x isa NamedTuple && for v in values(x); _scale_nested!(v, s); end
 end
 
+function make_language_targets(tokens, vocab_size::Int, to_dev_fn)
+    seq_len = size(tokens, 1)
+    target_tokens = tokens[2:seq_len, :]
+    targets_flat = vec(Array(target_tokens))
+    n_positions = length(targets_flat)
+
+    onehot = zeros(Float32, vocab_size, n_positions)
+    for j in 1:n_positions
+        tok = targets_flat[j]
+        1 <= tok <= vocab_size && (onehot[tok, j] = 1.0f0)
+    end
+
+    mask = reshape(Float32.(targets_flat .> 1), 1, :)
+    n_valid = Float32(max(sum(targets_flat .> 1), 1))
+
+    return (
+        input_tokens = tokens[1:seq_len-1, :],
+        target_onehot = to_dev_fn(onehot),
+        target_mask = to_dev_fn(mask),
+        n_valid = n_valid,
+    )
+end
+
 # ============================================================================
 # Training
 # ============================================================================
 
-function language_loss(model, ps, st, tokens)
-    # Next-token prediction: predict token[t+1] from position t
-    seq_len = size(tokens, 1)
-    input_tokens = tokens[1:seq_len-1, :]
-    target_tokens = tokens[2:seq_len, :]
-
+function language_loss(model, ps, st, input_tokens, target_onehot, target_mask, n_valid::Float32)
     logits, new_st = model(input_tokens, ps, st)
 
     vocab = size(logits, 1)
     logits_flat = reshape(logits, vocab, :)
-    targets_flat = vec(target_tokens)
-
-    # Ignore padding tokens (PAD_TOKEN = 1)
-    mask = targets_flat .> 1
-    n_valid = max(sum(mask), 1)
 
     log_probs = NNlib.logsoftmax(logits_flat, dims=1)
-    nll = -sum(log_probs[CartesianIndex.(targets_flat, 1:length(targets_flat))] .* mask) / n_valid
+    nll = -sum(log_probs .* target_onehot .* target_mask) / n_valid
 
     return nll, new_st
 end
@@ -187,7 +201,7 @@ function train_phase3a(;
     num_epochs::Int = 10,
     learning_rate::Float32 = 3f-4,
     max_seq_length::Int = 256,
-    checkpoint_every::Int = 200,
+    checkpoint_every::Int = 300,
     seed::Int = 42,
 )
     rng = Random.MersenneTwister(seed)
@@ -205,6 +219,10 @@ function train_phase3a(;
     config = phase2["config"]
     println("  Config: dim=$(config.embedding_dimension), layers=$(config.number_of_layers), vocab=$(config.vocab_size)")
     println("  Adapters: $(config.use_adapters)")
+    effective_max_seq_length = min(max_seq_length, config.max_sequence_length)
+    if effective_max_seq_length != max_seq_length
+        println("  Requested max_seq_length=$max_seq_length exceeds model limit=$(config.max_sequence_length); clamping to $effective_max_seq_length")
+    end
 
     # Build model
     model = ReasoningDrafter(config)
@@ -217,7 +235,7 @@ function train_phase3a(;
 
     # Load reasoning data
     println("Loading reasoning datasets from $data_dir...")
-    examples = load_all_reasoning_datasets(data_dir; max_seq_length=max_seq_length)
+    examples = load_all_reasoning_datasets(data_dir; max_seq_length=effective_max_seq_length)
     println("Total: $(length(examples)) examples")
 
     # Optimizer
@@ -235,13 +253,20 @@ function train_phase3a(;
             global_step += 1
 
             b_tokens = to_dev(batch.tokens)
+            targets = make_language_targets(batch.tokens, config.vocab_size, to_dev)
 
             if USE_GPU
                 GC.gc(false)
             end
 
             (loss_val, new_st), grads = Zygote.withgradient(ps) do p
-                language_loss(model, p, st, b_tokens)
+                language_loss(
+                    model, p, st,
+                    targets.input_tokens,
+                    targets.target_onehot,
+                    targets.target_mask,
+                    targets.n_valid,
+                )
             end
             grads = grads[1]
 
@@ -251,6 +276,7 @@ function train_phase3a(;
             opt_state, ps = Optimisers.update(opt_state, ps, grads)
             grads = nothing
             st = new_st
+            apply_reasoning_drafter_ema_codebook!(ps, st, model)
 
             epoch_loss += Float64(loss_val)
 
@@ -259,10 +285,10 @@ function train_phase3a(;
             end
 
             if global_step % checkpoint_every == 0
-                cp_path = joinpath(output_dir, "step_$(global_step).jld2")
-                ps_cpu = Lux.cpu(ps)
+                cp_path = joinpath(output_dir, "checkpoint_last.jld2")
+                ps_cpu = cpu_device()(ps)
                 JLD2.@save cp_path ps_cpu config global_step epoch
-                println("Checkpoint: $cp_path")
+                println("Checkpoint (step $global_step): $cp_path")
             end
         end
 
@@ -272,7 +298,7 @@ function train_phase3a(;
         if avg_loss < best_loss
             best_loss = avg_loss
             best_path = joinpath(output_dir, "best.jld2")
-            ps_cpu = Lux.cpu(ps)
+            ps_cpu = cpu_device()(ps)
             JLD2.@save best_path ps_cpu config global_step epoch
             println("  New best! Saved to $best_path")
         end

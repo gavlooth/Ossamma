@@ -56,7 +56,8 @@ function transfer_surgery(;
     # Load Phase 1 checkpoint
     println("Loading Phase 1 checkpoint...")
     phase1 = JLD2.load(input_path)
-    ps_chess = phase1["ps_cpu"]
+    ps_loaded = phase1["ps_cpu"]
+    ps_chess = haskey(ps_loaded, :Drafter) ? ps_loaded.Drafter : ps_loaded
     config_chess = phase1["config"]
     chess_step = get(phase1, "global_step", 0)
     println("  Chess config: dim=$(config_chess.embedding_dimension), layers=$(config_chess.number_of_layers)")
