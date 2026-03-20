@@ -36,6 +36,36 @@ using Test
         collision_rate = EngramMod.engram_collision_rate(engram, token_ids, st.hash_multipliers)
         @test 0.0 <= collision_rate <= 1.0
         @test collision_rate < 0.5  # should not be mostly collisions
+
+        precomputed_indices = EngramMod.prepare_engram_indices(
+            engram,
+            token_ids,
+            st.hash_multipliers;
+            reference_device = ps.EmbeddingTable,
+        )
+        out_cached, _ = engram((token_ids, hidden, precomputed_indices), ps, st)
+        @test out_cached == out
+    end
+
+    @testset "EngramModule cache state is mode-invariant" begin
+        engram = EngramModule(64; num_heads=4, ngram_orders=[2, 3], table_size=1024, head_dim=16)
+        ps = Lux.initialparameters(rng, engram)
+        st = Lux.initialstates(rng, engram)
+        eval_st = Lux.testmode(st)
+        train_st = Lux.trainmode(eval_st)
+
+        @test !hasproperty(st, :training)
+        @test eval_st == st
+        @test train_st == st
+
+        token_ids = rand(rng, 1:100, 16, 2)
+        hidden = randn(rng, Float32, 64, 16, 2)
+        out_eval, eval_st2 = engram((token_ids, hidden), ps, eval_st)
+        out_train, train_st2 = engram((token_ids, hidden), ps, train_st)
+
+        @test out_eval == out_train
+        @test eval_st2.hash_multipliers == eval_st.hash_multipliers
+        @test train_st2.hash_multipliers == train_st.hash_multipliers
     end
 
     @testset "subtokens_to_token_ids" begin
@@ -111,6 +141,41 @@ using Test
         inputs = (subtoken_state=subtoken_state, mask_ratio=0.3f0)
         logits, st_out = model(inputs, ps, st)
         @test size(logits) == (1000, 32, 1)
+    end
+
+    @testset "LLaDA PRIME runtime precompute matches implicit path" begin
+        config = LLaDAConfig(
+            vocab_size=1000, max_sequence_length=32, embedding_dimension=64,
+            number_of_heads=2, number_of_layers=4, time_dimension=32,
+            use_engram=true, engram_layers=[2],
+            engram_num_heads=4, engram_ngram_orders=[2, 3],
+            engram_table_size=512, engram_head_dim=16,
+        )
+        model = LLaDAModel(config)
+        ps = Lux.initialparameters(rng, model)
+        st = Lux.initialstates(rng, model)
+
+        subtoken_state = rand(rng, 1:config.prime_subtoken_base, model.prime_subtoken_length, 32, 2)
+        implicit_inputs = (subtoken_state = subtoken_state, mask_ratio = 0.4f0)
+        runtime_inputs = LLaDA.prepare_prime_forward_inputs(model, subtoken_state)
+        engram_runtime = Swamma.LLaDA.prepare_engram_forward_inputs(
+            model,
+            runtime_inputs.token_ids_for_engram,
+            st;
+            reference_device = subtoken_state,
+        )
+        explicit_inputs = (
+            subtoken_state = subtoken_state,
+            mask_ratio = 0.4f0,
+            prime_compatibility_mask = runtime_inputs.prime_compatibility_mask,
+            token_ids_for_engram = runtime_inputs.token_ids_for_engram,
+            engram_indices = engram_runtime,
+        )
+
+        logits_implicit, _ = model(implicit_inputs, ps, st)
+        logits_explicit, _ = model(explicit_inputs, ps, st)
+
+        @test logits_explicit == logits_implicit
     end
 
     @testset "config_from_dict with engram" begin

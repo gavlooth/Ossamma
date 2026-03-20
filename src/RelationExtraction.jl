@@ -16,6 +16,10 @@ detach_constant(x) = ChainRulesCore.ignore_derivatives() do
     x
 end
 
+const CANDIDATE_SPAN_CPU_CACHE = Dict{NTuple{3, Int}, Tuple{Array{Int, 3}, BitMatrix}}()
+const CANDIDATE_SPAN_GPU_CACHE = Dict{Tuple{String, NTuple{3, Int}}, Tuple{Any, Any}}()
+const CANDIDATE_SPAN_CACHE_LOCK = ReentrantLock()
+
 const DEFAULT_ENTITY_TYPES = [
     "PERSON", "ORGANIZATION", "LOCATION", "EVENT", "MISC"
 ]
@@ -165,8 +169,6 @@ function (layer::PairEvidenceSelectorHead)(inputs::Tuple, params, state)
     pair_feature_dim, max_pairs, batch_size = size(pair_features)
     d, seq_len, _ = size(token_states)
     evidence_dim = layer.evidence_dimension
-    on_gpu = token_states isa CUDA.CuArray
-
     pair_flat = reshape(pair_features, pair_feature_dim, :)
     query_flat, query_state = layer.QueryProjection(pair_flat, params.QueryProjection, state.QueryProjection)
     key_flat, key_state = layer.KeyProjection(reshape(token_states, d, :), params.KeyProjection, state.KeyProjection)
@@ -247,11 +249,6 @@ function (layer::PairEvidenceSelectorHead)(inputs::Tuple, params, state)
         evidence_top_token_index = hcat(top_index_batches...)
         evidence_attention_entropy = hcat(entropy_batches...)
         evidence_attention_max_weight = hcat(max_weight_batches...)
-        if on_gpu
-            evidence_top_token_index = CUDA.CuArray(evidence_top_token_index)
-            evidence_attention_entropy = CUDA.CuArray(evidence_attention_entropy)
-            evidence_attention_max_weight = CUDA.CuArray(evidence_attention_max_weight)
-        end
     end
 
     fused_inputs = vcat(
@@ -1544,6 +1541,27 @@ function candidate_span_tensor(seq_len::Int, max_span_width::Int, batch_size::In
     return spans, span_mask
 end
 
+function cached_candidate_span_tensor(seq_len::Int, max_span_width::Int, batch_size::Int)
+    key = (seq_len, max_span_width, batch_size)
+    lock(CANDIDATE_SPAN_CACHE_LOCK) do
+        return get!(CANDIDATE_SPAN_CPU_CACHE, key) do
+            candidate_span_tensor(seq_len, max_span_width, batch_size)
+        end
+    end
+end
+
+function candidate_span_tensor_on_device(hidden, seq_len::Int, max_span_width::Int, batch_size::Int)
+    candidate_spans, candidate_mask = cached_candidate_span_tensor(seq_len, max_span_width, batch_size)
+    hidden isa CUDA.CuArray || return candidate_spans, candidate_mask
+
+    key = (string(CUDA.device()), (seq_len, max_span_width, batch_size))
+    lock(CANDIDATE_SPAN_CACHE_LOCK) do
+        return get!(CANDIDATE_SPAN_GPU_CACHE, key) do
+            (CUDA.CuArray(candidate_spans), CUDA.CuArray(candidate_mask))
+        end
+    end
+end
+
 function score_span_representations(model::SwammaRelationExtractor, span_reps, span_mask, params, state)
     d, max_spans, batch_size = size(span_reps)
     mention_logits_flat, mention_state = model.MentionHead(
@@ -1571,9 +1589,13 @@ function propose_candidate_spans(
     spans = zeros(Int, 2, max_candidate_spans, batch_size)
     span_mask = falses(max_candidate_spans, batch_size)
     span_scores = fill(typemin(Float32), max_candidate_spans, batch_size)
-    candidate_spans, candidate_mask = candidate_span_tensor(seq_len, max_span_width, batch_size)
-    candidate_spans_device = hidden isa CUDA.CuArray ? CUDA.CuArray(candidate_spans) : candidate_spans
-    candidate_mask_device = hidden isa CUDA.CuArray ? CUDA.CuArray(candidate_mask) : candidate_mask
+    candidate_spans, candidate_mask = cached_candidate_span_tensor(seq_len, max_span_width, batch_size)
+    candidate_spans_device, candidate_mask_device = candidate_span_tensor_on_device(
+        hidden,
+        seq_len,
+        max_span_width,
+        batch_size,
+    )
     candidate_reps, span_state = build_span_representations(
         model,
         hidden,
@@ -1613,6 +1635,9 @@ function propose_candidate_spans(
         end
     end
 
+    if hidden isa CUDA.CuArray
+        return CUDA.CuArray(spans), CUDA.CuArray(span_mask), CUDA.CuArray(span_scores), span_state, mention_state
+    end
     return spans, span_mask, span_scores, span_state, mention_state
 end
 
@@ -1630,6 +1655,9 @@ function score_existing_spans(model::SwammaRelationExtractor, span_reps, span_ma
             mode = model.mention_score_mode,
             learned_weight = model.mention_score_learned_weight,
         )
+    end
+    if learned_scores isa CUDA.CuArray
+        return CUDA.CuArray(combined_scores), mention_logits, mention_state
     end
     return combined_scores, mention_logits, mention_state
 end
@@ -2239,8 +2267,14 @@ function build_span_context_adjacency(
     use_semantic::Bool = true,
     sentence_ids = nothing,
 )
-    max_spans, _, batch_size = size(scores)
+    max_spans = size(span_mask, 1)
+    batch_size = size(span_mask, 2)
     adjacency = falses(max_spans, max_spans, batch_size)
+    sentence_ids_cpu = if use_sentence && sentence_ids !== nothing && sentence_ids isa CUDA.CuArray
+        Array(sentence_ids)
+    else
+        sentence_ids
+    end
     for b in 1:batch_size
         valid_indices = findall(@view(span_mask[:, b]))
         isempty(valid_indices) && continue
@@ -2261,8 +2295,7 @@ function build_span_context_adjacency(
             end
         end
 
-        if use_sentence && sentence_ids !== nothing
-            sentence_ids_cpu = sentence_ids isa CUDA.CuArray ? Array(sentence_ids) : sentence_ids
+        if use_sentence && sentence_ids_cpu !== nothing
             sentence_column = if ndims(sentence_ids_cpu) == 1
                 sentence_ids_cpu
             elseif ndims(sentence_ids_cpu) == 2
@@ -2287,6 +2320,7 @@ function build_span_context_adjacency(
         end
 
         if use_semantic && semantic_topk > 0
+            scores === nothing && throw(ArgumentError("semantic span context requires semantic scores."))
             for span_idx in ordered_indices
                 semantic_candidates = Int[]
                 semantic_scores = Float32[]
@@ -2339,15 +2373,21 @@ function (layer::SparseSpanContextBlock)(inputs::Tuple, params, state)
     keys = reshape(key_flat, d, max_spans, batch_size)
     values = reshape(value_flat, d, max_spans, batch_size)
 
+    score_scale = sqrt(Float32(d))
+    raw_score_batches = map(1:batch_size) do b
+        transpose(@view(queries[:, :, b])) * @view(keys[:, :, b]) ./ score_scale
+    end
+    raw_scores = cat(raw_score_batches...; dims = 3)
+
     adjacency_device = ChainRulesCore.ignore_derivatives() do
-        scores_cpu = Array{Float32}(undef, max_spans, max_spans, batch_size)
-        queries_cpu = queries isa CUDA.CuArray ? Array(queries) : queries
-        keys_cpu = keys isa CUDA.CuArray ? Array(keys) : keys
-        for b in 1:batch_size
-            scores_cpu[:, :, b] .= Float32.(transpose(@view(queries_cpu[:, :, b])) * @view(keys_cpu[:, :, b]) ./ sqrt(Float32(d)))
-        end
         spans_cpu = spans isa CUDA.CuArray ? Array(spans) : spans
         span_mask_cpu = span_mask isa CUDA.CuArray ? Array(span_mask) : span_mask
+        scores_cpu = if use_semantic && layer.semantic_topk > 0
+            raw_scores_const = detach_constant(raw_scores)
+            raw_scores_const isa CUDA.CuArray ? Array(raw_scores_const) : raw_scores_const
+        else
+            nothing
+        end
         adjacency = build_span_context_adjacency(
             scores_cpu,
             spans_cpu,
@@ -2364,8 +2404,7 @@ function (layer::SparseSpanContextBlock)(inputs::Tuple, params, state)
 
     large_negative = oftype(zero(eltype(span_reps)), -1.0f4)
     attention_batches = map(1:batch_size) do b
-        raw_scores = transpose(@view(queries[:, :, b])) * @view(keys[:, :, b]) ./ sqrt(Float32(d))
-        masked_scores = ifelse.(@view(adjacency_device[:, :, b]), raw_scores, large_negative)
+        masked_scores = ifelse.(@view(adjacency_device[:, :, b]), @view(raw_scores[:, :, b]), large_negative)
         attention_weights = NNlib.softmax(masked_scores, dims = 2)
         message = @view(values[:, :, b]) * transpose(attention_weights)
         message .* reshape(Float32.(@view(span_mask[:, b])), 1, :)
@@ -2734,11 +2773,6 @@ function (model::SwammaRelationExtractor)(inputs::NamedTuple, params, state)
             max_candidate_spans = model.max_candidate_spans,
             max_span_width = model.max_span_width,
         )
-        if hidden isa CUDA.CuArray
-            proposed_spans = CUDA.CuArray(proposed_spans)
-            proposed_span_mask = CUDA.CuArray(proposed_span_mask)
-            proposed_span_scores = CUDA.CuArray(proposed_span_scores)
-        end
         proposed_span_reps, refined_span_state = build_span_representations(
             model,
             hidden,

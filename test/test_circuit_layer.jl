@@ -2,6 +2,7 @@ using Swamma
 using Swamma.CircuitLayerMod
 using Random
 using Lux
+using Zygote
 using Test
 
 @testset "AlgebraicCircuitLayer" begin
@@ -103,6 +104,28 @@ using Test
 
         relative_diff = sum(abs.(out .- hidden)) / sum(abs.(hidden))
         @test relative_diff < 0.5
+    end
+
+    @testset "input and parameter gradients flow in batched mode" begin
+        cl = AlgebraicCircuitLayer(16; num_leaves=8, product_arity=2, num_sums=4, num_circuits=3)
+        ps = Lux.initialparameters(rng, cl)
+        st = Lux.initialstates(rng, cl)
+        hidden = randn(rng, Float32, 16, 5, 2)
+
+        loss, grads = Zygote.withgradient(hidden, ps) do hidden_state, p
+            out, _ = cl(hidden_state, p, st)
+            sum(abs2, out)
+        end
+
+        grad_hidden, grad_ps = grads
+        @test isfinite(loss)
+        @test grad_hidden !== nothing
+        @test size(grad_hidden) == size(hidden)
+        @test grad_ps !== nothing
+        @test grad_ps.LeafWeights !== nothing
+        @test grad_ps.SumLogWeights !== nothing
+        @test grad_ps.OutputWeight !== nothing
+        @test grad_ps.GateWeight !== nothing
     end
 end
 

@@ -10,13 +10,49 @@ cd Swamma
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 pip install datasets   # for reasoning dataset download
 
-# 2. Smoke test (no large downloads, uses small sample)
-head -10000 data/chess/lichess_db_eval.jsonl > data/chess/smoke.jsonl  # if chess data exists
-julia --project=. scripts/train_chess_reasoning.jl --data data/chess/smoke.jsonl --max-positions 1000 --steps 50
+# 2. Fast sanity check
+./scripts/launch_reasoning_pipeline.sh --smoke
 
-# 3. Full pipeline
+# 3. Practical bounded validation path
+./scripts/launch_reasoning_pipeline.sh --bounded-medium
+
+# 4. Full pipeline
 ./scripts/launch_reasoning_pipeline.sh --all
 ```
+
+## Recommended Modes
+
+Use the pipeline modes according to what you are trying to validate:
+
+```bash
+# Minimal end-to-end smoke
+./scripts/launch_reasoning_pipeline.sh --smoke
+
+# Recommended day-to-day bounded validation
+./scripts/launch_reasoning_pipeline.sh --bounded-medium
+
+# Phase-specific bounded validation
+./scripts/launch_reasoning_pipeline.sh --phase 3a --bounded-medium
+./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium
+
+# Full long-run pipeline
+./scripts/launch_reasoning_pipeline.sh --all
+```
+
+Current bounded-medium defaults:
+
+| Mode | Default checkpoint root | Profile |
+|---|---|---|
+| `--smoke` | `checkpoints/reasoning_drafter_smoke/` | tiny sanity path |
+| `--bounded-medium` | `checkpoints/reasoning_drafter_medium/` | practical bounded validation |
+| `--all` | `checkpoints/reasoning_drafter/` | full pipeline |
+
+Bounded-medium is the best current default for local validation on this machine:
+
+- Phase 1 uses the compact smoke-compatible model and runs `3` optimizer steps.
+- Phase 2 performs surgery into the bounded `132`-token vocabulary.
+- Phase 3a runs `64` reasoning examples at `batch_size=2`, `max_steps=40`.
+- Phase 3b runs the same `64`-example bounded slice at `batch_size=2`, `max_steps=40`.
 
 ## Phase-by-Phase
 
@@ -58,6 +94,18 @@ julia --project=. scripts/train_chess_reasoning.jl \
 # Output: checkpoints/reasoning_drafter/phase1/best.jld2
 ```
 
+Bounded-medium Phase 1 is intentionally much smaller and uses the smoke-compatible model shape:
+
+```bash
+./scripts/launch_reasoning_pipeline.sh --bounded-medium
+
+# Phase 1 portion:
+#   data/chess/smoke.jsonl
+#   max_positions=128
+#   max_steps=3
+#   compact 64-dim / 2-layer drafter
+```
+
 ### Phase 2: Transfer Surgery
 
 Freezes reasoning backbone, adds adapters, swaps vocab for Granite.
@@ -71,6 +119,8 @@ julia --project=. scripts/transfer_surgery.jl \
 # This is fast (no training, just checkpoint manipulation)
 # Output: checkpoints/reasoning_drafter/phase2/surgery.jld2
 ```
+
+Bounded-medium uses `--target-vocab 132` so the medium Phase 3a/3b validation path stays lightweight and internally compatible.
 
 ### Phase 3a: Language Fine-Tuning
 
@@ -88,6 +138,24 @@ julia --project=. scripts/train_reasoning_language.jl \
 # Monitor: next-token loss on reasoning text
 ```
 
+Recommended bounded-medium Phase 3a:
+
+```bash
+./scripts/launch_reasoning_pipeline.sh --phase 3a --bounded-medium
+
+# Uses:
+#   64 examples total
+#   batch_size=2
+#   max_seq_length=64
+#   max_steps=40
+#   checkpoint_every=4
+#
+# Current measured profile on this GB10 host:
+#   best_loss ≈ 4.1658
+#   wall time ≈ 106s for 40 steps
+#   peak process GPU memory ≈ 348 MiB
+```
+
 ### Phase 3b: Granite Distillation
 
 Matches drafter to Granite's output distribution.
@@ -103,6 +171,23 @@ julia --project=. scripts/distill_granite.jl \
 # Requires: pip install safetensors torch (for Granite weight loading)
 # Granite model downloaded automatically from HuggingFace
 # Monitor: KL divergence, decreasing = good
+```
+
+Recommended bounded-medium Phase 3b:
+
+```bash
+./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium
+
+# Uses:
+#   64 examples total
+#   batch_size=2
+#   max_seq_length=64
+#   max_steps=40
+#   checkpoint_every=4
+#
+# Current measured profile on this GB10 host:
+#   best_loss ≈ 4.8578 when run phase-only from the smoke-root Phase 3a checkpoint
+#   peak process GPU memory ≈ 16.3 GiB
 ```
 
 ## Architecture

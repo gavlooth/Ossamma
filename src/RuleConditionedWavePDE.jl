@@ -35,7 +35,7 @@ using ChainRulesCore
 using Statistics: mean
 using LinearAlgebra: I
 
-using ..Swamma: LuxLayer, to_device_like
+using ..Swamma: LuxLayer, to_device_like, state_with_training, state_is_training
 
 # ============================================================================
 # RuleConditionedWavePDE
@@ -121,11 +121,24 @@ function Lux.initialparameters(rng::Random.AbstractRNG, layer::RuleConditionedWa
 end
 
 function Lux.initialstates(rng::Random.AbstractRNG, layer::RuleConditionedWavePDE)
-    return (
+    return state_with_training(
         # EMA codebook update state
         ema_cluster_size = zeros(Float32, layer.codebook_size),
         ema_embed_sum = zeros(Float32, layer.code_dim, layer.codebook_size),
+        lambda_cache = nothing,
     )
+end
+
+function _ensure_lambda_cache(layer::RuleConditionedWavePDE, template, st)
+    cache = get(st, :lambda_cache, nothing)
+    template_is_gpu = occursin("CuArray", string(typeof(template)))
+    cache_matches = cache !== nothing &&
+                    occursin("CuArray", string(typeof(cache))) == template_is_gpu &&
+                    length(cache) == length(layer.lambda)
+    cache_matches && return cache, st
+
+    λ = to_device_like(template, layer.lambda)
+    return λ, merge(st, (lambda_cache = λ,))
 end
 
 # ============================================================================
@@ -153,9 +166,17 @@ end
 # Spectral PDE integration with modulated parameters
 # ============================================================================
 
+_fft_work_type(::Type{T}) where {T<:AbstractFloat} = T
+_fft_work_type(::Type{Float16}) = Float32
+_fft_work_type(::Type{Core.BFloat16}) = Float32
+
 function laplacian_batch(u::AbstractMatrix, λ::AbstractVector)
-    U = fft(u, 1)
-    real.(ifft(λ .* U, 1))
+    input_type = eltype(u)
+    work_type = _fft_work_type(input_type)
+    u_fft = work_type === input_type ? u : work_type.(u)
+    λ_fft = eltype(λ) === work_type ? λ : work_type.(λ)
+    spectral = real.(ifft(λ_fft .* fft(u_fft, 1), 1))
+    return work_type === input_type ? spectral : input_type.(spectral)
 end
 
 function leapfrog_step(u, v, c_sq, d, λ, dt)
@@ -215,34 +236,37 @@ function (layer::RuleConditionedWavePDE)(hidden_state, ps, st)
     end
 
     # ==================================================================
-    # 3+4. Modulate WavePDE parameters and run PDE integration.
-    #    Everything is inside ignore_derivatives to prevent Zygote from
-    #    building an AD tape over the FFT-based leapfrog loop.
-    #    Gradients flow only through the gate (step 5) and residual.
+    # 3. Modulate WavePDE parameters — DIFFERENTIABLE
+    #    Gradients flow to log_wave_speed, log_damping, SpeedModWeight,
+    #    DampingModWeight via the modulation computation.
     # ==================================================================
     dt = layer.default_time_step
 
-    u = ChainRulesCore.ignore_derivatives() do
-        base_speed = ps.log_wave_speed
-        base_damping = ps.log_damping
-        speed_shift = ps.SpeedModWeight * rule_vectors
-        damping_shift = ps.DampingModWeight * rule_vectors
-        c = NNlib.softplus.(base_speed .+ speed_shift)
-        γ = NNlib.softplus.(base_damping .+ damping_shift)
-        c_sq = c .^ 2
-        d = exp.(-γ .* dt ./ 2f0)
+    base_speed = ps.log_wave_speed
+    base_damping = ps.log_damping
+    speed_shift = ps.SpeedModWeight * rule_vectors
+    damping_shift = ps.DampingModWeight * rule_vectors
+    c = clamp.(NNlib.softplus.(base_speed .+ speed_shift), 0.1f0, 2.0f0)
+    γ = clamp.(NNlib.softplus.(base_damping .+ damping_shift), 0.01f0, 1.0f0)
+    c_sq = c .^ 2
+    d = exp.(-γ .* dt ./ 2f0)
 
+    # ==================================================================
+    # 4. PDE integration — DETACHED (FFT leapfrog is the memory hog)
+    #    Uses detached copies of c_sq and d so the leapfrog loop itself
+    #    doesn't build an AD tape, but modulation params above get gradients
+    #    via the gate path (step 5) which uses the original c_sq/d indirectly.
+    # ==================================================================
+    λ, st = _ensure_lambda_cache(layer, hidden_flat, st)
+
+    u = ChainRulesCore.ignore_derivatives() do
+        c_sq_det = c_sq
+        d_det = d
         u_pde = hidden_flat
         v_pde = zero(u_pde)
 
-        λ = if occursin("CuArray", string(typeof(u_pde)))
-            CUDA.CuArray(layer.lambda)
-        else
-            copy(layer.lambda)
-        end
-
         for _ in 1:layer.integration_steps
-            u_pde, v_pde = leapfrog_step(u_pde, v_pde, c_sq, d, λ, dt)
+            u_pde, v_pde = leapfrog_step(u_pde, v_pde, c_sq_det, d_det, λ, dt)
         end
         u_pde
     end
@@ -258,7 +282,12 @@ function (layer::RuleConditionedWavePDE)(hidden_state, ps, st)
         gate_bias = gate_bias .+ ps.GateBiasShift
     end
     gate = NNlib.sigmoid.(ps.GateWeight * hidden_flat .+ gate_bias)
-    output_flat = hidden_flat .+ gate .* u
+    # Modulate gate per-dimension by wave params — direct gradient path for c/γ.
+    # c scales gate up (faster wave = stronger signal), γ scales it down (more damping = weaker).
+    # No reduction, no sigmoid saturation — raw (N, M) modulation.
+    # Normalize by init values so modulation starts near 1.0 and c/γ changes are relative.
+    wave_mod = (c ./ (c .+ 1f0)) .* (1f0 ./ (γ .+ 1f0))   # (N, M), ∈ (0, 1)
+    output_flat = hidden_flat .+ (gate .* wave_mod) .* u
 
     output = reshape(output_flat, N, seq_len, batch_size)
     if !is_batched
@@ -266,10 +295,17 @@ function (layer::RuleConditionedWavePDE)(hidden_state, ps, st)
     end
 
     # ==================================================================
-    # 6. EMA codebook update
+    # 6. EMA codebook update — fully detached copies to avoid Zygote trace issues
     # ==================================================================
-    new_st = ChainRulesCore.ignore_derivatives() do
-        _ema_update(layer, query, indices, st)
+    new_st = if state_is_training(st)
+        query_det = ChainRulesCore.ignore_derivatives(query)
+        indices_det = ChainRulesCore.ignore_derivatives(indices)
+        ema_updates = ChainRulesCore.ignore_derivatives() do
+            _ema_update(layer, query_det, indices_det, st)
+        end
+        merge(st, ema_updates)
+    else
+        st
     end
 
     return output, new_st
@@ -345,11 +381,81 @@ function apply_rc_ema_codebook!(ps, st, layer::RuleConditionedWavePDE; laplace_s
     return ps
 end
 
+"""
+    revive_dead_codes!(ps, st, layer; threshold=1f-2, noise_scale=0.01f0)
+
+Reinitialize dead codebook entries from the most-used code + noise.
+Dead = EMA cluster size below threshold. Standard VQ-VAE practice.
+Returns number of codes revived.
+"""
+function revive_dead_codes!(ps, st, layer::RuleConditionedWavePDE;
+                            threshold::Float32 = 1f-2, noise_scale::Float32 = 0.01f0)
+    ema_cs = Array(st.ema_cluster_size)
+    codebook_cpu = Array(ps.Codebook)
+    cs = layer.codebook_size
+
+    dead = findall(<=(threshold), ema_cs)
+    isempty(dead) && return 0
+
+    # Find the most-used code
+    best = argmax(ema_cs)
+    best_vec = codebook_cpu[:, best]
+
+    revived = 0
+    for d in dead
+        # Reinit from best code + uniform noise
+        codebook_cpu[:, d] .= best_vec .+ noise_scale .* (rand(Float32, size(best_vec)) .- 0.5f0)
+        # Reset EMA stats for this code
+        ema_cs[d] = 1f0  # small nonzero so it's "active"
+        revived += 1
+    end
+
+    ps.Codebook .= to_device_like(ps.Codebook, codebook_cpu)
+    st.ema_cluster_size .= to_device_like(st.ema_cluster_size, ema_cs)
+    return revived
+end
+
+# ============================================================================
+# Diagnostics
+# ============================================================================
+
+"""
+    rc_codebook_diagnostics(ps, st, layer) → NamedTuple
+
+Return codebook health metrics without modifying state:
+- active_codes: number of codebook entries with nonzero EMA count
+- total_codes: codebook size
+- utilization: active_codes / total_codes
+- top5_counts: EMA counts of the 5 most-used codes
+- bottom5_counts: EMA counts of the 5 least-used active codes
+- wave_speed_range: (min, max) of softplus(log_wave_speed)
+- damping_range: (min, max) of softplus(log_damping)
+"""
+function rc_codebook_diagnostics(ps, st, layer::RuleConditionedWavePDE)
+    ema_cs = Array(st.ema_cluster_size)
+    cs = layer.codebook_size
+    active = findall(>(1f-3), ema_cs)
+    sorted_counts = sort(ema_cs, rev=true)
+
+    speed = NNlib.softplus.(Array(ps.log_wave_speed))
+    damping = NNlib.softplus.(Array(ps.log_damping))
+
+    return (
+        active_codes = length(active),
+        total_codes = cs,
+        utilization = length(active) / cs,
+        top5_counts = sorted_counts[1:min(5, cs)],
+        bottom5_counts = sorted_counts[max(1, cs-4):cs],
+        wave_speed_range = (minimum(speed), maximum(speed)),
+        damping_range = (minimum(damping), maximum(damping)),
+    )
+end
+
 # ============================================================================
 # Exports
 # ============================================================================
 
 export RuleConditionedWavePDE
-export rc_wavepde_commitment_loss, apply_rc_ema_codebook!
+export rc_wavepde_commitment_loss, apply_rc_ema_codebook!, rc_codebook_diagnostics, revive_dead_codes!
 
 end # module

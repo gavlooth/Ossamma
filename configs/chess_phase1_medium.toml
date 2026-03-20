@@ -1,0 +1,39 @@
+# Phase 1 chess pretraining - medium practical run
+
+[data]
+path = "data/chess/lichess_db_eval.jsonl"
+max_positions = 1000000
+min_depth = 10
+
+[training]
+checkpoint_dir = "checkpoints/reasoning_drafter/phase1_medium"
+num_epochs = 10
+batch_size = 16
+gradient_accumulation_steps = 2
+learning_rate = 0.0008
+proposer_lr_scale = 0.25
+move_loss_weight = 1.0
+eval_loss_weight = 0.5
+checkpoint_every = 300
+log_every = 50
+debug_every = 1000
+seed = 42
+
+[hardware]
+mixed_precision = false
+precision = "float32"
+
+[model]
+embedding_dimension = 768
+number_of_heads = 12
+number_of_layers = 16
+time_dimension = 192
+rc_code_dim = 192
+rc_codebook_size = 1024
+rc_integration_steps = 8
+frontend_wave_heads = 6
+circuit_num_leaves = 16
+circuit_product_arity = 2
+circuit_num_sums = 8
+circuit_num_circuits = 4
+use_adapters = false

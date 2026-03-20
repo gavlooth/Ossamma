@@ -22,7 +22,7 @@ using NNlib
 using ChainRulesCore
 
 # Import shared helpers from parent Swamma module
-using ..Swamma: to_device_like, LuxLayer
+using ..Swamma: to_device_like, is_gpu_array, LuxLayer
 
 # ============================================================================
 # EngramModule
@@ -126,6 +126,21 @@ function compute_engram_indices(
     return indices
 end
 
+function prepare_engram_indices(
+    layer::EngramModule,
+    token_ids::AbstractMatrix{<:Integer},
+    hash_mults::AbstractMatrix{<:Integer};
+    reference_device = token_ids,
+)
+    token_ids_cpu = ChainRulesCore.ignore_derivatives() do
+        is_gpu_array(token_ids) ? Array(token_ids) : token_ids
+    end
+    indices_cpu = ChainRulesCore.ignore_derivatives() do
+        compute_engram_indices(layer, token_ids_cpu, Matrix{Int64}(hash_mults))
+    end
+    return to_device_like(reference_device, vec(indices_cpu))
+end
+
 # ============================================================================
 # Subtoken → token ID reconstruction
 # ============================================================================
@@ -168,7 +183,15 @@ Apply engram conditional memory injection.
 
 Returns: (output, state) where output = hidden + gate ⊙ project(engram_lookup)
 """
-function (layer::EngramModule)((token_ids, hidden_state), ps, st)
+function (layer::EngramModule)(inputs::Tuple, ps, st)
+    token_ids, hidden_state = if length(inputs) == 2
+        (inputs[1], inputs[2])
+    elseif length(inputs) == 3
+        (inputs[1], inputs[2])
+    else
+        throw(ArgumentError("EngramModule expects 2 or 3 inputs, got $(length(inputs))."))
+    end
+    precomputed_indices = length(inputs) == 3 ? inputs[3] : nothing
     is_batched = ndims(hidden_state) == 3
 
     if !is_batched
@@ -183,11 +206,11 @@ function (layer::EngramModule)((token_ids, hidden_state), ps, st)
     batch_size = size(token_ids_b, 2)
     nt = layer.total_tables
 
-    # 1. Compute hash indices on CPU (no gradient needed)
-    indices = ChainRulesCore.ignore_derivatives() do
-        idx_cpu = compute_engram_indices(layer, Array(token_ids_b), st.hash_multipliers)
-        # Transfer to same device as embedding table
-        to_device_like(ps.EmbeddingTable, vec(idx_cpu))
+    # 1. Compute or reuse hash indices outside the hot lookup path.
+    indices = if precomputed_indices === nothing
+        prepare_engram_indices(layer, token_ids_b, st.hash_multipliers; reference_device = ps.EmbeddingTable)
+    else
+        to_device_like(ps.EmbeddingTable, precomputed_indices)
     end
 
     # 2. Gather embeddings from combined table: single vectorized gather
@@ -247,6 +270,7 @@ end
 
 export EngramModule
 export subtokens_to_token_ids
+export prepare_engram_indices
 export engram_collision_rate
 
 end # module

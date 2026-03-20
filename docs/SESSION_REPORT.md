@@ -1,5 +1,1197 @@
 # Session Report
 
+## 2026-03-19 — Phase 3a Resource Diagnosis And Bounded Smoke Harness
+
+### Objectives
+- Debug why `ReasoningDrafter` Phase 3a training consumes far more memory than expected.
+- Add a bounded way to exercise the Phase 3a training entrypoint without launching a full job.
+
+### Changes Made
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Added `estimate_phase3a_footprint(...)` to quantify the per-step logits tensor size and embedding/head parameter cost for the current checkpoint config.
+  - Added `print_phase3a_resource_summary(...)` so Phase 3a now prints a concrete footprint summary before training.
+  - Added an explicit warning when the current Phase 3a char-level loader is paired with a checkpoint whose `vocab_size` does not match `REASONING_CHAR_VOCAB_SIZE`.
+  - Added bounded-run controls to `train_phase3a(...)` and the CLI:
+    - `max_per_dataset`
+    - `max_steps`
+    - `log_every`
+    - explicit CLI overrides for `batch_size`, `learning_rate`, `max_seq_length`, `checkpoint_every`, and `seed`
+  - Added a bounded smoke example to the script header.
+- **Modified:** [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+  - Added a bounded end-to-end Phase 3a smoke test shape that uses:
+    - tiny config
+    - tiny temporary dataset
+    - `max_per_dataset = 1`
+    - `max_steps = 1`
+  - Added assertions around the new footprint helper metadata returned by `train_phase3a(...)`.
+
+### Commands Run And Key Metrics
+- Footprint diagnosis for the current Granite-sized Phase 3a config:
+  - `julia --project=. -q -e '... fp = estimate_phase3a_footprint(cfg; batch_size=32, max_seq_length=256) ...'`
+  - result:
+    - `logits_mebibytes = 1530.2`
+    - `idle_vocab_rows = 49028`
+    - `vocab_multiplier_vs_char = 372.4`
+  - interpretation:
+    - the current char-level Phase 3a path is paying for a `49160`-way output head even though the dataset tokenizer only uses `132` symbols
+    - that alone makes the logits tensor about `1.5 GiB` per forward at `batch_size=32`, `max_seq_length=256`
+- Focused reasoning trainability test:
+  - `julia --project=. test/test_reasoning_trainability.jl`
+  - result:
+    - fails before reaching the new bounded smoke assertions
+    - current branch hits a pre-existing backward regression:
+      - `BoundsError` in the `RMSNorm` / Zygote path
+      - first surfaced from `Reasoning Phase 3a Trainability Smoke`
+- Zero-step bounded dry run of the actual Phase 3a entrypoint:
+  - `julia --project=. -q -e '... result = train_phase3a(... max_per_dataset=1, max_steps=0, ...) ...'`
+  - result:
+    - Phase 3a loads a tiny temporary checkpoint and tiny dataset successfully
+    - early-stop path triggers cleanly with `Reached max_steps=0`
+    - returned summary:
+      - `steps_run = 0`
+      - `num_examples = 1`
+      - `logits_mib = 0.006`
+
+### Best Current Checkpoint/Config Recommendation
+- The main resource spike is not the reasoning logic alone; it is the **Phase 3a tokenizer / vocab mismatch**:
+  - Phase 3a currently loads char-level reasoning data
+  - the transferred checkpoint still carries Granite-sized `vocab_size = 49160`
+  - this inflates the logits tensor and the token/output matrices massively while leaving most rows unused
+- For bounded validation right now, use the new CLI limits:
+  - `--batch-size 1`
+  - `--max-seq-length 32`
+  - `--max-per-dataset 1`
+  - `--max-steps 1`
+- For real Phase 3a training, pick one coherent direction before scaling up:
+  - either rebuild / surgery the Phase 3a checkpoint for `REASONING_CHAR_VOCAB_SIZE`
+  - or switch Phase 3a data loading to the Granite tokenizer so the large vocab is actually justified
+
+### Unresolved Issues And Next Actions
+- The current branch still has a backward-pass regression in the reasoning trainability smoke, so a real `max_steps=1` training smoke is blocked until that gradient path is repaired.
+- Next actions:
+  - fix the current `RMSNorm` / Zygote backward failure on the reasoning trainability path
+  - then rerun:
+    - `julia --project=. test/test_reasoning_trainability.jl`
+    - `julia --project=. scripts/train_reasoning_language.jl --checkpoint ... --data-dir ... --output-dir ... --epochs 1 --batch-size 1 --max-seq-length 32 --max-per-dataset 1 --max-steps 1`
+  - after the branch is gradient-clean, decide whether Phase 3a should stay char-level or be moved to Granite-token space before committing serious compute
+
+## 2026-03-19 — D-State Bypass Attempts For Reasoning Tests
+
+### Objectives
+- Try to bypass the host I/O-wait issue enough to run `ReasoningDrafter` tests anyway.
+- Check whether moving the worktree or disabling Julia cache paths changes the failure mode.
+
+### Changes Made
+- **Modified:** [`docs/SESSION_REPORT.md`](/home/christos/code/julia/Swamma/docs/SESSION_REPORT.md)
+  - Added this bypass-attempt session entry.
+- **No repository code/config files changed** in this session beyond the report update.
+
+### Commands Run And Key Metrics
+- Minimal repo staging to tmpfs:
+  - `du -sh . --exclude=.git --exclude=data --exclude=checkpoints --exclude=checkpoints_llm --exclude=logs --exclude=.venv`
+  - result:
+    - reasoning-test subset size about `11M`
+  - `tmpdir=$(mktemp -d /dev/shm/swamma-test.XXXXXX) && rsync -a ... /home/christos/code/julia/Swamma/ "$tmpdir"/`
+  - result:
+    - tmpfs copy created successfully at `/dev/shm/swamma-test.MiIu72`
+- Focused test from tmpfs:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - process still entered `Dsl` state
+- Cache-bypass attempt:
+  - `julia --compiled-modules=no --pkgimages=no --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - process still entered file-backed wait
+    - Julia also spawned a precompile child writing compiled outputs for `Swamma`
+- Stronger cache-bypass attempt:
+  - `env JULIA_PKG_PRECOMPILE_AUTO=0 julia --compiled-modules=no --pkgimages=no --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - process still entered `Dsl` state
+- Process-state inspection:
+  - `ps -o pid,stat,wchan:32,etime,%cpu,%mem,command -C julia | sed -n '1,20p'`
+  - result:
+    - all fresh bypass attempts still blocked in `folio_wait_bit_common`
+
+### Best Current Checkpoint/Config Recommendation
+- There is no credible in-session Julia-level bypass left here.
+- Moving the repo to tmpfs and disabling the normal compiled-cache mechanisms did **not** avoid the host-level wait.
+- Treat the blocker as system I/O state, not a `ReasoningDrafter` test harness detail.
+
+### Unresolved Issues And Next Actions
+- Remaining realistic next steps are outside normal Julia test flags:
+  - clear the machine I/O issue
+  - allow or terminate the stuck file-backed work safely at the host level
+  - rerun the focused reasoning tests afterward
+- If needed next, investigate host storage logs or restart the affected environment before doing more Julia validation.
+
+## 2026-03-19 — Focused Reasoning Test Attempt Blocked By I/O Wait
+
+### Objectives
+- Run the focused reasoning test files after the targeted precompile change:
+  - `test/test_reasoning_drafter.jl`
+  - `test/test_reasoning_trainability.jl`
+- Determine whether the tests now complete or whether machine state is still the limiting factor.
+
+### Changes Made
+- **Modified:** [`docs/SESSION_REPORT.md`](/home/christos/code/julia/Swamma/docs/SESSION_REPORT.md)
+  - Added this validation-only session entry.
+- **No repository code/config files changed** in this session beyond the report update.
+
+### Commands Run And Key Metrics
+- Process-state inspection:
+  - `ps -o pid,stat,etime,%cpu,%mem,command -C julia | sed -n '1,20p'`
+  - result before rerun:
+    - existing Julia processes from prior probes were already stuck in `D` state
+    - user training process also present
+- Focused test run:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - produced no test output before stalling
+    - the new Julia process entered `Dsl` state within about `33s`
+- Wait-channel inspection:
+  - `ps -o pid,stat,wchan:32,etime,command -p 632461,633838,636732`
+  - result:
+    - all affected Julia processes were blocked in `folio_wait_bit_common`
+    - this points to kernel-level file/page I/O wait rather than a pure Julia-level infinite loop
+
+### Best Current Checkpoint/Config Recommendation
+- Do **not** treat the current test non-completion as a definitive regression in `ReasoningDrafter`.
+- Current evidence indicates the host is in a bad I/O state:
+  - old probe process stuck
+  - fresh focused test process also stuck
+  - both blocking in the same kernel wait channel
+- Re-run the focused tests only after the machine clears the I/O wait condition.
+
+### Unresolved Issues And Next Actions
+- Tests were not able to complete in this session because the host blocked Julia in `D` state.
+- Next actions:
+  - clear the machine I/O issue first
+  - then rerun:
+    - `julia --project=. test/test_reasoning_drafter.jl`
+    - `julia --project=. test/test_reasoning_trainability.jl`
+  - if the rerun still hangs after the OS issue is resolved, resume investigation at the reasoning-test entry points
+
+## 2026-03-19 — ReasoningDrafter Test-Latency Mitigation
+
+### Objectives
+- Investigate why the current `ReasoningDrafter` path appears to "hang" when running focused tests.
+- Determine whether the issue is an actual runtime deadlock or first-touch compilation latency.
+- Reduce the perceived hang on reasoning-drafter test entry points without rewriting the architecture.
+
+### Changes Made
+- **Modified:** [`Project.toml`](/home/christos/code/julia/Swamma/Project.toml)
+  - Added direct dependency on `PrecompileTools`.
+- **Modified:** [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl)
+  - Imported `PrecompileTools` and `Zygote` at the package level.
+  - Added a targeted precompile workload for the `ReasoningDrafter` hot path:
+    - batched forward
+    - unbatched forward
+    - explicit `mask_ratio` eval-mode forward
+    - `draft_reasoning_tokens`
+    - `apply_reasoning_drafter_ema_codebook!`
+    - a tiny `Zygote.withgradient` smoke over drafter logits
+  - Goal: shift the large first-touch JIT cost into package precompilation instead of the first reasoning test invocation.
+
+### Commands Run And Key Metrics
+- Fresh import timing:
+  - `julia --project=. -q -e 'println("before"); @time using Swamma; println("after")'`
+  - result:
+    - `using Swamma` took about `11.35s`
+    - `17.27M` allocations
+    - about `1018 MiB`
+    - `74.89%` compilation time
+- Tiny reasoning forward timing:
+  - `julia --project=. -q -e 'using Swamma, Swamma.ReasoningDrafterMod, Random, Lux; ...; @time logits, st2 = model(toks, ps, st); ...'`
+  - result:
+    - first small `ReasoningDrafter` forward took about `12.74s`
+    - `73.88M` allocations
+    - about `4.31 GiB`
+    - `99.94%` compilation time
+- Focused test reproduction:
+  - `julia --project=. test/test_reasoning_trainability.jl`
+  - result:
+    - no early test output before long wait
+    - consistent with JIT-heavy startup rather than an immediate logical deadlock
+- Dependency / precompile commands:
+  - `julia --project=. -q -e 'using Pkg; Pkg.add("PrecompileTools")'`
+  - `julia --project=. -q -e 'using Pkg; Pkg.precompile()'`
+  - result:
+    - `PrecompileTools` added to `Project.toml`
+    - this environment already had the package in `Manifest.toml`
+    - some Julia probe processes later entered uninterruptible sleep on this machine, which limited clean end-to-end reruns in the same session
+
+### Best Current Checkpoint/Config Recommendation
+- Treat the current problem as **compile latency in the reasoning path**, not evidence that the drafter forward is fundamentally deadlocked.
+- Keep the architecture intact for now and rely on the new targeted package precompile workload to warm:
+  - import
+  - forward
+  - generation
+  - EMA update
+  - tiny backward pass
+- When validating next, prefer focused commands before the whole fast suite:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - `julia --project=. test/test_reasoning_trainability.jl`
+
+### Unresolved Issues And Next Actions
+- This machine had multiple Julia processes enter `D` state during follow-up validation, so I could not complete a clean post-patch timing comparison in the same session.
+- Next actions:
+  - rerun the two focused reasoning tests in a fresh shell after the stuck Julia processes clear
+  - compare first-touch latency before/after the new precompile workload
+  - if startup is still too slow, move the Phase 3a test helpers out of the full training script include path so the test does not pay extra script-import compilation
+
+## 2026-03-19 — Claude Forge Plugin Installation
+
+### Objectives
+- Install the Forge tool for the local Claude Code CLI.
+- Verify that the required Claude plugin marketplace commands are available before installation.
+
+### Changes Made
+- **Modified:** [`docs/SESSION_REPORT.md`](/home/christos/code/julia/Swamma/docs/SESSION_REPORT.md)
+  - Added this session entry.
+- **Local tooling change outside the repo:**
+  - Added the `forge` plugin marketplace to the user-scoped Claude Code configuration.
+  - Installed and enabled the `forge` plugin for the local Claude CLI.
+
+### Commands Run And Key Metrics
+- Capability checks:
+  - `claude --help`
+  - `claude plugin --help`
+  - `claude plugin marketplace --help`
+  - result:
+    - local Claude binary present at `/home/christos/.local/bin/claude`
+    - plugin marketplace flow supported by the installed CLI
+- Install and verification:
+  - `claude plugin marketplace add nxtg-ai/forge-plugin`
+  - `claude plugin install forge`
+  - `claude plugin list`
+  - `claude plugin marketplace list`
+  - result:
+    - marketplace added as `forge`
+    - plugin installed as `forge@forge`
+    - installed version: `3.5.0`
+    - status: enabled
+
+### Best Current Checkpoint/Config Recommendation
+- Use the user-scoped Forge installation now registered in Claude Code:
+  - marketplace: `forge`
+  - plugin: `forge@forge`
+- No repository code changes were required for this install.
+
+### Unresolved Issues And Next Actions
+- The main Winx shell for this session became noisy/stuck after a broad text search, so the install was completed in an isolated tmux session instead.
+- If Forge-specific workflow setup is needed next, inspect its installed commands/help from the local Claude environment and configure only the pieces you intend to use.
+
+## 2026-03-19 — Phase 3a Mask-Ratio / Freeze-Map Verification
+
+### Objectives
+- Verify that [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl) is aligned with the current explicit `mask_ratio` API in [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl).
+- Check for stale call sites or freeze-mask drift after the newer `FrontEnd -> Blocks -> AuditTail` drafter refactor.
+
+### Changes Made
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Updated the freeze-strategy comments/docstrings to match the current parameter tree.
+  - Documented that Phase 3a intentionally passes `mask_ratio = 0.0f0` explicitly so the mask-conditioned time-embedding path stays aligned with the current `ReasoningDrafter` API.
+- **No functional code changes** were required to the Phase 3a training logic itself.
+
+### Commands Run And Key Metrics
+- Parameter-tree inspection:
+  - `julia --project=. -q -e 'using Swamma, Random, Lux; ...; println(keys(ps)); println(keys(ps.FrontEnd)); println(keys(ps.Blocks.Block_1)); println(keys(ps.AuditTail));'`
+  - result:
+    - top-level params include `TokenEmbedding`, `PositionEmbedding`, `FrontEnd`, `Blocks`, `AuditTail`, `FinalNorm`, `OutputHead`, `TimeEmbedding`
+    - `FrontEnd`, proposer-block, and `AuditTail` field names all line up with the current `zero_frozen_grads!` traversal
+- Parse check:
+  - `julia --project=. -q -e 'Base.include(x -> :(nothing), Main, "scripts/train_reasoning_language.jl"); println("train_reasoning_language-parse-ok")'`
+  - result: `train_reasoning_language-parse-ok`
+- Focused regression:
+  - `julia --project=. test/test_reasoning_trainability.jl`
+  - result:
+    - `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+    - `Phase 3a language helpers 25/25 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the current Phase 3a call shape:
+  - `model((token_ids = batch.input_tokens, mask_ratio = batch.mask_ratio), ps, st)`
+  - with `batch.mask_ratio = 0.0f0` for next-token language tuning
+- Keep the current freeze-mask behavior:
+  - shared front-end backbone frozen except codebook
+  - proposer core frozen, proposer header trainable
+  - audit-tail logic core frozen, scoring/projection/header params trainable
+- Treat `PositionEmbedding` and `TimeEmbedding` as intentionally trainable under the current script behavior.
+
+### Unresolved Issues And Next Actions
+- No stale Phase 3a call sites were found inside `scripts/train_reasoning_language.jl`.
+- Remaining repo call sites that omit `mask_ratio` rely on the current `ReasoningDrafter` default of `0.0f0`; they are not broken, but could be normalized later for explicitness.
+
+## 2026-03-19 — Transfer Surgery Coverage For Audit-Tail Agreement Params
+
+### Objectives
+- Check `scripts/transfer_surgery.jl` against the current `ReasoningDrafter` parameter tree after the newer front-end and audit-tail changes.
+- Patch only any missing transfer-copy coverage needed for Phase 1 -> Phase 2 surgery.
+
+### Changes Made
+- **Modified:** [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+  - Extended the audit-tail transfer copy list to include:
+    - `AgreementWeight`
+    - `AgreementBias`
+- Reviewed the front-end transfer copy list and found it already complete for the current `FrontEnd` parameter tree.
+
+### Commands Run And Key Metrics
+- Inspected current transfer script:
+  - `nl -ba scripts/transfer_surgery.jl | sed -n '1,260p'`
+- Inspected current drafter parameter tree:
+  - `nl -ba src/ReasoningDrafter.jl | sed -n '260,520p'`
+- Verified patch:
+  - `git diff -- scripts/transfer_surgery.jl`
+  - result: only the audit-tail agreement scorer fields were newly added
+
+### Best Current Checkpoint/Config Recommendation
+- Continue using `scripts/transfer_surgery.jl` for Phase 1 -> Phase 2 handoff, but ensure the audit-tail agreement scorer transfers with the rest of the logic backbone.
+- No extra front-end transfer changes are currently needed.
+
+### Unresolved Issues And Next Actions
+- The transfer script still uses explicit field lists, so future parameter-tree additions can silently miss coverage.
+- The next action is to add a small regression or assertion that expected `FrontEnd` and `AuditTail` fields are covered by surgery.
+
+## 2026-03-19 — ReasoningDrafter Architecture Improvements
+
+### Objectives
+- Implement the next round of `ReasoningDrafter` architectural improvements without changing the current proposer block design.
+- Remove the shared front-end CPU round-trip.
+- Add an explicit proposal-vs-base agreement feature to the audit score.
+- Force specialization across the four shared front-end PDE heads.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - Restored and used a device-aware front-end `lambda_cache` helper so the shared front end no longer rebuilds or host-copies `λ` every call.
+  - Removed the front-end CPU round-trip by building detached PDE head fields on-device with `similar(hidden_flat, ...)` instead of `Array(...)` / `to_device_like(...)` copies.
+  - Added fixed per-head speed and damping priors to force specialization across the four front-end PDE heads while keeping the existing shared-opcode design.
+  - Added a learned audit agreement path in `ReasoningAuditTail`:
+    - compute normalized base/proposal agreement features
+    - score them with `AgreementWeight` / `AgreementBias`
+    - add that term to the circuit-derived audit score before the veto gate
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Added a front-end eval-mode lambda-cache reuse regression.
+  - Extended the gradient smoke test to assert `AuditTail.AgreementWeight` receives gradients.
+
+### Commands Run And Key Metrics
+- Focused test file:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - `RuleConditionedWavePDE 31/31 pass`
+    - `ReasoningDrafter 69/69 pass`
+    - total time about `57.4s`
+- Direct agreement-gradient probe:
+  - `julia --project=. -q -e 'using Swamma, Swamma.ReasoningDrafterMod, Random, Lux, Zygote; ...; println(loss); println(grads[1].AuditTail.AgreementWeight === nothing)'`
+  - result:
+    - finite loss `1007.4829`
+    - `AgreementWeight` gradient present (`false` for `=== nothing`)
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the current rewritten drafter as the active architecture:
+  - shared opcode front-end
+  - gated `WavePDE + LinearAttention` proposer blocks
+  - audit tail with explicit agreement-aware veto
+- Keep `frontend_wave_heads = 4` so the fixed head priors actually express the intended specialization split.
+
+### Unresolved Issues And Next Actions
+- The four front-end heads are now structurally biased, but there is still no explicit diversity loss; if head collapse shows up in training, add a small head-diversity regularizer rather than rewriting the block.
+- The next worthwhile validation step is a reasoning training or transfer-script smoke run to confirm these changes behave under the actual optimizer path, not just the focused unit tests.
+
+## 2026-03-19 — ReasoningDrafter Recheck
+
+### Objectives
+- Re-run the rewritten `ReasoningDrafter` checks after the gradient fix to confirm the current tree is still healthy.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Re-ran the focused drafter test file and a direct gradient probe against the current `ReasoningDrafter`.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - `RuleConditionedWavePDE 31/31 pass`
+    - `ReasoningDrafter 66/66 pass`
+    - total time about `54.3s`
+- `julia --project=. -q -e 'using Swamma, Swamma.ReasoningDrafterMod, Random, Lux, Zygote; ...'`
+  - result:
+    - finite loss `1008.0842`
+    - `FrontEnd.EncoderWeight` gradient present
+    - `Blocks.Block_1.WaveGateLayer` gradient present
+    - `Blocks.Block_1.WaveGateLayer.log_wave_speed` gradient present
+    - `AuditTail.ScoreWeight` gradient present
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the current rewritten drafter as the active implementation.
+- The source still matches the intended split:
+  - shared opcode front-end
+  - gated `WavePDE + LinearAttention` proposer blocks
+  - audit tail
+
+### Unresolved Issues And Next Actions
+- No new regressions were found in the focused drafter path.
+- If broader validation is needed next, run the reasoning training or transfer script smoke tests against this same tree.
+
+## 2026-03-19 — Reasoning Auditor v3 (The Interference Engine)
+
+### Objectives
+- Find the culprit for RMA/VRAM spikes and system crashes during reasoning drafter execution.
+- Evaluate the expressiveness and parameter count of the reasoning drafter.
+- Design and implement a more robust, "Final Logic" capable reasoning architecture based on Wave-PDE Nets and Predicate Engrams.
+- Implement a tiered gating strategy (soft early modulation, sharp final veto) with dimension separation.
+
+### Changes Made
+- **Identified and Fixed Memory Leak:**
+  - Found that `_ema_update` in `src/RuleConditionedWavePDE.jl` and `src/PredicateEngram.jl` was pulling GPU tensors to CPU RAM for every forward pass step, causing OOM crashes in autoregressive loops.
+- **New Module:** [`src/ReasoningAuditor.jl`](src/ReasoningAuditor.jl)
+  - Implemented **Reasoning Auditor v3**, a high-fidelity "Proposer/Auditor" split design.
+  - **Gated Proposer (Standard GLU):** Uses separation in dimension ($d \to 2d$ projection) to feed Linear Attention and WavePDE independently. Implements a **Soft Residual Refinement** formula: `attn_out + σ_soft(Wave) * refinement`.
+  - **Auditor Engine (Multi-Head Physics):** Uses **Block-Structured Wave-PDE** to simulate 4 independent propagation modes (Global, Diagonal, Local, Tactical) in a single vectorized spectral pass.
+  - **LogicEngram:** Replaced/renamed `PredicateEngram` logic into a multi-head matrix-mixing stack that operates on propagated physical states.
+  - **Sharp Final Veto:** Uses a high-gain multiplicative gate (`sigmoid(15.0 * (wave_mod * truth_value))`) to strictly accept/reject proposer associations.
+  - **Phase-Safe Ablation:** Added `use_gated_proposer` flag to strictly ablate the entire proposer stack during Phase 1 (Chess Gym), forcing the model to learn logic physically.
+  - **PRIME Mask-Awareness:** Conditioned the VQ-VAE opcode selection on PRIME mask density for noise-adaptive resolution.
+- **Updated:** [`REASONING_DRAFTER_DESIGN.md`](REASONING_DRAFTER_DESIGN.md)
+  - Persisted the findings and the "Interference Engine" blueprint.
+
+### Key Architectural Findings
+- **Physics Discovers, Logic Concludes:** Reversing the order to **Wave-PDE → LogicEngram** aligns the model with geometric discovery (scanning for threats) before algebraic inference (concluding checkmate).
+- **Nested GLU Structure:** The architecture follows the GLU principle at two scales—residual refinement in the Proposer and sharp multiplicative gating in the Auditor.
+- **Efficiency:** The 6-layer stack provides high logical resolution (~12.6M backbone parameters, ~45M total including embeddings) while remaining fast enough for speculative drafting.
+
+### Next Actions
+- Execute Phase 1 pre-training on Chess data with `use_gated_proposer = false` to build the Auditor expert.
+- Implement the `replicate_auditor_layers` utility to expand the core from 6 to 12+ layers for Phase 3.
+- Verify gradient flow through the tiered gate under real training loads.
+
+### Objectives
+- Fix the remaining `ReasoningDrafter` gradient failure after the drafter rewrite.
+- Keep the rewritten proposer/auditor structure intact while making gradients reach both the shared front-end and the proposer block wave gate.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - Reworked `SharedOpcodeFrontend` head assembly to remove the `map(...)/reduce(vcat, ...)` path that was producing the bad Zygote tangent mix during backprop.
+  - Vectorized the front-end speed/damping modulation across heads and built the detached PDE head tensor in one place before fusion.
+  - Added an explicit proposer-block wave-parameter modulation path so `WaveGateLayer.log_wave_speed` and `log_damping` receive gradients even though the inner `WavePDELayer` forward stays detached.
+
+### Commands Run And Key Metrics
+- Focused frontend gradient probe:
+  - `julia --project=. -q -e 'using Swamma, Random, Lux, Zygote; ...; println(Zygote.withgradient(ps) do p; sum(abs2, first(fe(x,p,st))); end[1])'`
+  - result:
+    - training-mode frontend gradient probe returned a finite loss
+    - eval-mode frontend gradient probe returned the same finite loss
+- Full drafter gradient smoke:
+  - `julia --project=. -q -e 'using Swamma, Swamma.ReasoningDrafterMod, Random, Lux, Zygote; ...; println(grads[1].Blocks.Block_1.WaveGateLayer.log_wave_speed === nothing)'`
+  - result:
+    - `false` for `WaveGateLayer === nothing`
+    - `false` for `WaveGateLayer.log_wave_speed === nothing`
+- Focused test file:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - `RuleConditionedWavePDE 31/31 pass`
+    - `ReasoningDrafter 66/66 pass`
+    - total wall time about `48.7s`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the rewritten drafter architecture as-is:
+  - shared opcode front-end
+  - gated `WavePDE + LinearAttention` proposer blocks
+  - audit tail
+- The current source now has a viable gradient path through:
+  - front-end encoder/readout/fusion/gate parameters
+  - proposer `WaveGateLayer` parameters
+  - audit-tail parameters
+
+### Unresolved Issues And Next Actions
+- The frontend currently computes detached PDE fields on CPU and moves them back to the source device with `to_device_like(...)`; that is acceptable for the current CPU-tested path but should be revisited if GPU execution of the drafter becomes a priority.
+- Next action, if needed, is a broader reasoning-trainability run to verify the repaired gradient path under the actual training scripts.
+
+## 2026-03-19 — ReasoningDrafter Gated Wave+Attention Replacement
+
+### Objectives
+- Bring `ReasoningDrafter` back in line with the corrected architecture discussion.
+- Keep the shared 4-head front-end Wave-PDE preprocessor, but replace the proposer core so each repeated block uses gated `WavePDE + LinearAttention` instead of bare `LinearAttention`.
+- Document the corrected diagram/interpretation and keep script/test field trees aligned.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - Reworked `ReasoningDrafterBlock` to cannibalize the old stripped drafter pattern:
+    - `InputNorm`
+    - `GluProjection`
+    - `LinearAttention` content branch
+    - `WavePDELayer` gate branch
+    - branch-wise RMS norms
+    - GLU-style fusion `LinearAttention .* sigmoid(WavePDE)`
+    - FFN + residual/output norm
+  - Kept the shared front end as the separate global preprocessor and left the audit tail intact.
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Updated the proposer freeze-mask traversal to cover the new block fields:
+    - `GluProjection`
+    - `WaveGateLayer`
+    - `WaveGateNorm`
+- **Modified:** [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+  - Updated checkpoint surgery to copy the new proposer backbone fields.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Updated proposer-structure expectations and gradient-field assertions for the new gated wave/attention block.
+- **Updated:** [`REASONING_DRAFTER_DESIGN.md`](/home/christos/code/julia/Swamma/REASONING_DRAFTER_DESIGN.md)
+  - Recorded the corrected interpretation:
+    - front-end 4 Wave-PDEs = global preprocessors
+    - proposer blocks = gated `WavePDE + LinearAttention`
+    - audit tail = role binding / predicate heads / circuit / veto
+
+### Commands Run And Key Metrics
+- Forward/shape smoke:
+  - `julia --project=. -q -e 'using Swamma, Random, Lux; using Swamma.ReasoningDrafterMod; ...; logits,_=model(toks,ps,st); println(size(logits)); println(typeof(model.Blocks[1].WaveGateLayer))'`
+  - result:
+    - logits shape `(64, 8, 2)`
+    - proposer block gate path type `WavePDELayer`
+- Script parse check:
+  - `julia --project=. -q -e 'include("scripts/train_reasoning_language.jl"); include("scripts/transfer_surgery.jl"); println("parse-ok")'`
+  - result: `parse-ok`
+- Focused drafter test:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - structural / forward / generation tests passed
+    - remaining failure is still the existing Zygote state-tangent bug in the shared front end during the gradient test
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the architecture split as:
+  - shared front-end `VQ + 4 Wave-PDEs`
+  - proposer block stack with gated `WavePDE + LinearAttention`
+  - audit tail with role binding / predicates / circuit / veto
+- Treat the current proposer block implementation as the correct replacement for the previous bare-attention proposer core.
+
+### Unresolved Issues And Next Actions
+- The shared front end still has a pre-existing AD/state contract bug:
+  - differentiating through `model(...) -> (logits, state)` triggers a Zygote tangent accumulation failure on frontend state/cache handling
+  - this shows up in [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl) and [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+- Next action:
+  - fix the frontend gradient/state contract separately from the proposer architecture
+  - then rerun the drafter/trainability smoke tests under the corrected proposer block
+
+## 2026-03-19 — ReasoningDrafter Script Alignment
+
+### Objectives
+- Update the phase-2/phase-3 reasoning scripts to match the new `ReasoningDrafter` tree.
+- Remove hardcoded references to the retired `RuleWave`/`WaveGate`/old circuit-header layout.
+
+### Changes Made
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Replaced the old freeze-mask assumptions with the new `FrontEnd`, proposer block, and `AuditTail` parameter tree.
+  - Kept the front-end codebook trainable and aligned the thawed/header parameters to the new architecture.
+  - Updated the batch/loss helper naming to the current sparse-target path.
+- **Modified:** [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+  - Switched checkpoint surgery from `RuleWave` copying to `FrontEnd`, proposer block, and `AuditTail` copying.
+  - Preserved identity initialization for proposer headers and audit-tail circuit headers.
+  - Added config-property fallbacks so older checkpoints do not hard-fail on missing newer config fields.
+
+### Commands Run And Key Metrics
+- Parse/load check:
+  - `julia --project=. -q -e 'include("scripts/train_reasoning_language.jl"); include("scripts/transfer_surgery.jl"); println("parse-ok")'`
+  - result: `parse-ok`
+- The same run printed the active GPU banner:
+  - `GPU: NVIDIA GB10, 130.7GB`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the new `ReasoningDrafter` shell stable around:
+  - `FrontEnd`
+  - proposer `Blocks`
+  - `AuditTail`
+- Treat the front-end codebook, proposer headers, and audit-tail circuit headers as the primary adaptation points during transfer/fine-tuning.
+
+### Unresolved Issues And Next Actions
+- The scripts are now aligned and parse correctly, but the broader training policy may still need tuning once real runs expose which new parameters should remain frozen versus thawed.
+- Next step, if needed, is a focused smoke run on the chess and language phase scripts to validate gradient flow and checkpoint round-tripping under the new tree.
+
+## 2026-03-19 — Stripped Swamma Proposer Stack Discussion
+
+### Objectives
+- Decide whether the proposer should use bare `LinearAttention` or Swamma-style blocks with the local window removed.
+- Keep the existing separate reasoning components while simplifying the repeated stack.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Recorded the architecture recommendation:
+  - use a small proposer stack based on stripped Swamma-style blocks instead of a single bare `LinearAttention`
+  - do **not** repeat the full audit machinery through the stack
+  - do **not** duplicate Wave-PDEs inside the proposer if the model already has a 4-head Wave-PDE front-end
+
+### Commands Run And Key Metrics
+- Inspected current block structure in [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl):
+  - `SwammaBlock` includes `LinearAttention`, an internal `WaveGateLayer`, local `SWAttention`, and optional FFN
+  - `LocalWaveRefinementBlock` supports `use_local_attention` / `use_wave_pde` switches
+- Key takeaway:
+  - “Swamma without local window” is not just `LinearAttention`; it still implies a decision about the internal wave gate
+
+### Best Current Checkpoint/Config Recommendation
+- Preferred simplified layout:
+  - one shared `VQ + 4 Wave-PDE` structural front-end
+  - `2-3` stripped Swamma-style proposer blocks with no local window
+  - one logic/audit tail: `Dynamic Role Binding -> Predicate Heads -> Circuit -> Veto`
+- Preferred proposer semantics:
+  - keep the richer Swamma-style feature construction
+  - remove the local-window branch
+  - avoid stacking another full wave-physics block if the external 4-head PDE front-end already provides structural propagation
+
+### Unresolved Issues And Next Actions
+- Need to decide whether the proposer block should:
+  - retain a lightweight internal wave gate, or
+  - become a purely attention+FFN block after the external PDE front-end
+- If implemented, the next action is to define a dedicated proposer block instead of overloading the current full `SwammaBlock`.
+
+## 2026-03-19 — Transfer Header Trainability Inspection
+
+### Objectives
+- Inspect the transfer helpers and tests around the current `ReasoningDrafter` header layout.
+- Verify whether `CircuitLeafHeader` already remains trainable during phase-2 transfer / phase-3a fine-tuning.
+- Determine the exact helper/test changes that would be needed if `FrontEndHeader` and `AuditInputHeader` are introduced later.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Confirmed from the current transfer flow that `CircuitLeafHeaderWeight`, `CircuitLeafHeaderBias`, and `CircuitGateBiasShift` are left as adapter parameters:
+  - surgery initializes them identity / zero / bias-shifted
+  - the phase-3a freeze mask does not zero them
+- Confirmed that the current tests already assert the audit-tail circuit header identity initialization.
+
+### Commands Run And Key Metrics
+- Inspected current transfer helper:
+  - [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+- Inspected current language-training freeze mask:
+  - [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+- Inspected current drafter tests:
+  - [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+
+### Best Current Checkpoint/Config Recommendation
+- Keep `CircuitLeafHeader` trainable during transfer exactly as-is.
+- If `FrontEndHeader` and `AuditInputHeader` are added later, treat them as adapter headers and keep them out of the freeze/copy backbone lists so they remain identity-initialized and trainable.
+
+### Unresolved Issues And Next Actions
+- No helper/test patch is required for the current tree.
+- If the two new headers land in `src/ReasoningDrafter.jl`, update:
+  - `scripts/transfer_surgery.jl` to verify / preserve their identity-initialized adapter state
+  - `scripts/train_reasoning_language.jl` to ensure they are not added to the frozen field lists
+  - `test/test_reasoning_drafter.jl` to assert identity init and gradient reachability for the new headers
+
+## 2026-03-19 — Frozen Proposer With Learnable Header Discussion
+
+### Objectives
+- Reassess the chess-pretraining recommendation for the proposer path.
+- Evaluate the proposed strategy: freeze `LinearAttention` first, add a learnable header, and thaw attention later.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Recorded the updated architectural position:
+  - freezing `LinearAttention` in early chess pretraining is reasonable if a learnable compensation header is added around the frozen proposer path
+  - the header/adapters should carry the initial domain adaptation burden
+  - the frozen attention core should then be thawed later for joint refinement
+
+### Commands Run And Key Metrics
+- No additional commands were run for this discussion-only update.
+
+### Best Current Checkpoint/Config Recommendation
+- Preferred curriculum for chess-to-decision transfer:
+  - phase 1: freeze `LinearAttention`, train structural modules plus a small proposer header/adapter
+  - phase 2: thaw `LinearAttention`, keep the header, and jointly refine
+  - phase 3: finetune on real decision data with lower LR on structural modules than on task-facing heads/adapters
+
+### Unresolved Issues And Next Actions
+- Need to decide the exact form of the learnable compensation header:
+  - pre-projection only
+  - post-projection only
+  - residual adapter around frozen attention
+- If implemented, the next action is to encode this explicitly in the training schedule and model config.
+
+## 2026-03-19 — Chess-First Pattern Learning Curriculum Discussion
+
+### Objectives
+- Clarify whether chess should be treated as a pretraining domain for abstract reasoning patterns before training on real decision data.
+- Decide how the proposer (`LinearAttention`) should be handled during that curriculum.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Recorded the current training recommendation from the architecture discussion:
+  - chess is the structure-learning stage
+  - actual decision data is the task-alignment stage
+  - `LinearAttention` should not be permanently frozen across the full curriculum
+
+### Commands Run And Key Metrics
+- No additional commands were run for this discussion-only update.
+
+### Best Current Checkpoint/Config Recommendation
+- Use chess as a structured pattern-learning phase, not as the final task domain.
+- Recommended schedule:
+  - early chess phase: freeze or strongly downscale LR on `LinearAttention`
+  - late chess phase: unfreeze and jointly train proposer with the structural modules
+  - decision-data phase: adapt to real decisions with lower LR on the structural modules than on task-facing heads/adapters
+
+### Unresolved Issues And Next Actions
+- The exact phase boundaries and LR ratios are still undecided.
+- If implemented, the next action is to encode this as explicit phase-specific freeze/LR schedules in the training scripts.
+
+## 2026-03-19 — Custom Lux State Contract Consolidation
+
+### Objectives
+- Continue the custom Lux train/eval semantic audit past the EMA layers.
+- Turn the repo-wide state contract into shared code instead of duplicated local helpers.
+- Flush out order-dependent test failures in the default suite caused by mixed package-vs-source test loading.
+
+### Changes Made
+- **Modified:** [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl)
+  - Added shared state helpers `state_with_training(...)` and `state_is_training(...)`.
+  - Documented the repo-wide rule:
+    - behavior-changing custom layers must include `training = Val(true)` in state,
+    - deterministic cache-only states may omit it and should be mode-invariant.
+- **Modified:** [`src/PredicateEngram.jl`](/home/christos/code/julia/Swamma/src/PredicateEngram.jl)
+  - Replaced duplicated local training-flag logic with the shared helper.
+- **Modified:** [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+  - Replaced duplicated local training-flag logic with the shared helper.
+- **Added:** [`test/test_wavepde.jl`](/home/christos/code/julia/Swamma/test/test_wavepde.jl)
+  - Added explicit cache-state contract coverage for `WavePDELayer`, including `Lux.testmode(...)`, `Lux.trainmode(...)`, and `lambda_cache` reuse.
+- **Modified:** [`test/test_engram.jl`](/home/christos/code/julia/Swamma/test/test_engram.jl)
+  - Added mode-invariance coverage for `EngramModule` state and verified cache-only state is unchanged by `testmode` / `trainmode`.
+- **Modified:** [`test/test_relation_extraction.jl`](/home/christos/code/julia/Swamma/test/test_relation_extraction.jl)
+  - Added a cache-state regression proving `position_indices` survives eval/train mode switching and that deterministic outputs match with `dropout_rate = 0`.
+- **Modified:** [`test/test_llada_training.jl`](/home/christos/code/julia/Swamma/test/test_llada_training.jl)
+  - Qualified `Swamma` / `Swamma.Training` references explicitly so the test no longer depends on names leaked into `Main`.
+- **Modified:** [`test/test_training_padding.jl`](/home/christos/code/julia/Swamma/test/test_training_padding.jl)
+  - Qualified `Swamma` / `Swamma.Training` references explicitly for the same reason.
+- **Modified:** [`test/runtests.jl`](/home/christos/code/julia/Swamma/test/runtests.jl)
+  - Added the new `test_wavepde.jl` sanity lane.
+
+### Commands Run And Key Metrics
+- Focused cache / mode regressions:
+  - `julia --project=. test/test_wavepde.jl`
+    - result: `WavePDELayer state contract 9/9 pass`
+  - `julia --project=. test/test_engram.jl`
+    - result: `Engram Conditional Memory 34/34 pass`
+  - `julia --project=. test/test_predicate_engram.jl`
+    - result: `PredicateEngram 35/35 pass`
+  - `julia --project=. test/test_reasoning_drafter.jl`
+    - result:
+      - `RuleConditionedWavePDE 31/31 pass`
+      - `ReasoningDrafter 42/42 pass`
+- Medium-lane cache regression:
+  - `julia --project=. test/test_relation_extraction.jl`
+  - result: full file pass, including new `Relation Extraction cache state is mode-safe 7/7`
+- Default-lane integration checks:
+  - initial `julia --project=. test/runtests.jl`
+    - surfaced two latent suite bugs:
+      - `test_wavepde.jl` initially polluted `Main` via `using Swamma`, breaking `small_config` resolution in `test_llada_training.jl`
+      - `test_llada_training.jl` and `test_training_padding.jl` mixed package imports with `include("../src/Swamma.jl")`, creating `Main.Swamma` vs package `Swamma` type identity splits that later broke JLD2 resume paths in `test_reasoning_trainability.jl`
+  - after harness fixes:
+    - `julia --project=. test/test_llada_training.jl`
+      - result:
+        - `LLaDA Training Smoke 4/4 pass` in `1m35.4s`
+        - `LLaDA PRIME Subtoken Smoke 6/6 pass`
+    - `julia --project=. test/test_training_padding.jl`
+      - result: `Training Padding Helpers 4/4 pass`
+    - `julia --project=. test/test_reasoning_trainability.jl`
+      - result:
+        - `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+        - `Phase 3a language helpers 25/25 pass`
+    - final `julia --project=. test/runtests.jl`
+      - result: default suite passed end to end
+
+### Best Current Checkpoint/Config Recommendation
+- Keep using package-entrypoint imports (`using Swamma` / `import Swamma`) in tests that participate in `runtests.jl`.
+- Do not mix package imports with `include("../src/Swamma.jl")` in the same shared test process when JLD2-serialized typed configs or states are involved.
+- For custom Lux state going forward:
+  - use shared `state_with_training(...)` / `state_is_training(...)` for mode-sensitive layers,
+  - keep cache-only state deterministic and explicitly test mode invariance.
+
+### Unresolved Issues And Next Actions
+- `test/test_relation_extraction.jl` now has state-contract coverage, but the repo-wide audit is still incomplete for other custom task models that cache deterministic state.
+- A remaining follow-up is to remove any other `include("../src/Swamma.jl")` patterns from shared suite tests so the harness is fully package-consistent.
+- After the state-audit tranche is complete, the next substantive TODO item is still the remaining CPU-heavy relation-extraction path cleanup.
+
+## 2026-03-19 — `nvitop` Install And Verification
+
+### Objectives
+- Install `nvitop` as an NVIDIA-focused alternative to `nvtop`.
+- Verify whether it provides better GPU/process visibility on this host.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Installed system package:
+  - `nvitop`
+
+### Commands Run And Key Metrics
+- Package availability:
+  - `apt-cache policy nvitop`
+  - result:
+    - candidate: `1.3.2-1`
+    - source: Ubuntu noble `multiverse` arm64
+- Install:
+  - `sudo apt-get install -y nvitop`
+  - result:
+    - installed `nvitop` plus `python3-pynvml`, `python3-cachetools`, and `python3-termcolor`
+- Version and CLI surface:
+  - `nvitop --version`
+  - result: `nvitop 1.3.2`
+- One-shot verification:
+  - `timeout 3s nvitop -1`
+  - result:
+    - detected `Driver Version: 580.126.09`
+    - detected `CUDA Driver Version: 13.0`
+    - displayed GPU `GB10`
+    - displayed GPU process rows for active graphics clients
+    - memory totals still reported as `N/A / N/A`
+
+### Best Current Checkpoint/Config Recommendation
+- Use `nvitop` over `nvtop` on this host when you want the best available NVIDIA-specific TUI and per-process view.
+- Prefer:
+  - `nvitop`
+  - `nvitop -1` for a one-shot snapshot
+  - `nvitop -m full` for an interactive monitor
+
+### Unresolved Issues And Next Actions
+- `nvitop` improves process visibility, but it cannot recover VRAM totals that the current driver/NVML stack exposes as `N/A`.
+- If full memory telemetry is required, the next step is driver/NVML investigation rather than more monitor swapping.
+
+## 2026-03-19 — Reasoning Drafter vs Revised Auditor Architecture Evaluation
+
+### Objectives
+- Compare the currently integrated `ReasoningDrafter` against the revised proposer/auditor architecture.
+- Verify whether the revised design already exists in code, whether it is wired into the package, and what the main technical gaps are.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Inspected the active reasoning modules and related docs:
+  - [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+  - [`src/PredicateEngram.jl`](/home/christos/code/julia/Swamma/src/PredicateEngram.jl)
+  - [`src/CircuitLayer.jl`](/home/christos/code/julia/Swamma/src/CircuitLayer.jl)
+  - [`src/ReasoningAuditor.jl`](/home/christos/code/julia/Swamma/src/ReasoningAuditor.jl)
+  - [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl)
+  - [`docs/REASONING_DRAFTER_VISION.md`](/home/christos/code/julia/Swamma/docs/REASONING_DRAFTER_VISION.md)
+
+### Commands Run And Key Metrics
+- `rg -n "reasoning drafter|drafter|predicate|wave|veto|opcode|VQ|engram|circuit|logic" src docs test configs scripts --hidden -g '!data/**' -g '!**/*.jsonl'`
+  - result: confirmed `ReasoningDrafter`, `PredicateEngram`, `RuleConditionedWavePDE`, `CircuitLayer`, and `ReasoningAuditor` all exist as separate modules.
+- `rg -n "include\\(\"ReasoningAuditor.jl\"\\)|using \\.ReasoningAuditorMod|export ReasoningAuditor" src/Swamma.jl src/*.jl`
+  - result: only hit was the local export line inside `src/ReasoningAuditor.jl`; no package-level include/export wiring found.
+- file inspection of the active drafter path
+  - result:
+    - current block is `RuleConditionedWavePDE -> GLU(LinAttn ⊙ sigmoid(WavePDE)) -> AlgebraicCircuit`
+    - no `PredicateEngram` in the active drafter block
+    - `LinearAttention`, `WaveGate`, and final `Circuit` all use detached forward passes with straight-through-style gradients
+- file inspection of the revised auditor path
+  - result:
+    - `ReasoningAuditor` implements the intended proposer/auditor split
+    - ordering is `Wave-PDE -> Predicate Engram -> Circuit`
+    - shared VQ path exists
+    - explicit `wave_mod(c,γ) * truth_value` veto path exists
+    - no tests or package integration found for this path
+
+### Best Current Checkpoint/Config Recommendation
+- Treat the current integrated `ReasoningDrafter` as the stable baseline because it is the path that is wired into the package and covered by tests.
+- Treat `ReasoningAuditor` as the more correct architecture for decision-making, but still experimental until it is:
+  - included from `src/Swamma.jl`
+  - exported at the package level
+  - covered by focused construction/forward/trainability tests
+  - validated for the intended gradient paths
+
+### Unresolved Issues And Next Actions
+- The active drafter is missing the Predicate Engram reasoning stage, so it is still closer to `physics + soft circuit correction` than `physics -> logic -> audit`.
+- The revised auditor path exists but appears orphaned; it is not currently part of the package surface.
+- The next action is to decide whether to:
+  - replace the active drafter block with the auditor block, or
+  - keep the drafter as proposer and add the auditor as a final reasoning head/block
+- After that decision, the minimum follow-up work is package wiring plus tests for:
+  - forward pass
+  - train/eval state behavior
+  - gradient reachability into `log_wave_speed`, `log_damping`, shared VQ parameters, and circuit parameters
+
+## 2026-03-19 — GPU Monitor Capability Check (`btop` / `btm` / alternatives)
+
+### Objectives
+- Determine whether `btop` or `btm` can expose dedicated GPU metrics on this host.
+- Identify realistic alternatives when `nvtop` is already insufficient.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Inspected local package help/docs and host telemetry capability for:
+  - `btop`
+  - `btm`
+  - `nvidia-smi`
+
+### Commands Run And Key Metrics
+- `btop --help`
+  - result: normal CLI help, no runtime flags for enabling GPU telemetry beyond layout/preset controls.
+- `btm --help`
+  - result: confirms `--enable_gpu_memory`, but no full dedicated GPU utilization/process-telemetry feature surface comparable to `nvtop`.
+- `dpkg -L btop | rg 'btop.conf|README|man|doc'`
+  - result: packaged docs available under `/usr/share/doc/btop`.
+- `zcat /usr/share/doc/btop/README.md.gz | rg -n "gpu|shown_boxes|nvml"`
+  - result:
+    - GPU boxes exist (`gpu0`..`gpu5`)
+    - upstream docs describe Linux GPU support for `x86_64`
+    - local default config only showed `cpu mem net proc`
+- `rg -n "shown_boxes|show_gpu_info|custom_gpu_name|gpu" ~/.config/btop/btop.conf`
+  - result: `shown_boxes = "cpu mem net proc"`
+- `nvidia-smi --query-gpu=name,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw --format=csv,noheader`
+  - result: `NVIDIA GB10, 0 %, 0 %, [N/A], [N/A], 28, 3.70 W`
+
+### Best Current Checkpoint/Config Recommendation
+- `btm` is not the right tool if you want real dedicated GPU telemetry; at best it can show GPU memory with `--enable_gpu_memory`.
+- `btop` can show GPU boxes, but on this `aarch64` host the packaged support surface is likely limited; if GPU panes appear at all, expect partial metrics.
+- For NVIDIA-specific fallback views, use:
+  - `nvitop`
+  - `nvidia-smi dmon`
+  - `nvidia-smi pmon`
+
+### Unresolved Issues And Next Actions
+- The driver/NVML stack on this host is not exposing total/used VRAM cleanly (`[N/A]`), so even better monitors may still show incomplete memory data.
+- If deeper GPU visibility is required, the next action is to test `nvitop` and/or inspect the NVIDIA driver/NVML setup rather than tuning `btm`.
+
+## 2026-03-19 — Eval/Train State Contract Audit
+
+### Objectives
+- Continue the post-P0 hardening pass by auditing explicit `Lux.testmode(...)` and `Lux.trainmode(...)` semantics for the EMA-bearing layers.
+- Convert the current behavior from an implicit assumption into regression-tested contract coverage.
+
+### Changes Made
+- **Modified:** [`test/test_predicate_engram.jl`](/home/christos/code/julia/Swamma/test/test_predicate_engram.jl)
+  - Added explicit state-contract checks that fresh state starts with `training = Val(true)`, `Lux.testmode(...)` flips it to `Val(false)`, and `Lux.trainmode(...)` flips it back to `Val(true)`.
+  - Added a round-trip regression proving `Lux.trainmode(...)` re-enables EMA mutation after eval mode, instead of only checking that eval mode freezes EMA.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Added the same `RuleConditionedWavePDE` train/eval state-contract tests.
+  - Added a nested `ReasoningDrafter` round-trip regression proving `Lux.testmode(...)` propagates through `RuleWave` substate and `Lux.trainmode(...)` restores EMA-updating behavior at the model level.
+
+### Commands Run And Key Metrics
+- Focused PredicateEngram regression suite:
+  - `julia --project=. test/test_predicate_engram.jl`
+  - result: `PredicateEngram 35/35 pass`
+- Focused RuleWave + drafter regression suite:
+  - `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - `RuleConditionedWavePDE 31/31 pass`
+    - `ReasoningDrafter 42/42 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- Treat `Lux.testmode(...)` / `Lux.trainmode(...)` as the required control surface for EMA-bearing inference and evaluation paths.
+- Keep future stateful-layer work aligned to the same contract:
+  - fresh state defaults to training
+  - eval mode freezes EMA/stat updates
+  - train mode round-trip must explicitly restore mutation
+
+### Unresolved Issues And Next Actions
+- The state contract is now covered for `PredicateEngram`, `RuleConditionedWavePDE`, and the nested `ReasoningDrafter` path, but the broader custom-layer audit is not finished.
+- The next highest-value follow-up is to continue the same audit pattern across the remaining custom Lux modules that maintain nontrivial state, then resume the CPU-heavy relation-extraction cleanup.
+
+## 2026-03-19 — System Monitor Install (`btop` + `bottom`)
+
+### Objectives
+- Install a more modern and maintained replacement set for `vtop`.
+- Prefer distro packages over source builds.
+
+### Changes Made
+- **No repository code/config files changed** outside this session report entry.
+- Installed system packages on the host:
+  - `btop`
+  - `btm` (Ubuntu package name for `bottom`)
+
+### Commands Run And Key Metrics
+- Package discovery:
+  - `apt-cache search '^btop$|^bottom$|^btm$'`
+  - result:
+    - `btop - Modern and colorful command line resource monitor that shows usage and stats`
+    - `btm - customizable graphical process/system monitor for the terminal`
+- Install:
+  - `sudo apt-get update && sudo apt-get install -y btop btm`
+  - result:
+    - binaries available at `/usr/bin/btop` and `/usr/bin/btm`
+- Version check:
+  - `btop --version`
+    - result: `btop version: 1.3.0`
+  - `btm --version`
+    - result: `bottom 0.9.6`
+
+### Best Current Checkpoint/Config Recommendation
+- Use `btop` as the closest polished replacement for `vtop`.
+- Use `btm` when you want the `bottom` interface and process/system view.
+
+### Unresolved Issues And Next Actions
+- Ubuntu’s packaged versions are older than the newest upstream releases.
+- If newer features are needed later, the next step is to install upstream binaries or build the latest releases separately from the distro packages.
+
+## 2026-03-19 — `train_llm.jl` Smoke-Mode Hardening
+
+### Objectives
+- Finish the remaining `scripts/train_llm.jl` P0 item by proving the script can run end to end in a controlled smoke configuration.
+- Remove script-level failure modes uncovered during the first smoke attempts.
+
+### Changes Made
+- **Modified:** [`scripts/train_llm.jl`](/home/christos/code/julia/Swamma/scripts/train_llm.jl)
+  - Added env-driven smoke controls for model size, corpus size, batch limits, epoch count, checkpoint path, and generation skipping.
+  - Added chunk/book/train-batch/val-batch limits so the script can run as a bounded smoke job instead of forcing a full Gutenberg-scale run.
+  - Stopped dropping partial final batches so validation cannot silently disappear on small splits.
+  - Hardened the warmup/cosine LR schedule so short runs do not generate `NaN` learning rates.
+  - Switched validation and generation to explicit `Lux.testmode(...)` state so non-training paths no longer run with training-mode state.
+- **Modified:** [`src/Training.jl`](/home/christos/code/julia/Swamma/src/Training.jl)
+  - Moved the padded PRIME mask/device conversions fully behind `ignore_derivatives` so the shared padded GPU loss path no longer trips Zygote over CUDA allocation boundaries.
+
+### Commands Run And Key Metrics
+- Syntax-only parse:
+  - `julia --project=. -q -e 'Base.include(x -> :(nothing), Main, "scripts/train_llm.jl"); println("train_llm-parse-ok")'`
+  - result: `train_llm-parse-ok`
+- Focused shared-loss regressions:
+  - `julia --project=. test/test_training_padding.jl`
+    - result: `Training Padding Helpers 4/4 pass`
+  - `julia --project=. test/test_llada_training.jl`
+    - result:
+      - `LLaDA Training Smoke 4/4 pass`
+      - `LLaDA PRIME Subtoken Smoke 6/6 pass`
+- End-to-end script smoke:
+  - `SWAMMA_LLM_SMOKE=1 SWAMMA_LLM_MAX_BOOKS=1 SWAMMA_LLM_MAX_CHUNKS=16 SWAMMA_LLM_MAX_TRAIN_BATCHES=1 SWAMMA_LLM_MAX_VAL_BATCHES=1 SWAMMA_LLM_SKIP_GENERATION=1 SWAMMA_LLM_CHECKPOINT_DIR=/tmp/swamma_llm_smoke julia --project=. scripts/train_llm.jl`
+  - result:
+    - `Embedding dim 128`, `heads 4`, `layers 2`, `seq length 64`, `batch size 4`
+    - `Parameters: 0.6M`
+    - `Epoch 1 done | Avg Loss: 2.9445`
+    - final smoke after LR/testmode fixes: `Val Loss: 2.6888`
+    - checkpoint written to [`/tmp/swamma_llm_smoke/checkpoint_epoch_1.jls`](/tmp/swamma_llm_smoke/checkpoint_epoch_1.jls)
+    - best checkpoint written to [`/tmp/swamma_llm_smoke/checkpoint_best.jls`](/tmp/swamma_llm_smoke/checkpoint_best.jls)
+    - no training-mode Lux warning during validation
+
+### Best Current Checkpoint/Config Recommendation
+- For future script-level validation, use the new smoke surface:
+  - `SWAMMA_LLM_SMOKE=1`
+  - small `MAX_BOOKS`, `MAX_CHUNKS`, `MAX_TRAIN_BATCHES`, and `MAX_VAL_BATCHES`
+  - `SWAMMA_LLM_SKIP_GENERATION=1`
+- Treat the current shared `diffusion_loss_with_padding(...)` path as the canonical padded training loss for PRIME scripts.
+
+### Unresolved Issues And Next Actions
+- The smoke path is now healthy, but a larger bounded run is still warranted before calling the full `train_llm.jl` item completely finished.
+- The next hardening target after that is still the remaining CPU heuristic ranking inside relation extraction, or the broader eval/training semantic audit across custom Lux layers.
+
+## 2026-03-19 — Parallel P0 Hardening Sweep
+
+### Objectives
+- Continue the active hardening queue in parallel rather than serially.
+- Reduce host/device churn in relation extraction.
+- Push PRIME/Engram CPU work out of the block hot path.
+- Strengthen Phase 3a reasoning-language acceptance coverage.
+- Remove the broken one-hot/scalar-fallback loss path from `scripts/train_llm.jl`.
+
+### Changes Made
+- **Modified:** [`src/RelationExtraction.jl`](/home/christos/code/julia/Swamma/src/RelationExtraction.jl), [`test/test_relation_extraction.jl`](/home/christos/code/julia/Swamma/test/test_relation_extraction.jl)
+  - Kept evidence diagnostics on CPU.
+  - Cached candidate-span tensors and removed repeated candidate-span reallocation.
+  - Reused span-context raw scores instead of recomputing CPU query/key matmuls.
+  - Returned proposed spans / span masks / span scores and combined span scores on-device when the forward is on CUDA.
+  - Added GPU regressions proving diagnostics stay host-side while proposal outputs stay device-resident.
+- **Modified:** [`src/Engram.jl`](/home/christos/code/julia/Swamma/src/Engram.jl), [`src/LLaDA.jl`](/home/christos/code/julia/Swamma/src/LLaDA.jl), [`test/test_engram.jl`](/home/christos/code/julia/Swamma/test/test_engram.jl)
+  - Added explicit PRIME runtime precompute helpers.
+  - Added explicit Engram index precompute helpers and threaded precomputed indices through the LLaDA forward.
+  - Isolated remaining CPU hashing/index construction at the model boundary instead of inside each Engram block call.
+  - Added regressions proving explicit PRIME/Engram precompute matches the implicit path.
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl), [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+  - Strengthened Phase 3a acceptance coverage around sparse targets and resume behavior.
+  - Added checks for `CartesianIndex` sparse targets, absence of dense one-hot targets, direct gathered-log-prob loss equivalence, and resumed next-step loss/gradient equivalence.
+- **Modified:** [`src/Training.jl`](/home/christos/code/julia/Swamma/src/Training.jl), [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl), [`scripts/train_llm.jl`](/home/christos/code/julia/Swamma/scripts/train_llm.jl), [`test/test_training_padding.jl`](/home/christos/code/julia/Swamma/test/test_training_padding.jl), [`test/runtests.jl`](/home/christos/code/julia/Swamma/test/runtests.jl)
+  - Replaced `masked_cross_entropy_vectorized` one-hot construction with sparse gathered target log-probs.
+  - Added `diffusion_loss_with_padding(...)` so padding-aware PRIME training uses the shared sparse path instead of a script-local dense one-hot implementation.
+  - Removed `CUDA.allowscalar(true)` and the invalid `token_ids = batch` model call from `scripts/train_llm.jl`.
+  - Added focused padding/loss regression coverage and included it in the default test lane.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_relation_extraction.jl`
+  - result:
+    - `Relation Extraction Evidence Diagnostics Stay Host-Side 9/9 pass`
+    - `Relation Extraction Proposal Outputs Stay Device-Resident 9/9 pass`
+    - full relation extraction suite passed
+- `julia --project=. test/test_engram.jl`
+  - result: `Engram Conditional Memory 28/28 pass`
+- `julia --project=. test/test_llada_training.jl`
+  - result:
+    - `LLaDA Training Smoke 4/4 pass`
+    - `LLaDA PRIME Subtoken Smoke 6/6 pass`
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result:
+    - `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+    - `Phase 3a language helpers 25/25 pass`
+- `julia --project=. test/test_training_padding.jl`
+  - result: `Training Padding Helpers 4/4 pass`
+- `julia --project=. -q -e 'Base.include(x -> :(nothing), Main, "scripts/train_llm.jl"); println("train_llm-parse-ok")'`
+  - result: `train_llm-parse-ok`
+
+### Best Current Checkpoint/Config Recommendation
+- Use the explicit PRIME runtime precompute path and Engram index precompute path for any heavy LLaDA/Engram forwards.
+- Keep the current Phase 3a sparse-target checkpoint format and its resume tests as the acceptance gate.
+- Treat the updated shared `Training.diffusion_loss_with_padding(...)` path as the only acceptable padded PRIME loss surface for future scripts.
+
+### Unresolved Issues And Next Actions
+- `scripts/train_llm.jl` now has the correct sparse/device-consistent loss skeleton, but it still needs an actual end-to-end smoke run from the real script path, not just syntax validation.
+- The RE path still contains CPU heuristic ranking; the current sweep removed waste around it, but did not fully move heuristic selection onto device.
+- The Engram path still hashes on CPU, but only once per model-boundary precompute instead of inside each block call.
+
+## 2026-03-19 — Phase 3a Acceptance Coverage Hardening
+
+### Objectives
+- Strengthen the Phase 3a reasoning-language acceptance coverage around sparse targets and checkpoint resume behavior.
+- Verify the existing Phase 3a implementation against direct loss equivalence and a real post-update resume continuation path.
+
+### Changes Made
+- **Modified:** [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+  - Added assertions that `make_language_batch(...)` returns sparse `CartesianIndex` targets, the expected mask vector, and no `target_onehot` field.
+  - Added a direct sparse-loss equivalence check against `NNlib.logsoftmax` gathered with the batch target indices.
+  - Added a checkpoint round-trip test that saves a real post-update Phase 3a state, reloads it, and verifies the resumed parameters/state/optimizer state match.
+  - Added a continuation check showing the next-step loss and gradients match between the live post-update state and the resumed checkpoint state.
+
+### Commands Run And Key Metrics
+- `julia --project=. -q -e 'include("scripts/train_reasoning_language.jl"); println("train_reasoning_language-parse-ok")'`
+  - result: `GPU: NVIDIA GB10, 130.7GB`
+  - result: `train_reasoning_language-parse-ok`
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result:
+    - `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+    - `Phase 3a language helpers 25/25 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- Use the current Phase 3a checkpoint format that saves `ps_cpu`, `st_cpu`, `opt_state_cpu`, `config`, `global_step`, `epoch`, and `best_loss`.
+- Keep the sparse target-index language batch path as the accepted Phase 3a training surface.
+
+### Unresolved Issues And Next Actions
+- The Phase 3a train path is now better covered, but the next gap is still broader GPU training hardening in `scripts/train_llm.jl`.
+- If any future change touches the Phase 3a checkpoint schema, keep the resume test in `test/test_reasoning_trainability.jl` as the gate for backward compatibility.
+
+## 2026-03-19 — LLaDA/Engram Hot-Path Cleanup
+
+### Objectives
+- Continue the P0 hot-path cleanup beyond the PRIME precompute hook already in place.
+- Remove or isolate the remaining per-call CPU hash/index work in the Engram path.
+- Keep the changes behavior-compatible and prove them with focused regressions.
+
+### Changes Made
+- **Modified:** [`src/Engram.jl`](/home/christos/code/julia/Swamma/src/Engram.jl)
+  - Added `prepare_engram_indices(...)` to precompute Engram hash indices outside the lookup body.
+  - Extended `EngramModule` forward to accept an optional third input containing precomputed indices.
+  - Preserved the old `(token_ids, hidden_state)` call form as a fallback for standalone use and tests.
+- **Modified:** [`src/LLaDA.jl`](/home/christos/code/julia/Swamma/src/LLaDA.jl)
+  - Added `prepare_engram_forward_inputs(...)` to precompute per-module Engram indices once per model forward.
+  - Threaded cached Engram indices through the model forward path so the block call no longer hashes token ids internally.
+  - Kept the PRIME compatibility helper intact and reused the same explicit-precompute pattern for the combined PRIME + Engram path.
+- **Modified:** [`test/test_engram.jl`](/home/christos/code/julia/Swamma/test/test_engram.jl)
+  - Added regression coverage proving the precomputed Engram-index path matches the implicit path.
+  - Added a model-level regression proving explicit PRIME + Engram precompute inputs produce identical logits to the implicit path.
+
+### Commands Run And Key Metrics
+- `julia --project=. -q -e 'include("src/Swamma.jl"); using .Swamma; println("llada-engram-parse-ok")'`
+  - result: `llada-engram-parse-ok`
+- `julia --project=. test/test_engram.jl`
+  - result: `Engram Conditional Memory 28/28 pass`
+- `julia --project=. test/test_llada_training.jl`
+  - result:
+    - `LLaDA Training Smoke 4/4 pass`
+    - `LLaDA PRIME Subtoken Smoke 6/6 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep using the explicit PRIME runtime precompute path plus the new Engram index precompute boundary for any heavy LLaDA/Engram forwards.
+- The current checkpoint/config setup remains valid; no config changes were needed for this cleanup.
+
+### Unresolved Issues And Next Actions
+- The Engram path still performs CPU hashing, but it is now isolated at the model boundary instead of being hidden inside the block lookup body.
+- The next P0 item to attack is still `scripts/train_llm.jl`, which has the dense one-hot target path and `CUDA.allowscalar(true)` risk.
+
 ## 2026-03-17 — Reasoning Memory Prototypes (PredicateEngram + CircuitLayer)
 
 ### Objectives
@@ -4568,3 +5760,2968 @@ The remaining 26GB is CUDA memory pool holding freed allocations, not active usa
 - The straight-through estimator means backbone params only learn via EMA codebook updates, not gradient — acceptable for Phase 1 pre-training but needs revisiting for Phase 3
 - Refactor other Swamma-based architectures to use the same memory-efficient pattern
 - Monitor Enzyme.jl + CUDA + Lux maturity for eventual migration
+
+## 2026-03-19 — Chess Gradient Debug Review
+
+### Objectives
+- Inspect the Claude debugging session around `ReasoningDrafterBlock` gradient flow in chess Phase 1 training.
+- Verify the current source-level state of the relevant block, wave layer, and trainer without making new code changes.
+
+### Changes Made
+- No code changes in this session.
+- Inspected:
+  - [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+  - [`src/WavePDE.jl`](/home/christos/code/julia/Swamma/src/WavePDE.jl)
+  - [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+
+### Commands Run And Key Metrics
+- `git diff -- src/ReasoningDrafter.jl`
+- `git diff -- scripts/train_chess_reasoning.jl`
+- `rg -n "ignore_derivatives|ema|RuleConditionedWavePDE|withgradient|apply_rc_ema_codebook|log_wave_speed|GateWeight|SpeedModWeight" src scripts`
+- `nl -ba scripts/train_chess_reasoning.jl | sed -n '340,430p'`
+- `nl -ba src/ReasoningDrafter.jl | sed -n '238,315p'`
+- Key inspection result:
+  - the current block implementation uses straight-through residuals around detached `LinAttn`, `WaveGate`, and `Circuit`, so upstream gradients to `Norm`, `RuleWave`, and `GluProjection` are intended to survive;
+  - the current chess trainer drops all returned block state with `new_st = st`, so EMA/codebook state is not being threaded forward during training and diagnostics derived from that state are not trustworthy.
+
+### Best Current Checkpoint/Config Recommendation
+- Do not treat the current Claude discussion as a complete diagnosis of the training behavior.
+- Before more long runs, first fix state threading in `scripts/train_chess_reasoning.jl` and then re-check block gradients with a minimal deterministic gradient probe.
+
+### Unresolved Issues And Next Actions
+- Confirm whether block-local gradients are truly missing under the full block path or whether the previous logging accessed the gradient tree incorrectly.
+- Restore correct state propagation for block outputs, `FinalNorm`, and EMA-backed codebook updates in chess training.
+- After state threading is fixed, rerun a short controlled experiment comparing:
+  - full block path
+  - direct `RuleWave` bypass path
+  - logged gradients for `Norm`, `GluProjection`, `RuleWave`, `LinAttn`, `WaveGate`, and `Circuit`
+
+## 2026-03-19 — Chess Trainer State Threading Fix And Gradient Probe
+
+### Objectives
+- Fix the chess Phase 1 trainer so Lux state is carried forward instead of being reset every step.
+- Verify whether the current full `ReasoningDrafterBlock` path really drops gradients to block-local parameters.
+
+### Changes Made
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - `withgradient` now returns `new_st` alongside the losses.
+  - Token embedding, position embedding, both block states, `FinalNorm`, `MoveHead`, and `EvalHead` states are threaded forward explicitly.
+  - Removed the stale-state reset pattern (`new_st = st`) so EMA/codebook updates now consume current state.
+
+### Commands Run And Key Metrics
+- Parse/load sanity:
+  - `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("parse-ok")'`
+  - result: `GPU: NVIDIA GB10, 130.7GB`, `parse-ok`
+- Minimal full-block gradient probe on CPU-sized config:
+  - result:
+    - `loss=10.934938`
+    - `movehead=2.337693`
+    - `tokemb=0.371387`
+    - `b1_norm=0.604079`
+    - `b1_glu=4.233521`
+    - `b1_rulewave_ws=0.021989`
+    - `b1_rulewave_gate=0.174715`
+    - `b1_linattn=nil`
+    - `b1_wavegate=nil`
+    - `b1_circuit=nil`
+- Tiny end-to-end training smoke:
+  - `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/lichess_db_eval.jsonl --max-positions 64 --steps 1 --checkpoint-dir /tmp/swamma_chess_smoke`
+  - result: completed `Epoch 1/1`, `avg_loss=10.2331`, `batches=1`
+  - artifact: [`/tmp/swamma_chess_smoke/best.jld2`](/tmp/swamma_chess_smoke/best.jld2)
+
+### Best Current Checkpoint/Config Recommendation
+- The current full block design does propagate gradients into upstream block parameters (`Norm`, `GluProjection`, `RuleWave`) while intentionally detaching `LinAttn`, `WaveGate`, and `Circuit`.
+- Resume debugging and training from the full block path, not the temporary bypass path.
+
+### Unresolved Issues And Next Actions
+- Replace or refine the in-training gradient logger so it reflects the actual gradient tree without conflating intentionally detached submodules with broken upstream flow.
+- Run a short resumed chess training segment and confirm that codebook/EMA diagnostics now change under correctly threaded state.
+- If training still behaves unexpectedly, the next target is optimizer behavior or the diagnostic logic, not the block-level gradient path itself.
+
+## 2026-03-19 — ReasoningDrafter Module Review
+
+### Objectives
+- Review the current `src/ReasoningDrafter.jl` module against an external LLM review.
+- Separate stale findings from issues that still apply on current HEAD.
+
+### Changes Made
+- No production code changes.
+- Inspected:
+  - [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+
+### Commands Run And Key Metrics
+- GPU forward sanity on the module forward path:
+  - `julia --project=. -q -e '...; y, st2 = m(x, ps, st); println(size(y)); println(typeof(y));'`
+  - result: `(13, 8, 1)`, `CuArray{Float32, 3, CUDA.DeviceMemory}`
+- Key review outcome:
+  - the older “entire block wrapped in `ignore_derivatives`” finding is stale for current HEAD;
+  - current full-block gradients do reach upstream block params (`Norm`, `GluProjection`, `RuleWave`);
+  - current module still has an adapter-identity initialization bug and a type-instability/performance issue in block application.
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the current full-block design as the baseline.
+- Prioritize fixing adapter initialization and block-application dispatch before deeper architectural churn.
+
+### Unresolved Issues And Next Actions
+- Fix `CircuitGateBiasShift` initialization so adapter-enabled transfer starts from true identity behavior.
+- Replace `_apply_reasoning_blocks` with a type-stable tuple/`NamedTuple` traversal.
+- Remove or consolidate the dead `_block_forward` path to avoid implementation drift.
+
+## 2026-03-19 — ReasoningDrafter Module Fixes
+
+### Objectives
+- Fix the remaining `ReasoningDrafter` module issues from review:
+  - adapter identity initialization
+  - type-unstable block application
+  - duplicate dead block-forward implementation
+- Add regression coverage for the intended straight-through gradient behavior.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - `CircuitGateBiasShift` now initializes to `10.0f0` instead of `0.0f0`, so adapter-enabled blocks start near the original `circuit_out` behavior.
+  - Removed the dead `_block_forward` implementation to eliminate drift between the documented and live block path.
+  - Replaced `_apply_reasoning_blocks(model, ..., i)` runtime-symbol recursion with tuple-based recursion over `model.Blocks`, `values(ps.Blocks)`, and `values(st.Blocks)` to avoid dynamic field lookup in the hot path.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Added adapter-initialization assertions.
+  - Strengthened gradient tests to verify that:
+    - upstream block params (`Norm`, `GluProjection`, `RuleWave`) receive gradients
+    - intentionally detached submodules (`LinAttn`, `WaveGate`, `Circuit`) remain `nothing`
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `RuleConditionedWavePDE 23/23 pass`, `ReasoningDrafter 32/32 pass`
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the current full-block straight-through design.
+- Treat `LinAttn`, `WaveGate`, and `Circuit` as intentionally detached, with gradients flowing through `Norm`, `RuleWave`, and `GluProjection`.
+
+### Unresolved Issues And Next Actions
+- The model still re-forwards the full sequence during `draft_reasoning_tokens`; acceptable for now, but it remains the next inference-side optimization target if drafter latency matters.
+- The model-level `time_emb` broadcast still allocates via `repeat`; this is low priority compared with end-to-end training correctness.
+
+## 2026-03-19 — Time Embedding Broadcast Cleanup
+
+### Objectives
+- Remove repeated materialization of identical time embeddings in the `ReasoningDrafter` forward and chess training paths.
+- Keep the block API unchanged by letting `LinearAttentionLayer` broadcast a single-column time input across batch internally.
+
+### Changes Made
+- **Modified:** [`src/linearAttention.jl`](/home/christos/code/julia/Swamma/src/linearAttention.jl)
+  - `LinearAttentionLayer` now accepts time inputs with batch size `1` or `batch_size`.
+  - Added an explicit batch-mismatch check and internal broadcast via reshape instead of requiring callers to pre-`repeat` the time vector.
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - Replaced `repeat(reshape(ps.TimeEmbedding, :, 1), 1, batch_size)` with `reshape(ps.TimeEmbedding, :, 1)`.
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Replaced the three `repeat(reshape(...TimeEmbedding...))` call sites with single-column reshapes.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `RuleConditionedWavePDE 23/23 pass`, `ReasoningDrafter 32/32 pass`
+- `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/lichess_db_eval.jsonl --max-positions 64 --steps 1 --checkpoint-dir /tmp/swamma_chess_smoke2`
+  - result: completed `Epoch 1/1`, `avg_loss=10.2331`, `batches=1`
+  - artifact: [`/tmp/swamma_chess_smoke2/best.jld2`](/tmp/swamma_chess_smoke2/best.jld2)
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the single-column time embedding path. It removes unnecessary allocation without changing model semantics.
+
+### Unresolved Issues And Next Actions
+- `draft_reasoning_tokens` still re-forwards the full sequence each generation step. That remains the last review item not addressed here.
+- If inference latency becomes important, the next task is designing a cache or recurrent draft path compatible with the bidirectional structured modules.
+
+## 2026-03-19 — Draft Generation Buffer Cleanup
+
+### Objectives
+- Remove repeated token-buffer reallocations from `draft_reasoning_tokens`.
+- Make prompt constraints explicit instead of relying on incidental buffer failures.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - `draft_reasoning_tokens` now:
+    - preallocates a fixed `(max_len, 1)` token buffer,
+    - reuses that buffer instead of `vcat` on every draft step,
+    - enforces non-empty and max-length-bounded prompts with explicit `ArgumentError`s,
+    - keeps the current full-prefix re-forward semantics, now documented inline.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Added coverage for:
+    - max-length prompt cap behavior,
+    - empty prompt rejection,
+    - overlength prompt rejection.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `RuleConditionedWavePDE 23/23 pass`, `ReasoningDrafter 36/36 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the buffered generation helper. It reduces local allocation overhead while preserving the existing speculative-drafter behavior.
+
+### Unresolved Issues And Next Actions
+- The drafter still recomputes the full active prefix each generation step. This is now explicit and intentional.
+- Any further inference-speed improvement requires a new cacheable/recurrent design, not another local cleanup.
+
+## 2026-03-19 — Final Module Consistency Cleanup
+
+### Objectives
+- Remove the last runtime-symbol lookup from the `ReasoningDrafter` module.
+- Re-run the chess integration suite after the accumulated drafter changes.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - `apply_reasoning_drafter_ema_codebook!` now iterates with `zip(values(ps.Blocks), values(st.Blocks), model.Blocks)` instead of building `Symbol("Block_$i")` at runtime.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_chess_pipeline.jl`
+  - result:
+    - `ChessTokenizer 29/29 pass`
+    - `ChessDataset 16/16 pass`
+    - `Chess → ReasoningDrafter integration 3/3 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- The `ReasoningDrafter` module and chess training path are now internally consistent with the current straight-through training design.
+
+### Unresolved Issues And Next Actions
+- The remaining meaningful work is architectural:
+  - redesign drafter generation to avoid full-prefix recomputation, or
+  - revisit whether any of the intentionally detached submodules (`LinAttn`, `WaveGate`, `Circuit`) should regain trainable gradients via custom rules/checkpointing.
+
+## 2026-03-19 — Chess Trainer Traversal Cleanup
+
+### Objectives
+- Remove the remaining hardcoded two-block path and runtime-symbol traversal from the chess Phase 1 trainer.
+- Keep the trainer aligned with the tuple-based `ReasoningDrafter` module internals.
+
+### Changes Made
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Replaced `_apply_chess_blocks(drafter, ..., i)` with tuple-based recursion over `drafter.Blocks`, `values(ps.Drafter.Blocks)`, and `values(st.Drafter.Blocks)`.
+  - Added `_namedtuple_like` to reconstruct block-state `NamedTuple`s without runtime symbol construction.
+  - Generalized the differentiable training path inside `withgradient` so it no longer assumes exactly two blocks.
+  - Removed hot-loop `Symbol("Block_$i")` lookups from:
+    - encoder reinitialization
+    - gradient diagnostics
+    - dead-code revival
+    - codebook diagnostics
+
+### Commands Run And Key Metrics
+- Parse/load sanity:
+  - `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("parse-ok")'`
+  - result: `GPU: NVIDIA GB10, 130.7GB`, `parse-ok`
+- Tiny end-to-end training smoke:
+  - `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/lichess_db_eval.jsonl --max-positions 64 --steps 1 --checkpoint-dir /tmp/swamma_chess_smoke3`
+  - result: completed `Epoch 1/1`, `avg_loss=10.2331`, `batches=1`
+  - artifact: [`/tmp/swamma_chess_smoke3/best.jld2`](/tmp/swamma_chess_smoke3/best.jld2)
+
+### Best Current Checkpoint/Config Recommendation
+- The chess trainer is now structurally aligned with the module and no longer depends on a fixed two-block assumption.
+
+### Unresolved Issues And Next Actions
+- The in-training gradient logger is still debug-oriented and noisy; if it remains useful, it should be refactored into a small helper with explicit coverage for detached submodules.
+- The next meaningful improvement would be experiment-focused rather than structural: resume a short real chess run and inspect whether the now-cleaner diagnostics match the codebook/state behavior.
+
+## 2026-03-19 — Short Chess Diagnostic Run
+
+### Objectives
+- Add runtime knobs so short trainer runs can emit useful gradient/codebook diagnostics.
+- Validate the cleaned-up chess trainer on a real multi-batch run instead of a one-batch smoke.
+
+### Changes Made
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Added configurable intervals:
+    - `log_every`
+    - `debug_every`
+    - `revive_every`
+    - CLI flags: `--log-every`, `--debug-every`, `--revive-every`, `--checkpoint-every`
+
+### Commands Run And Key Metrics
+- Parse/load sanity:
+  - `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("parse-ok")'`
+  - result: `GPU: NVIDIA GB10, 130.7GB`, `parse-ok`
+- Short real diagnostic run:
+  - `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/lichess_db_eval.jsonl --max-positions 640 --steps 10 --log-every 5 --debug-every 5 --revive-every 5 --checkpoint-every 1000 --checkpoint-dir /tmp/swamma_chess_diag`
+  - result: completed `Epoch 1/1`, `avg_loss=10.1618`, `batches=10`
+  - artifact: [`/tmp/swamma_chess_diag/best.jld2`](/tmp/swamma_chess_diag/best.jld2)
+- Key diagnostics at step 5:
+  - gradients:
+    - `mh=2.19013`
+    - `te=0.155367`
+    - `Block 1: norm=0.085607, glu=24.401608, ws=0.00011, gate=0.056279`
+    - `Block 2: norm=0.012646, glu=3.759588, ws=1.5e-5, gate=0.004427`
+  - codebook intervention:
+    - `Block 1 revived 501 dead codes`
+    - `Block 2 revived 410 dead codes`
+  - codebook state after revival:
+    - both blocks `active=512/512 (100.0%)`
+    - `Block 1 smod=1.1238`, `ws_raw=(-0.004899, 0.004719)`
+    - `Block 2 smod=1.1371`, `ws_raw=(-0.004742, 0.004916)`
+- Key diagnostics at step 10:
+  - gradients remained nonzero for `Norm`, `GluProjection`, and `RuleWave`
+  - codebook stats continued moving:
+    - `Block 1 smod=1.2676`, `ws_raw=(-0.008236, 0.008707)`
+    - `Block 2 smod=1.2772`, `ws_raw=(-0.007568, 0.008722)`
+
+### Best Current Checkpoint/Config Recommendation
+- The cleaned-up trainer is behaving consistently with the current design:
+  - upstream block params are training,
+  - detached submodules remain detached,
+  - EMA/codebook diagnostics now update coherently on short real runs.
+- Use the new debug-interval flags for future short inspection runs instead of patching frequencies by hand.
+
+### Unresolved Issues And Next Actions
+- Reviving `501/512` and `410/512` codes at step 5 is aggressive and probably too early for a default policy; the next experiment should test delaying or throttling revival.
+- The current useful next experiment is a short A/B run:
+  - current `revive_every=500`
+  - delayed revival, e.g. after warmup or disabled for the first few hundred steps
+
+## 2026-03-19 — Revival Warmup A/B
+
+### Objectives
+- Add an explicit warmup gate for code revival.
+- Compare aggressive early revival against delayed revival on a matched short chess run.
+
+### Changes Made
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Added `revive_start_step` to `train_phase1`.
+  - Added CLI flag: `--revive-start-step`.
+  - Revival now triggers only when `global_step >= revive_start_step && global_step % revive_every == 0`.
+
+### Commands Run And Key Metrics
+- Parse/load sanity:
+  - `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("parse-ok")'`
+  - result: `GPU: NVIDIA GB10, 130.7GB`, `parse-ok`
+- Delayed-revival diagnostic run:
+  - `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/lichess_db_eval.jsonl --max-positions 640 --steps 10 --log-every 5 --debug-every 5 --revive-every 5 --revive-start-step 1000 --checkpoint-every 1000 --checkpoint-dir /tmp/swamma_chess_diag_norevive`
+  - result: completed `Epoch 1/1`, `avg_loss=10.1618`, `batches=10`
+  - artifact: [`/tmp/swamma_chess_diag_norevive/best.jld2`](/tmp/swamma_chess_diag_norevive/best.jld2)
+- A/B comparison against the earlier aggressive-revival run (`revive_start_step=0` effectively, revive firing at step 5):
+  - loss:
+    - aggressive revival: `avg_loss=10.1618`
+    - delayed revival: `avg_loss=10.1618`
+  - gradients at steps 5/10:
+    - essentially unchanged between runs for `mh`, `te`, `Norm`, `GluProjection`, and `RuleWave`
+  - codebook active counts:
+    - aggressive revival at step 5:
+      - `Block 1 active=512/512`
+      - `Block 2 active=512/512`
+    - delayed revival at step 5:
+      - `Block 1 active=11/512 (2.1%)`
+      - `Block 2 active=103/512 (20.1%)`
+    - delayed revival at step 10:
+      - `Block 1 active=11/512 (2.1%)`
+      - `Block 2 active=103/512 (20.1%)`
+  - wave-parameter movement (`smod`, `ws_raw`) was materially the same across both runs despite the huge difference in active-code count.
+
+### Best Current Checkpoint/Config Recommendation
+- Do not revive codes this early by default.
+- The matched short run shows early revival does not improve loss or upstream gradient behavior in the first 10 steps; it only forces full codebook occupancy artificially.
+- Recommended default for future longer runs:
+  - keep `revive_every=500`
+  - set `revive_start_step` to a real warmup threshold, not the first few steps
+
+### Unresolved Issues And Next Actions
+- The next useful experiment is to pick a warmup threshold empirically:
+  - e.g. `revive_start_step=1000` vs `5000`
+- If codebook utilization remains genuinely stuck after warmup, then revival is warranted; if utilization rises naturally, revival should stay delayed or disabled.
+
+## 2026-03-19 — 100-Step No-Early-Revival Follow-Up
+
+### Objectives
+- Test whether codebook utilization rises naturally during a longer short run when revival is delayed.
+- Turn the earlier A/B result into a concrete default-policy change.
+
+### Changes Made
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Changed the default `revive_start_step` from `500` to `1000`.
+
+### Commands Run And Key Metrics
+- 100-step delayed-revival run:
+  - `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/lichess_db_eval.jsonl --max-positions 6400 --steps 100 --log-every 50 --debug-every 50 --revive-every 500 --revive-start-step 1000 --checkpoint-every 1000 --checkpoint-dir /tmp/swamma_chess_diag_100_norevive`
+  - result: completed `Epoch 1/1`, `avg_loss=8.1012`, `batches=100`
+  - artifact: [`/tmp/swamma_chess_diag_100_norevive/best.jld2`](/tmp/swamma_chess_diag_100_norevive/best.jld2)
+- Key diagnostics:
+  - step 50:
+    - `Block 1 active=11/512 (2.1%)`
+    - `Block 2 active=104/512 (20.3%)`
+    - `Block 1 smod=5.6215`
+    - `Block 2 smod=3.1633`
+  - step 100:
+    - `Block 1 active=11/512 (2.1%)`
+    - `Block 2 active=104/512 (20.3%)`
+    - `Block 1 smod=19.0298`
+    - `Block 2 smod=7.4007`
+    - `Block 2 ws_raw=(-0.02729, 0.073585)`
+- Parse/load sanity after changing the default:
+  - `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("parse-ok")'`
+  - result: `GPU: NVIDIA GB10, 130.7GB`, `parse-ok`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep delayed revival as the default.
+- Current recommended default policy:
+  - `revive_every=500`
+  - `revive_start_step=1000`
+- Interpretation:
+  - code utilization does **not** recover naturally in the first 100 steps,
+  - but early step-5 revival is still too aggressive because it changes occupancy without improving early loss or gradients.
+
+### Unresolved Issues And Next Actions
+- The next threshold worth testing is a later warmup such as `5000` if you want a stronger bias toward natural specialization before intervention.
+- A longer run is now needed to decide whether revival after warmup genuinely improves downstream learning or just inflates occupancy metrics.
+
+## 2026-03-19 — Inference EMA And PDE Cache Memory Fix
+
+### Objectives
+- Verify whether `RuleConditionedWavePDE` and `ReasoningDrafter` were causing inference-time RAM/VRAM spikes via unconditional EMA updates and repeated spectral-operator allocation.
+- Patch the inference path so token drafting runs in eval mode and stops doing per-step EMA/state churn.
+- Remove repeated `lambda` materialization from the hot PDE loops.
+
+### Changes Made
+- **Modified:** [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+  - Added `training = Val(true)` and `lambda_cache = nothing` to layer state.
+  - Added training-state gating so EMA updates only run in training mode.
+  - Cached the device-local spectral operator in state instead of recreating it every forward.
+- **Modified:** [`src/PredicateEngram.jl`](/home/christos/code/julia/Swamma/src/PredicateEngram.jl)
+  - Added `training = Val(true)` to layer state.
+  - Skips EMA state updates when called with `Lux.testmode(state)`.
+- **Modified:** [`src/WavePDE.jl`](/home/christos/code/julia/Swamma/src/WavePDE.jl)
+  - Added `lambda_cache` to state.
+  - Reuses cached `lambda` across forwards instead of allocating a fresh copy/CuArray every pass.
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - `draft_reasoning_tokens` now forces `st = Lux.testmode(st)` before the autoregressive loop, so drafting uses eval semantics even if the caller passes a training state.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Added regression coverage proving:
+    - eval-mode `RuleConditionedWavePDE` skips EMA updates,
+    - `RuleConditionedWavePDE` reuses `lambda_cache`,
+    - drafter eval forwards do not accumulate EMA stats.
+- **Modified:** [`test/test_predicate_engram.jl`](/home/christos/code/julia/Swamma/test/test_predicate_engram.jl)
+  - Added regression coverage proving eval-mode `PredicateEngram` skips EMA updates.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_predicate_engram.jl`
+  - result: `PredicateEngram 30/30 pass`
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result:
+    - `RuleConditionedWavePDE 26/26 pass`
+    - `ReasoningDrafter 37/37 pass`
+- Additional verification outcome:
+  - `Lux.testmode` flips custom `training` state fields to `Val(false)`, so the new gating works with existing Lux test/eval flow.
+  - `RuleConditionedWavePDE` and `WavePDELayer` now retain and reuse a cached `lambda_cache` between forwards on the same device.
+
+### Best Current Checkpoint/Config Recommendation
+- For all drafting/inference paths, use `draft_reasoning_tokens` or otherwise run the model with `Lux.testmode(state)`.
+- Keep EMA statistics as training-only behavior; update codebooks explicitly after training steps with the existing helper functions.
+
+### Unresolved Issues And Next Actions
+- This fixes the largest inference-time memory churn in the drafter stack, but it does not make the autoregressive path cheap overall; drafting still re-forwards the full active prefix each step.
+- `vq_quantize` and EMA application still move some index/statistics work through CPU by design. That is acceptable for training-side bookkeeping, but if training throughput or GPU residency becomes the next bottleneck, the next step would be a fully device-local EMA/update path.
+
+## 2026-03-19 — Repository Hardening Backlog Review
+
+### Objectives
+- Review the current codebase for the highest-risk pressure points, subtle bugs, and structural failure modes.
+- Convert the review into an execution-ready prioritized backlog in `TODO.md`.
+
+### Changes Made
+- **Modified:** [`TODO.md`](/home/christos/code/julia/Swamma/TODO.md)
+  - Added a new top-level hardening queue with explicit priority bands (`P0`–`P3`).
+  - Added an execution rule requiring regression tests, perf/memory checks where applicable, and session-report updates for each closed item.
+  - Added an immediate iteration order to force highest-risk-first execution.
+
+### Commands Run And Key Metrics
+- Reviewed hotspot files and patterns using targeted source inspection:
+  - `src/RelationExtraction.jl`
+  - `src/LLaDA.jl`
+  - `src/Engram.jl`
+  - `src/RuleConditionedWavePDE.jl`
+  - `src/PredicateEngram.jl`
+  - `src/WavePDE.jl`
+  - `scripts/train_reasoning_language.jl`
+  - `scripts/train_llm.jl`
+  - `scripts/train_chess_reasoning.jl`
+- Key findings recorded into `TODO.md`:
+  - `scripts/train_reasoning_language.jl` has a concrete device-path correctness bug (`b_tokens` computed but unused; CPU `input_tokens` fed into the model path) plus dense one-hot target allocation and missing state checkpointing.
+  - `RelationExtraction` still performs substantial CPU copies and CPU-only ranking/adjacency work inside core model-side paths.
+  - `LLaDA` PRIME and `Engram` still reconstruct compatibility/hash data through CPU every forward.
+  - `scripts/train_llm.jl` still relies on `CUDA.allowscalar(true)` and CPU-built one-hot targets in the loss path.
+
+### Best Current Checkpoint/Config Recommendation
+- Treat the new `P0` section in `TODO.md` as the active work queue.
+- Start with `scripts/train_reasoning_language.jl` before touching lower-priority optimization work, because it contains a likely correctness bug rather than just inefficiency.
+
+### Unresolved Issues And Next Actions
+- Execute `Iteration 1` from `TODO.md`: repair `scripts/train_reasoning_language.jl`, add resume-safe state checkpointing, and replace dense one-hot targets.
+- After that, move directly to the `RelationExtraction` hot-path split before doing broader cleanup.
+
+## 2026-03-19 — ReasoningDrafter Test Rewrite
+
+### Objectives
+- Update `test/test_reasoning_drafter.jl` for the new `ReasoningDrafter` architecture already implemented in `src/ReasoningDrafter.jl`.
+- Preserve the `RuleConditionedWavePDE` coverage where possible.
+- Rebuild the drafter tests around the new invariants:
+  - `FrontEnd` exists and updates EMA.
+  - proposer blocks exist and expose `LinAttn`.
+  - draft generation works.
+  - gradient smoke coverage reaches the front-end, proposer, and audit parameters without relying on the old detached/null-gradient assumption.
+  - parameter estimate remains sane.
+
+### Changes Made
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Kept the `RuleConditionedWavePDE` suite intact and added the current training/eval/EMA contract checks.
+  - Rewrote the `ReasoningDrafter` suite to assert the new model tree:
+    - `FrontEnd`
+    - proposer `Blocks`
+    - `AuditTail`
+  - Added checks that proposer blocks expose `LinAttn`, `FFN`, and the expected norm layers.
+  - Kept draft-generation coverage, including prompt-length guards and EMA non-accumulation in eval mode.
+  - Replaced the old full-model gradient assumption with focused smoke tests for:
+    - front-end parameters
+    - proposer block parameters
+    - audit-tail parameters
+  - Kept the parameter-estimate sanity check and preserved the existing count-vs-estimate comparison.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `RuleConditionedWavePDE 31/31 pass`
+  - result: `ReasoningDrafter 64/64 pass`
+  - total: `64 passed, 0 failed, 0 errored, 0 broken`
+
+### Best Current Checkpoint/Config Recommendation
+- Keep the new `ReasoningDrafter` checkpoint shape centered on:
+  - `FrontEnd`
+  - stripped proposer `Blocks`
+  - `AuditTail`
+- For test coverage, treat front-end gradients as a focused smoke path rather than a full model-level backprop through the stateful EMA update branch.
+
+### Unresolved Issues And Next Actions
+- The test file is now aligned with the current architecture, but the full-model gradient path still has a source-side stateful frontend issue that the test intentionally avoids.
+- If the source path is revised later, the gradient smoke test can be collapsed back toward a single full-model pass.
+
+## 2026-03-19 — Chess Proposer LR Scaling
+
+### Objectives
+- Inspect the chess pretraining optimizer path for `ReasoningDrafter` proposer LR control.
+- Identify the minimal change needed to slow the proposer core during chess pretraining.
+- Patch only the relevant trainer path if the change was straightforward.
+
+### Changes Made
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Added a small recursive gradient-scaling helper for the drafter proposer blocks.
+  - Added `proposer_lr_scale::Float32 = 0.25f0` to `train_phase1`.
+  - Scaled `grads.Drafter.Blocks` before `Optimisers.update(...)`, leaving the rest of the chess parameter tree unchanged.
+
+### Commands Run And Key Metrics
+- Parse/load sanity:
+  - `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("parse-ok")'`
+  - result: `GPU: NVIDIA GB10, 130.7GB`
+  - result: `parse-ok`
+
+### Best Current Checkpoint/Config Recommendation
+- For chess pretraining, keep the global optimizer unchanged and use the new proposer gradient scale to make the proposer core train more slowly than the heads.
+- Default proposer scale currently set to `0.25f0`.
+
+### Unresolved Issues And Next Actions
+- The change is intentionally minimal and only affects chess pretraining.
+- If later runs show the proposer needs a different relative pace, adjust `proposer_lr_scale` rather than rewriting the optimizer stack.
+
+## 2026-03-19 — ReasoningDrafter Architecture Documentation Update
+
+### Objectives
+- Document the corrected `ReasoningDrafter` architecture without touching source or tests.
+- Record the clarified split between the 4-head global Wave-PDE front end and the gated WavePDE + LinearAttention proposer blocks.
+
+### Changes Made
+- **Modified:** [`REASONING_DRAFTER_DESIGN.md`](/home/christos/code/julia/Swamma/REASONING_DRAFTER_DESIGN.md)
+  - Replaced the old "triple-gate interference engine" framing with the corrected architecture note.
+  - Documented the three-stage flow:
+    - shared VQ-VAE + 4 Wave-PDE global preprocessors
+    - proposer blocks with gated WavePDE + LinearAttention fusion
+    - role binding / predicate / circuit / veto tail
+  - Added explicit design rules explaining that the front-end PDEs and per-block wave branch serve different roles.
+
+### Commands Run And Key Metrics
+- Inspected the current architecture docs and session history using:
+  - `rg -n "ReasoningDrafter|Wave-PDE|LinearAttention|veto|predicate|circuit" docs REASONING_DRAFTER_DESIGN.md . -g'*.md'`
+  - `ls -1 docs`
+  - `tail -n 80 docs/SESSION_REPORT.md`
+- No runtime tests were run because this session was documentation-only.
+
+### Best Current Checkpoint/Config Recommendation
+- Treat `REASONING_DRAFTER_DESIGN.md` as the canonical architecture note for the corrected drafter layout:
+  - 4 Wave-PDEs as global preprocessors
+  - gated WavePDE + LinearAttention proposer blocks
+  - explicit audit tail with veto
+
+### Unresolved Issues And Next Actions
+- The source implementation still needs to be brought into exact alignment with this corrected architecture in a separate coding session.
+- If the code is updated later, the architecture note should be kept in sync with the actual block topology and training contract.
+
+## 2026-03-19 — Explicit TiDAR Mask-Ratio Integration In ReasoningDrafter
+
+### Objectives
+- Make `ReasoningDrafter` explicitly TiDAR-conditioned by accepting a runtime `mask_ratio`.
+- Route the mask signal into the shared opcode front end instead of leaving the existing time path inert.
+- Align focused tests and helper scripts with the explicit `(token_ids, mask_ratio)` model API.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - Added explicit named-tuple forward support: `model((token_ids=..., mask_ratio=...), ps, st)`.
+  - Kept backward-compatible overloads so `model(tokens, ps, st)` still works and defaults to `mask_ratio = 0.0f0`.
+  - Extended `SharedOpcodeFrontend` with explicit mask-conditioned projections:
+    - `MaskCodeWeight`, `MaskCodeBias`
+    - `MaskReadoutWeight`, `MaskReadoutBias`
+  - Routed the runtime mask signal through a deterministic sinusoidal embedding scaled by learnable `TimeEmbedding` gains, then conditioned:
+    - the coarse opcode query
+    - the front-end wave readouts
+  - Added helpers to normalize/broadcast `mask_ratio` cleanly across batch and sequence.
+  - Updated drafting helpers to call the explicit API with `mask_ratio = 0.0f0`.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Updated forward, overlength, EMA, and gradient tests to use the explicit input path.
+  - Added a regression test that confirms different `mask_ratio` values change the logits.
+  - Extended gradient checks to cover:
+    - `FrontEnd.MaskCodeWeight`
+    - `FrontEnd.MaskReadoutWeight`
+    - `TimeEmbedding`
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Added `mask_ratio = 0.0f0` to the next-token language batch.
+  - Switched the loss path to call `ReasoningDrafter` with explicit named-tuple inputs.
+  - Froze the new front-end mask-conditioning backbone weights with the rest of the frozen structural front end.
+- **Modified:** [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+  - Extended front-end parameter transfer to include:
+    - `MaskCodeWeight`, `MaskCodeBias`
+    - `MaskReadoutWeight`, `MaskReadoutBias`
+  - Extended audit-tail transfer to include:
+    - `AgreementWeight`, `AgreementBias`
+
+### Commands Run And Key Metrics
+- `julia --project=. -q -e 'include("scripts/train_reasoning_language.jl"); println("parse-ok")'`
+  - result: `parse-ok`
+- `julia --project=. -q -e 'include("scripts/transfer_surgery.jl"); println("parse-ok")'`
+  - result: `parse-ok`
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `RuleConditionedWavePDE 31/31 pass`
+  - result: `ReasoningDrafter 73/73 pass`
+- `julia --project=. -q -e '... compare logits at mask_ratio 0.1 vs 0.9 ...'`
+  - `maximum(abs.(logits_lo - logits_hi)) = 0.6081096`
+  - confirms the explicit mask path is active rather than a no-op
+
+### Best Current Checkpoint/Config Recommendation
+- Treat the explicit API as canonical for TiDAR-style use:
+  - `model((token_ids = ..., mask_ratio = ...), ps, st)`
+- For plain next-token language tuning, keep passing `mask_ratio = 0.0f0` explicitly so the model and scripts stay on one API path.
+- Preserve the current proposer block shape:
+  - GLU split
+  - `LinearAttention` content path
+  - `WavePDE` gate path
+  - multiplicative fusion
+  - `SwiGLU` refinement
+
+### Unresolved Issues And Next Actions
+- Phase 3a language training was parse-checked, not run as a real optimization smoke test after this API change.
+- Transfer surgery was parse-checked, not exercised end-to-end on a checkpoint pair in this session.
+- If mask-ratio conditioning becomes central during denoising runs, the next check should be a short trainability smoke test with nonzero `mask_ratio` schedules rather than another structural refactor.
+
+## 2026-03-19 — Frozen-Module Headers And Proposer-LR Curriculum
+
+### Objectives
+- Add explicit adapter headers around the modules we intend to keep frozen during transfer.
+- Keep the `FrontEnd` and audit logic core frozen during transfer while preserving trainable adaptation surfaces.
+- Make chess pretraining use the full `ReasoningDrafter` path and keep proposer updates slower than the rest of the model.
+
+### Changes Made
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - Added a reusable `ResidualAdapterHeader` layer:
+    - `RMSNorm`
+    - `SwiGLU`
+    - output projection
+    - learned residual gate
+  - Added `frontend_header_expansion` and `audit_input_header_expansion` to `ReasoningDrafterConfig`.
+  - Added `FrontEndHeader` after the shared front end and before the proposer stack when `use_adapters = true`.
+  - Added `AuditInputHeader` inside `ReasoningAuditTail`, before the frozen audit core input normalization.
+  - Added `reasoning_hidden(model, inputs, ps, st)` so scripts can use the full hidden-state path without going through the vocab projection head.
+  - Kept the existing proposer `ProposalHeader` and audit `CircuitLeafHeader` / `CircuitGateBiasShift` path intact.
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Switched chess pretraining config to `use_adapters = true`.
+  - Routed chess pretraining through `reasoning_hidden(...)` so the full drafter path is exercised, including:
+    - `FrontEnd`
+    - `FrontEndHeader`
+    - proposer blocks
+    - `AuditInputHeader`
+    - `AuditTail`
+    - `FinalNorm`
+  - Preserved slower proposer learning by scaling `grads.Drafter.Blocks` with `proposer_lr_scale = 0.25f0` before optimizer update.
+  - Removed stale block-specific debug/revive logic that referenced the old `RuleWave` internals.
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Updated freeze-strategy documentation to reflect the new trainable headers:
+    - `FrontEndHeader`
+    - `AuditInputHeader`
+    - existing proposer and circuit-leaf headers
+  - Freeze mask behavior remains correct: the frozen front end and audit core are zeroed, while the new headers remain trainable by default.
+- **Modified:** [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+  - Added transfer support for:
+    - `FrontEndHeader`
+    - `AuditInputHeader`
+    - existing `ProposalHeader`
+    - existing `CircuitLeafHeader` and `CircuitGateBiasShift`
+  - The script now copies header parameters when the source checkpoint already has them, otherwise it leaves them fresh/identity-initialized.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Added adapter initialization checks for `FrontEndHeader` and `AuditInputHeader`.
+
+### Commands Run And Key Metrics
+- `julia --project=. -q -e 'using Swamma; println("pkg-load-ok")'`
+  - result: `pkg-load-ok`
+- `julia --project=. -q -e 'include("scripts/train_reasoning_language.jl"); println("language-parse-ok")'`
+  - result: `language-parse-ok`
+- `julia --project=. -q -e 'include("scripts/transfer_surgery.jl"); println("surgery-parse-ok")'`
+  - result: `surgery-parse-ok`
+- `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("chess-parse-ok")'`
+  - result: `chess-parse-ok`
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `RuleConditionedWavePDE 31/31 pass`
+  - result: `ReasoningDrafter 80/80 pass`
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+  - result: `Phase 3a language helpers 25/25 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- For Phase 1 chess pretraining:
+  - enable adapters: `use_adapters = true`
+  - keep full-model pretraining active
+  - scale proposer block gradients with `proposer_lr_scale = 0.25f0`
+- For transfer:
+  - keep `FrontEnd` frozen
+  - keep audit logic core frozen
+  - adapt through:
+    - `FrontEndHeader`
+    - `ProposalHeader`
+    - `AuditInputHeader`
+    - `CircuitLeafHeader`
+    - score/agreement heads
+
+### Unresolved Issues And Next Actions
+- Chess pretraining script now parses against the current architecture, but I did not run a long optimization smoke on real chess data in this session.
+- If Phase 1 memory or throughput regresses after re-enabling the full drafter path, the next step is to profile `reasoning_hidden(...)` inside `train_chess_reasoning.jl` rather than reverting the architecture.
+
+## 2026-03-19 — Post-Chess Freeze Policy Tightening
+
+### Objectives
+- Make the transfer freeze policy match the intended architecture exactly after chess pretraining.
+- Freeze the full `FrontEnd` after Phase 1, not just its readout backbone.
+- Freeze the full audit core after Phase 1 while keeping only the adapter headers and score/agreement calibration trainable.
+
+### Changes Made
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Tightened `zero_frozen_grads!` so Phase 3a now freezes:
+    - `FrontEnd.Codebook`
+    - full front-end backbone
+    - full audit logic core
+    - `CircuitLeafProjection`
+    - `Circuit`
+    - `FinalNorm`
+  - Left trainable:
+    - `FrontEndHeader`
+    - proposer `ProposalHeader`
+    - `AuditInputHeader`
+    - `CircuitLeafHeader`
+    - `CircuitGateBiasShift`
+    - `ScoreWeight` / `AgreementWeight` and biases
+    - token/position/time embeddings
+    - `OutputHead`
+  - Updated the script documentation so it no longer claims the front-end codebook or audit projection core remain trainable during transfer.
+
+### Commands Run And Key Metrics
+- `julia --project=. -q -e 'include("scripts/train_reasoning_language.jl"); println("language-parse-ok")'`
+  - result: `language-parse-ok`
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+  - result: `Phase 3a language helpers 25/25 pass`
+
+### Best Current Checkpoint/Config Recommendation
+- After chess pretraining:
+  - freeze the full `FrontEnd`
+  - freeze the full audit core
+  - keep only adapter surfaces and calibration heads trainable
+- Concretely, treat `CircuitLeafHeader` as trainable, but treat `CircuitLeafProjection` and `Circuit` as frozen audit-core parameters.
+
+### Unresolved Issues And Next Actions
+- This change was validated with the Phase 3a trainability smoke, not a full downstream training run.
+- If downstream adaptation becomes too rigid, expand the headers further before considering audit/front-end thaw.
+
+## 2026-03-19 — Reasoning Drafter Regression + Bounded Training Fixes
+
+### Objectives
+- Fix the backward-pass regressions blocking reasoning-drafter training.
+- Keep the bounded Phase 3a smoke runnable so training can be tested without launching a full job.
+- Address the high resource footprint issue by making the Phase 3a path respect the active char-level vocabulary during loss computation.
+
+### Changes Made
+- **Modified:** [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl)
+  - Replaced the custom `RMSNorm` implementation with a wrapper around `Lux.RMSNorm` to eliminate the failing backward path on the drafter stack.
+- **Modified:** [`src/CircuitLayer.jl`](/home/christos/code/julia/Swamma/src/CircuitLayer.jl)
+  - Refactored `AlgebraicCircuitLayer` forward logic into explicit helper paths for 2D and 3D inputs.
+  - Removed the earlier gradient-breaking shape/composition path; input and parameter gradients now propagate in the batched case.
+- **Modified:** [`src/PredicateEngram.jl`](/home/christos/code/julia/Swamma/src/PredicateEngram.jl)
+  - Reworked `vq_quantize` to use an explicit straight-through `rrule`.
+  - Marked nearest-code lookup as non-differentiable so the backward path only tracks the intended query gradient.
+- **Modified:** [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+  - Replaced the proposer attention call inside `ReasoningDrafterBlock` with an explicit staged attention computation that avoids the failing callable `LinearAttentionLayer` backward boundary.
+  - Made `_reasoning_time_embedding(...)` treat the sinusoidal basis as non-differentiable conditioning, while still learning the trainable `TimeEmbedding` gain vector.
+- **Modified:** [`src/linearAttention.jl`](/home/christos/code/julia/Swamma/src/linearAttention.jl)
+  - Restored the generic `LinearAttentionLayer` file to its baseline implementation after the validated reasoning-path fix was localized in `ReasoningDrafter.jl`.
+  - This keeps the training fix scoped to the reasoning drafter instead of shipping a half-validated generic attention rewrite.
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Added bounded-run CLI controls: `--max-per-dataset`, `--max-steps`, and explicit runtime overrides for batch size, sequence length, LR, checkpoint cadence, and logging.
+  - Added Phase 3a footprint estimation and active-vocab reporting.
+  - Restricted Phase 3a language loss to the active char vocabulary so the char-level stage no longer pays full-vocab output cost unnecessarily.
+- **Modified:** [`test/test_reasoning_drafter.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_drafter.jl)
+  - Added direct backward coverage for `RMSNorm`.
+  - Kept the existing proposer/audit gradient coverage that now passes again end-to-end.
+- **Modified:** [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+  - Added bounded Phase 3a smoke coverage with `max_steps=1` and `max_per_dataset=1`.
+- **Modified:** [`test/test_circuit_layer.jl`](/home/christos/code/julia/Swamma/test/test_circuit_layer.jl)
+  - Added explicit batched backward coverage for `AlgebraicCircuitLayer`.
+- **Modified:** [`test/test_predicate_engram.jl`](/home/christos/code/julia/Swamma/test/test_predicate_engram.jl)
+  - Added straight-through VQ gradient coverage.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_circuit_layer.jl`
+  - result: `AlgebraicCircuitLayer 34/34 pass`
+- `julia --project=. test/test_predicate_engram.jl`
+  - result: `PredicateEngram 39/39 pass`
+- `julia --project=. test/test_reasoning_drafter.jl`
+  - result: `RuleConditionedWavePDE 31/31 pass`
+  - result: `RMSNorm 4/4 pass`
+  - result: `ReasoningDrafter 80/80 pass`
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+  - result: `Phase 3a language helpers 25/25 pass`
+  - result: `Phase 3a bounded train run 7/7 pass`
+  - bounded run config: `batch_size=1`, `max_seq_length=12`, `max_per_dataset=1`, `max_steps=1`
+  - bounded run metric: `step=1  loss=4.6787`
+  - bounded run artifact: `best.jld2` written successfully in the temporary output dir
+
+### Best Current Checkpoint/Config Recommendation
+- Treat the reasoning-drafter Phase 3a path as trainable again on the current branch.
+- For fast safety checks, use the bounded Phase 3a entrypoint:
+  - `batch_size = 1`
+  - `max_seq_length = 12` or similarly small
+  - `max_per_dataset = 1`
+  - `max_steps = 1`
+- Keep the active char-vocab loss path enabled during Phase 3a when training against the reasoning char tokenizer; that removes the worst output-head mismatch cost without changing the checkpoint format.
+
+### Unresolved Issues And Next Actions
+- The bounded Phase 3a smoke now passes, but I did not run a long real-data optimization job in this session.
+- The warning from `OptimisersAdaptExt` about device transfer on optimizer leaves still appears during the bounded Phase 3a run; it did not block the smoke, but it should be cleaned up before large GPU runs if optimizer-state device movement becomes part of the workflow.
+- If you want the next hardening step, run a multi-step Phase 3a smoke on a small real reasoning slice and record memory/throughput on the production GPU profile.
+
+## 2026-03-19 — Optimizer State Device-Transfer Cleanup
+
+### Objectives
+- Remove the `OptimisersAdaptExt` warning from the bounded Phase 3a GPU smoke.
+- Avoid generic `Adapt`-based transfers for `Optimisers.Leaf` state during checkpoint save/load and GPU movement.
+- Apply the same safe optimizer-state serialization pattern to the adjacent drafter training scripts.
+
+### Changes Made
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Added a leaf-aware recursive optimizer-state copier that only moves arrays, preserving `Optimisers.Leaf` structure without routing the whole object through generic `Adapt`.
+  - Switched:
+    - Phase 3a checkpoint save to `_optimizer_state_to_cpu(opt_state)`
+    - Phase 3a GPU resume/setup to `_optimizer_state_to_device(opt_state)`
+- **Modified:** [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+  - Updated temporary checkpoint export in the test to use the same optimizer-state CPU copier.
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Replaced direct `cpu_device()(opt_state)` checkpoint export with the same leaf-aware CPU copier.
+- **Modified:** [`scripts/distill_granite.jl`](/home/christos/code/julia/Swamma/scripts/distill_granite.jl)
+  - Replaced direct `cpu_device()(opt_state)` checkpoint export with the same leaf-aware CPU copier.
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+  - result: `Phase 3a language helpers 25/25 pass`
+  - result: `Phase 3a bounded train run 7/7 pass`
+  - result: bounded GPU run no longer emitted the prior `OptimisersAdaptExt` warning
+- `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("chess-parse-ok")'`
+  - result: `chess-parse-ok`
+- `julia --project=. -q -e 'include("scripts/distill_granite.jl"); println("distill-parse-ok")'`
+  - result: `distill-parse-ok`
+
+### Best Current Checkpoint/Config Recommendation
+- Use the bounded Phase 3a smoke exactly as before for quick validation, but the optimizer-state transfer path is now safe for GPU checkpointing/resume:
+  - `batch_size = 1`
+  - `max_seq_length = 12`
+  - `max_per_dataset = 1`
+  - `max_steps = 1`
+- Reuse the same optimizer-state transfer helper pattern for any new drafter training entrypoint that checkpoints Adam state across CPU/GPU boundaries.
+
+### Unresolved Issues And Next Actions
+- The warning is gone on the bounded reasoning run, but I still did not run a long multi-checkpoint production training job in this session.
+- If the next goal is hardening, run a longer resumed Phase 3a smoke that loads from `checkpoint_last.jld2` for several optimizer steps to validate checkpoint-resume continuity on GPU.
+
+## 2026-03-19 — Phase 3a Resume Continuity Coverage
+
+### Objectives
+- Verify that bounded Phase 3a training resumes from `checkpoint_last.jld2` instead of silently reinitializing.
+- Add automated regression coverage for multi-step checkpoint/resume continuity on the reasoning training entrypoint.
+
+### Changes Made
+- **Modified:** [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+  - Added `Phase 3a bounded resume run`.
+  - The new test:
+    - runs an initial bounded Phase 3a job with `max_steps = 1`
+    - resumes from the generated `checkpoint_last.jld2`
+    - runs `max_steps = 2` additional steps
+    - asserts that `global_step` advances from `1` to `3`
+    - asserts the resumed checkpoint persists `global_step == 3`
+    - asserts the resumed checkpoint still carries `opt_state_cpu`
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+  - result: `Phase 3a language helpers 25/25 pass`
+  - result: `Phase 3a bounded train run 7/7 pass`
+  - result: `Phase 3a bounded resume run 8/8 pass`
+  - resume metrics:
+    - initial bounded run: `step=1  loss=5.0179`
+    - resumed run: `step=2  loss=4.9888`
+    - resumed run: `step=3  loss=4.9597`
+    - resumed `global_step`: `3`
+
+### Best Current Checkpoint/Config Recommendation
+- The Phase 3a entrypoint now has automated coverage for both:
+  - fresh bounded startup
+  - bounded resume from `checkpoint_last.jld2`
+- For safe smoke validation before real training, prefer this sequence:
+  - first run: `max_steps = 1`
+  - resume run: `checkpoint_path = checkpoint_last.jld2`, `max_steps = 2`
+
+### Unresolved Issues And Next Actions
+- Resume continuity is now covered for bounded runs, but not yet for a larger real-data multi-epoch production run.
+- If you want the next hardening step, run a small real reasoning subset for several checkpoints and confirm loss continuity plus checkpoint reload on the production output directory, not just tempdirs.
+
+## 2026-03-19 — Legacy Checkpoint Guardrails And Real-Data Bounded Smoke
+
+### Objectives
+- Stop `Phase 3a` training and `transfer_surgery` from crashing with low-signal field errors when pointed at stale monolithic checkpoints.
+- Make the incompatibility with the checked-in legacy Phase 1 / Phase 2 artifacts explicit and actionable.
+- Re-run a bounded real-data `Phase 3a` smoke from a current-layout checkpoint so the production path is still validated end to end.
+
+### Changes Made
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Added checkpoint-layout classification for current split checkpoints vs legacy monolithic checkpoints.
+  - Added explicit `ArgumentError` messages for:
+    - legacy monolithic Phase 2 checkpoints
+    - raw legacy Phase 1 checkpoints with top-level chess heads
+    - unknown checkpoint parameter trees
+  - `_load_phase3a_state(...)` now validates checkpoint layout before building the live model/state path.
+- **Modified:** [`scripts/transfer_surgery.jl`](/home/christos/code/julia/Swamma/scripts/transfer_surgery.jl)
+  - Added drafter-layout validation for current vs legacy monolithic Phase 1 checkpoints.
+  - Replaced the earlier `FieldError` crash path with an explicit incompatibility error explaining why the old per-block `RuleWave` / `Circuit` layout cannot be transferred safely into the current split `FrontEnd` + `AuditTail` architecture.
+- **Modified:** [`test/test_reasoning_trainability.jl`](/home/christos/code/julia/Swamma/test/test_reasoning_trainability.jl)
+  - Added regression coverage for both compatibility guards:
+    - Phase 3a loading a legacy monolithic Phase 2 checkpoint
+    - Phase 2 transfer surgery loading a legacy monolithic Phase 1 checkpoint
+
+### Commands Run And Key Metrics
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: `Reasoning Phase 3a Trainability Smoke 17/17 pass`
+  - result: `Phase 3a language helpers 25/25 pass`
+  - result: `Phase 3a bounded train run 7/7 pass`
+  - result: `Phase 3a bounded resume run 8/8 pass`
+  - result: `Legacy checkpoint compatibility guards 4/4 pass`
+- `julia --project=. scripts/train_reasoning_language.jl --checkpoint checkpoints/reasoning_drafter/phase2/surgery.jld2 --data-dir data/reasoning --output-dir /tmp/phase3a_should_fail --epochs 1 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 1`
+  - result: fails fast with an explicit `ArgumentError` identifying the checked-in `phase2/surgery.jld2` artifact as a legacy monolithic Phase 2 checkpoint
+- `julia --project=. scripts/transfer_surgery.jl --input checkpoints/reasoning_drafter/phase1_256dim/best.jld2 --output /tmp/surgery_should_fail.jld2 --target-vocab 49160`
+  - result: fails fast with an explicit `ArgumentError` identifying the checked-in `phase1_256dim/best.jld2` artifact as a legacy monolithic Phase 1 checkpoint
+- `julia --project=. -q -e '... build current-layout /tmp/phase2_current_smoke.jld2 ...'`
+  - result: wrote a fresh current-layout Phase 2-compatible checkpoint scaffold
+- `julia --project=. scripts/train_reasoning_language.jl --checkpoint /tmp/phase2_current_smoke.jld2 --data-dir data/reasoning --output-dir /tmp/phase3a_prod_smoke_current --epochs 2 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 2 --checkpoint-every 1 --log-every 1 --seed 41`
+  - dataset slice: `1 gsm8k + 1 reclor = 2 examples`
+  - footprint: `input_seq=63`, `vocab=132`, `full logits=8,316 Float32 (~0.0 MiB)` for the bounded smoke config
+  - metrics:
+    - `step=1  loss=5.4354`
+    - `step=2  loss=5.5260`
+    - `epoch_1 avg_loss=5.4807`
+  - artifacts:
+    - `/tmp/phase3a_prod_smoke_current/checkpoint_last.jld2`
+    - `/tmp/phase3a_prod_smoke_current/best.jld2`
+
+### Best Current Checkpoint/Config Recommendation
+- Do **not** use the checked-in `checkpoints/reasoning_drafter/phase1_256dim/best.jld2` or `checkpoints/reasoning_drafter/phase2/surgery.jld2` artifacts with the current split `ReasoningDrafter` code. They are legacy monolithic checkpoints and are now rejected explicitly.
+- For current-branch work:
+  - regenerate Phase 1 on the current architecture
+  - run `scripts/transfer_surgery.jl` on that new Phase 1 checkpoint
+  - then run `scripts/train_reasoning_language.jl`
+- For bounded production-path validation on this branch, a fresh current-layout checkpoint scaffold is sufficient to verify data loading, checkpointing, stepping, and loss logging on real reasoning files.
+
+### Unresolved Issues And Next Actions
+- The hard crash path is fixed, but the repository still does not contain a current-architecture pretrained Phase 1 / Phase 2 checkpoint pair.
+- I did **not** implement a silent heuristic migration from the old monolithic architecture into the current split architecture, because there is no defensible 1:1 parameter mapping for the old per-block `RuleWave` / `Circuit` layout.
+- The next real milestone is operational rather than structural:
+  - train or recover a current-architecture Phase 1 checkpoint
+  - generate a fresh Phase 2 surgery checkpoint from it
+  - run a longer real-data Phase 3a job with several checkpoint/resume cycles
+
+## 2026-03-19 — End-To-End Bounded Pipeline Smoke
+
+### Objectives
+- Make the bounded smoke path produce a current-architecture Phase 1 checkpoint instead of relying on ad hoc temporary scaffolds.
+- Run a real bounded `Phase 1 -> Phase 2 -> Phase 3a` pipeline through the user-facing `launch_reasoning_pipeline.sh --smoke` entrypoint.
+- Fix remaining operational/polish issues discovered while exercising the bounded pipeline.
+
+### Changes Made
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Added exact `max_steps` early stopping for bounded Phase 1 runs.
+  - Added CLI/runtime overrides for the main small-smoke knobs:
+    - `batch_size`
+    - `min_depth`
+    - `learning_rate`
+    - `proposer_lr_scale`
+    - `seed`
+    - `embedding_dimension`
+    - `number_of_heads`
+    - `number_of_layers`
+    - `time_dimension`
+    - `rc_code_dim`
+    - `rc_codebook_size`
+    - `rc_integration_steps`
+    - `frontend_wave_heads`
+    - circuit sizing
+    - `use_adapters`
+  - Moved `_optimizer_state_to_cpu` above the `main()` execution path so direct script execution no longer fails with `UndefVarError` after the first bounded checkpoint.
+- **Modified:** [`scripts/launch_reasoning_pipeline.sh`](/home/christos/code/julia/Swamma/scripts/launch_reasoning_pipeline.sh)
+  - Upgraded `--smoke` to run:
+    - Phase 1 on `data/chess/smoke.jsonl`
+    - Phase 2 surgery with `target_vocab=132`
+    - Phase 3a bounded reasoning tuning on the existing reasoning files
+  - Added small-model/small-step Phase 1 smoke args:
+    - `embedding_dim=64`
+    - `layers=2`
+    - `heads=4`
+    - `max_steps=1`
+    - `batch_size=8`
+  - Relaxed smoke-mode reasoning data preparation so it uses existing reasoning `.jsonl` files instead of forcing a dataset download.
+  - Fixed the final pipeline banner so smoke mode reports the actual final artifact directory (`phase3a`, not `phase3b`).
+
+### Commands Run And Key Metrics
+- `julia --project=. -q -e 'include("scripts/train_chess_reasoning.jl"); println("phase1-parse-ok")'`
+  - result: `phase1-parse-ok`
+- `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/smoke.jsonl --max-positions 128 --checkpoint-dir /tmp/phase1_smoke_current_42 --steps 0 --batch-size 8 --learning-rate 1e-3 --checkpoint-every 1 --log-every 1 --max-steps 1 --embedding-dim 64 --heads 4 --layers 2 --time-dim 32 --rc-code-dim 32 --rc-codebook-size 64 --rc-steps 4 --frontend-wave-heads 2 --circuit-leaves 8 --circuit-sums 4 --circuit-circuits 2 --seed 42`
+  - result: bounded current-architecture Phase 1 checkpoint written successfully
+  - metrics:
+    - `Parameters: 1.508M`
+    - `step=1  loss=10.5455`
+    - `move_loss=10.3164`
+    - `eval_loss=0.4582`
+    - `best.jld2` written to `/tmp/phase1_smoke_current_42/`
+- `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - Phase 1 metrics:
+    - `Parameters: 1.508M`
+    - `step=1  loss=12.0838`
+    - `move_loss=10.6520`
+    - `eval_loss=2.8637`
+    - `checkpoints/reasoning_drafter/phase1/best.jld2` written
+  - Phase 2 metrics:
+    - transferred from current-architecture Phase 1 checkpoint
+    - `target_vocab=132`
+    - surgery checkpoint size summary: `0.301M params`
+    - `checkpoints/reasoning_drafter/phase2/surgery.jld2` written
+  - Phase 3a metrics:
+    - loaded `1 gsm8k + 1 reclor = 2 examples`
+    - `step=1  loss=5.4921`
+    - `step=2  loss=5.4554`
+    - `epoch_1 avg_loss=5.4738`
+    - `checkpoints/reasoning_drafter/phase3a/best.jld2` written
+
+### Best Current Checkpoint/Config Recommendation
+- For bounded end-to-end validation on the current branch, use `./scripts/launch_reasoning_pipeline.sh --smoke`.
+- The smoke path is now the preferred way to verify:
+  - current-architecture Phase 1 checkpoint creation
+  - Phase 2 surgery compatibility
+  - Phase 3a real-data bounded stepping and checkpoint writes
+- For longer training, keep smoke-only shortcuts out of the main path:
+  - smoke uses `target_vocab=132` and a small 64-dim/2-layer Phase 1 model only for operational validation
+  - full runs should still use the larger production configs and a fresh current-branch Phase 1 checkpoint
+
+### Unresolved Issues And Next Actions
+- The bounded smoke path is now operational, but Phase 3b distillation is still excluded from smoke mode.
+- The checked-in legacy monolithic checkpoints remain intentionally unsupported on the current split architecture.
+- The next step is a longer current-branch run using the same now-working Phase 1 -> Phase 2 -> Phase 3a chain with:
+  - more than 1 chess step
+  - more than 2 reasoning steps
+  - at least one explicit resume cycle in the pipeline-level workflow
+
+## 2026-03-20 — Pipeline Resume Coverage And Smoke Workflow Cleanup
+
+### Objectives
+- Add pipeline-level resume support instead of resuming individual Julia scripts manually.
+- Make bounded smoke resume semantics consistent between Phase 1 and Phase 3a.
+- Refresh the smoke `Phase 2` surgery artifact after advancing the smoke `Phase 1` checkpoint.
+- Clean up remaining script-level correctness issues discovered while exercising resume flows.
+
+### Changes Made
+- **Modified:** [`scripts/launch_reasoning_pipeline.sh`](/home/christos/code/julia/Swamma/scripts/launch_reasoning_pipeline.sh)
+  - Replaced the single-positional mode parser with combinable flags:
+    - `--all`
+    - `--smoke`
+    - `--resume`
+    - `--phase <1|2|3a|3b>`
+  - Added smoke-mode resume support:
+    - `Phase 1` resumes from `checkpoints/reasoning_drafter/phase1/checkpoint_last.jld2` when `--resume` is provided
+    - `Phase 3a` resumes from `checkpoints/reasoning_drafter/phase3a/checkpoint_last.jld2` when `--resume` is provided
+  - Kept smoke-mode Phase 3a bounded to `2` additional steps during resume, instead of the earlier accidental `4`.
+  - Fixed final-artifact banner precedence so `--phase 2 --smoke` now reports `phase2/` instead of incorrectly reporting `phase3a/`.
+- **Modified:** [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Changed `max_steps` semantics to match `train_reasoning_language.jl`:
+    - `max_steps` is now per invocation (`steps_run`) rather than an absolute `global_step` cap
+    - bounded resume now performs the requested number of additional steps
+  - Added `_optimizer_state_to_device(...)` and switched resumed optimizer-state restore away from generic `Adapt`-style transfer
+  - This removes the prior `OptimisersAdaptExt` warning on resumed Phase 1 smoke runs
+
+### Commands Run And Key Metrics
+- `./scripts/launch_reasoning_pipeline.sh --phase 3a --smoke --resume`
+  - initial validation after parser addition:
+    - resumed from `checkpoints/reasoning_drafter/phase3a/checkpoint_last.jld2`
+    - advanced `global_step` from `2` to `6`
+    - metrics:
+      - `step=3  loss=5.3887`
+      - `step=4  loss=5.3656`
+      - `step=5  loss=5.2920`
+      - `step=6  loss=5.2758`
+      - best loss improved to `5.2839`
+  - post-cleanup validation after reducing resume smoke back to `2` additional steps:
+    - advanced `global_step` from `6` to `8`
+    - metrics:
+      - `step=7  loss=5.1972`
+      - `step=8  loss=5.1865`
+      - best loss improved to `5.1918`
+- `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/smoke.jsonl --max-positions 128 --checkpoint-dir checkpoints/reasoning_drafter/phase1 --resume checkpoints/reasoning_drafter/phase1/checkpoint_last.jld2 --steps 0 --batch-size 8 --learning-rate 1e-3 --checkpoint-every 1 --log-every 1 --max-steps 1 --embedding-dim 64 --heads 4 --layers 2 --time-dim 32 --rc-code-dim 32 --rc-codebook-size 64 --rc-steps 4 --frontend-wave-heads 2 --circuit-leaves 8 --circuit-sums 4 --circuit-circuits 2 --seed 41`
+  - before optimizer-state restore fix:
+    - advanced `global_step` from `1` to `2`
+    - metric: `step=2  loss=10.6332`
+    - exposed resumed optimizer-state `OptimisersAdaptExt` warning
+  - after optimizer-state restore fix:
+    - advanced `global_step` from `2` to `3`
+    - metric: `step=3  loss=10.2471`
+    - warning no longer emitted
+- `./scripts/launch_reasoning_pipeline.sh --phase 2 --smoke`
+  - refreshed `checkpoints/reasoning_drafter/phase2/surgery.jld2` from the newer smoke `Phase 1` best checkpoint
+  - loaded `Chess step: 3`
+  - saved updated smoke surgery artifact with `0.301M params`
+  - final banner correctly reported `checkpoints/reasoning_drafter/phase2/`
+
+### Best Current Checkpoint/Config Recommendation
+- For smoke workflow validation on the current branch, the supported commands are now:
+  - fresh bounded chain: `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - bounded Phase 3a resume: `./scripts/launch_reasoning_pipeline.sh --phase 3a --smoke --resume`
+  - bounded Phase 1 resume: `./scripts/launch_reasoning_pipeline.sh --phase 1 --smoke --resume`
+- Current smoke artifact state:
+  - `phase1/checkpoint_last.jld2` advanced to `global_step=3`
+  - `phase2/surgery.jld2` refreshed from the `Phase 1` best checkpoint at chess step `3`
+  - `phase3a/checkpoint_last.jld2` advanced to `global_step=8`
+
+### Unresolved Issues And Next Actions
+- The smoke artifacts are now operational and resume-capable, but provenance is no longer perfectly linear across the latest files:
+  - `phase3a/checkpoint_last.jld2` is a continued language checkpoint from the earlier smoke surgery artifact
+  - `phase2/surgery.jld2` was later refreshed from the newer `Phase 1` best checkpoint at step `3`
+- If strict downstream provenance matters, the next step is:
+  - rerun a fresh smoke `Phase 3a` from the refreshed `phase2/surgery.jld2`, or
+  - separate “fresh chain” and “resume chain” artifacts into different output directories
+- Phase 3b still remains outside the smoke workflow.
+
+## 2026-03-20 — Isolated Smoke Artifact Lineage And Resume Preflight Guards
+
+### Objectives
+- Eliminate provenance ambiguity between long-lived main checkpoints and bounded smoke checkpoints.
+- Validate a fresh smoke chain and a smoke resume inside a dedicated isolated checkpoint root.
+- Fail fast with actionable shell-level errors when `--resume` is requested before the required checkpoint files exist.
+
+### Changes Made
+- **Modified:** [`scripts/launch_reasoning_pipeline.sh`](/home/christos/code/julia/Swamma/scripts/launch_reasoning_pipeline.sh)
+  - Added checkpoint-root selection logic:
+    - default full-run root: `checkpoints/reasoning_drafter`
+    - default smoke root: `checkpoints/reasoning_drafter_smoke`
+    - optional explicit override via `REASONING_CHECKPOINT_DIR=...`
+  - Added `require_file(...)` preflight checks so the pipeline now fails with concise, actionable errors when:
+    - Phase 1 resume is requested without `phase1/checkpoint_last.jld2`
+    - Phase 2 is requested without `phase1/best.jld2`
+    - Phase 3a fresh start is requested without `phase2/surgery.jld2`
+    - Phase 3a resume is requested without `phase3a/checkpoint_last.jld2`
+
+### Commands Run And Key Metrics
+- `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - ran a fresh isolated smoke chain in `checkpoints/reasoning_drafter_smoke/`
+  - Phase 1:
+    - `step=1  loss=12.0838`
+    - `move_loss=10.6520`
+    - `eval_loss=2.8637`
+    - wrote `checkpoints/reasoning_drafter_smoke/phase1/best.jld2`
+  - Phase 2:
+    - `Chess step: 1`
+    - wrote `checkpoints/reasoning_drafter_smoke/phase2/surgery.jld2`
+    - `0.301M params`
+  - Phase 3a:
+    - `step=1  loss=5.4921`
+    - `step=2  loss=5.4554`
+    - `epoch_1 avg_loss=5.4738`
+    - wrote `checkpoints/reasoning_drafter_smoke/phase3a/best.jld2`
+- `./scripts/launch_reasoning_pipeline.sh --phase 3a --smoke --resume`
+  - resumed cleanly inside the isolated smoke tree
+  - advanced `global_step` from `2` to `4`
+  - metrics:
+    - `step=3  loss=5.3887`
+    - `step=4  loss=5.3656`
+    - `epoch_2 avg_loss=5.3772`
+    - improved best loss to `5.3772`
+- `REASONING_CHECKPOINT_DIR=/tmp/reasoning_drafter_missing ./scripts/launch_reasoning_pipeline.sh --phase 3a --smoke --resume`
+  - result: intentional shell-level failure with:
+    - `ERROR: Phase 3a resume requested, but no Phase 3a checkpoint_last.jld2 exists in the selected checkpoint root.`
+
+### Best Current Checkpoint/Config Recommendation
+- Use the isolated smoke tree for bounded validation by default:
+  - fresh chain: `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - resume Phase 3a: `./scripts/launch_reasoning_pipeline.sh --phase 3a --smoke --resume`
+- Treat `checkpoints/reasoning_drafter_smoke/` as the canonical bounded-validation lineage.
+- Keep `checkpoints/reasoning_drafter/` for longer-lived non-smoke artifacts and manual experimentation.
+
+### Unresolved Issues And Next Actions
+- The smoke workflow is now lineage-clean through Phase 3a, but Phase 3b still has no bounded smoke path.
+- If we want parity across the full pipeline, the next step is either:
+  - add a bounded smoke configuration for Phase 3b, or
+  - explicitly document that smoke coverage ends at Phase 3a
+
+## 2026-03-20 — Phase 3b Smoke Distillation And Full All-Phase Smoke Validation
+
+### Objectives
+- Add a bounded Phase 3b smoke path instead of stopping smoke coverage at Phase 3a.
+- Make Phase 3b robust to the current Granite GPU-teacher limitations on this branch.
+- Validate both:
+  - fresh Phase 3b smoke
+  - Phase 3b resume smoke
+  - full `./scripts/launch_reasoning_pipeline.sh --smoke` across all four phases
+
+### Changes Made
+- **Modified:** [`scripts/distill_granite.jl`](/home/christos/code/julia/Swamma/scripts/distill_granite.jl)
+  - Added bounded CLI/runtime controls:
+    - `batch_size`
+    - `learning_rate`
+    - `max_seq_length`
+    - `temperature`
+    - `checkpoint_every`
+    - `max_per_dataset`
+    - `max_steps`
+    - `log_every`
+    - `local_files_only`
+    - `teacher_device`
+    - `seed`
+  - Added current-checkpoint save/load support for Phase 3b:
+    - `checkpoint_last.jld2`
+    - `best.jld2`
+    - `training_stage = "phase3b_distill"` marker
+  - Fixed Phase 3b initialization semantics so a Phase 3a checkpoint no longer contaminates:
+    - `global_step`
+    - `epoch`
+    - `best_loss`
+    - optimizer state
+  - Added shared-vocab KL slicing so distillation can run when the drafter and Granite teacher vocabularies differ.
+  - Moved the teacher onto CPU by default for smoke validation and only transfers the sliced teacher logits to the student device, working around the current Granite GPU rotary-embedding failure.
+  - Replaced the boolean KL mask with a float mask to avoid the GPU broadcast/backprop failure in the masked KL path.
+  - Removed the helper-order bug by relying on the shared optimizer-state utilities from `train_reasoning_language.jl`.
+- **Modified:** [`scripts/launch_reasoning_pipeline.sh`](/home/christos/code/julia/Swamma/scripts/launch_reasoning_pipeline.sh)
+  - Added bounded smoke Phase 3b invocation:
+    - `epochs=1`
+    - `batch_size=1`
+    - `max_per_dataset=1`
+    - `max_steps=1`
+    - `local_files_only=true`
+    - `teacher_device=cpu`
+  - Added Phase 3b resume support from `phase3b/checkpoint_last.jld2`.
+  - Fixed the final artifact banner for all-phase smoke so it now points to `phase3b/`, not `phase3a/`.
+- **Modified:** [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Added a shared top-level GPU banner guard so included scripts do not double-print the device line.
+- **Modified:** [`scripts/distill_granite.jl`](/home/christos/code/julia/Swamma/scripts/distill_granite.jl)
+  - Added the same GPU banner guard to avoid double-printing when the script includes `train_reasoning_language.jl`.
+
+### Commands Run And Key Metrics
+- `julia --project=. -q -e 'include("scripts/distill_granite.jl"); println("distill-parse-ok")'`
+  - result: parse succeeded, GPU banner emitted once after the guard fix
+- `./scripts/launch_reasoning_pipeline.sh --phase 3b --smoke`
+  - fresh bounded Phase 3b distillation in `checkpoints/reasoning_drafter_smoke/phase3b/`
+  - metrics:
+    - `step=1  kl_loss=5.5835`
+    - `epoch_1 avg_kl=5.5835`
+    - wrote:
+      - `checkpoints/reasoning_drafter_smoke/phase3b/checkpoint_last.jld2`
+      - `checkpoints/reasoning_drafter_smoke/phase3b/best.jld2`
+- `./scripts/launch_reasoning_pipeline.sh --phase 3b --smoke --resume`
+  - resumed bounded Phase 3b from the saved distill checkpoint
+  - metrics:
+    - `step=2  kl_loss=5.5626`
+    - `epoch_2 avg_kl=5.5626`
+    - improved best KL to `5.5626`
+- `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - full all-phase smoke now runs through:
+    - Phase 1
+    - Phase 2
+    - Phase 3a
+    - Phase 3b
+  - all-phase smoke metrics:
+    - Phase 1: `step=1  loss=12.0838`
+    - Phase 2: surgery from chess step `1`, `0.301M params`
+    - Phase 3a: `step=1  loss=5.4921`, `step=2  loss=5.4554`, `avg_loss=5.4738`
+    - Phase 3b: `step=1  kl_loss=5.5823`, `avg_kl=5.5823`
+  - final artifact: `checkpoints/reasoning_drafter_smoke/phase3b/`
+
+### Best Current Checkpoint/Config Recommendation
+- The canonical bounded validation workflow now covers the full chain:
+  - fresh all-phase smoke: `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - Phase 3a resume smoke: `./scripts/launch_reasoning_pipeline.sh --phase 3a --smoke --resume`
+  - Phase 3b resume smoke: `./scripts/launch_reasoning_pipeline.sh --phase 3b --smoke --resume`
+- For reliable smoke runs on this branch, keep Phase 3b teacher execution on CPU:
+  - `--teacher-device cpu`
+  - `--local-files-only true`
+
+### Unresolved Issues And Next Actions
+- Granite teacher execution on GPU is still not usable on this branch; the smoke path currently works around that by keeping the teacher on CPU.
+- The next hardening step is therefore narrower than before:
+  - debug the `NativeTeacherLM` GPU path so Phase 3b can optionally move the teacher off CPU
+  - if that is not worth doing immediately, the current smoke workflow is operational enough for bounded end-to-end validation
+
+## 2026-03-20 (GPU teacher restored and guarded)
+
+### Objectives Attempted
+- Restore native Phase 3b Granite teacher execution on GPU for bounded smoke runs.
+- Keep Phase 3b operational if the local CUDA stack regresses again.
+- Add regression coverage for the new teacher-backend probing behavior.
+
+### Code / Config Changes Made
+- **Modified:** [`src/NativeTeacherLM.jl`](/home/christos/code/julia/Swamma/src/NativeTeacherLM.jl)
+  - Replaced the earlier CUDA-conditional `_device_like` helper with allocation via `similar(ref, ...)` and `copyto!` so RoPE support tensors are materialized on the same backend as live activations without a hard CUDA dependency in the module.
+- **Modified:** [`scripts/distill_granite.jl`](/home/christos/code/julia/Swamma/scripts/distill_granite.jl)
+  - Added `maybe_fallback_teacher_to_cpu(...)`, a one-time Phase 3b backend probe that:
+    - keeps `--teacher-device gpu` when the Granite forward succeeds
+    - falls back to CPU teacher execution with an explicit warning if the GPU probe fails
+  - Added a pre-loop probe using a bounded reasoning batch so backend selection happens once, not inside the training loop.
+- **Modified:** [`scripts/launch_reasoning_pipeline.sh`](/home/christos/code/julia/Swamma/scripts/launch_reasoning_pipeline.sh)
+  - Switched Phase 3b smoke back to `--teacher-device gpu` now that the bounded GPU teacher path is working again.
+- **Added:** [`test/test_distill_granite.jl`](/home/christos/code/julia/Swamma/test/test_distill_granite.jl)
+  - Added bounded regression coverage for the teacher-backend probe:
+    - synthetic GPU probe failure falls back to CPU
+    - successful GPU probe keeps GPU execution
+
+### Experiment Commands And Key Metrics
+- `julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_requested_smoke --epochs 1 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 1 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - result: bounded Phase 3b completed successfully on GPU teacher
+  - metrics:
+    - `step=1  kl_loss=5.5823`
+    - wrote `/tmp/phase3b_gpu_requested_smoke/checkpoint_last.jld2`
+    - wrote `/tmp/phase3b_gpu_requested_smoke/best.jld2`
+- `./scripts/launch_reasoning_pipeline.sh --phase 3b --smoke`
+  - result: Phase 3b smoke completed through the pipeline entrypoint using GPU teacher
+  - metrics:
+    - `step=1  kl_loss=5.5823`
+    - final artifact: `checkpoints/reasoning_drafter_smoke/phase3b/`
+- `./scripts/launch_reasoning_pipeline.sh --phase 3b --smoke --resume`
+  - result: resumed bounded Phase 3b smoke completed on GPU teacher
+  - metrics:
+    - `step=2  kl_loss=5.5612`
+    - `epoch_2 avg_kl=5.5612`
+    - improved best KL to `5.5612`
+- `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - result: full bounded Phase 1 -> Phase 2 -> Phase 3a -> Phase 3b pipeline completed with GPU teacher in Phase 3b
+  - metrics:
+    - Phase 1: `step=1  loss=12.0838`
+    - Phase 3a: `step=1  loss=5.4921`, `step=2  loss=5.4554`
+    - Phase 3b: `step=1  kl_loss=5.5823`
+    - final artifact banner correctly reported `checkpoints/reasoning_drafter_smoke/phase3b/`
+- `julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_3step_smoke --epochs 2 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 3 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - result: longer bounded GPU-teacher Phase 3b run completed for three steps
+  - metrics:
+    - `step=1  kl_loss=5.5823`
+    - `step=2  kl_loss=5.0390`
+    - `step=3  kl_loss=5.5414`
+    - `epoch_1 avg_kl=5.3106`
+    - best checkpoint written to `/tmp/phase3b_gpu_3step_smoke/best.jld2`
+- `julia --project=. test/test_distill_granite.jl`
+  - result: `6/6` pass
+  - notable output: synthetic GPU probe failure now logs a warning and falls back cleanly to CPU
+- `julia --project=. test/test_native_teacher_lm.jl`
+  - result: `44/44` pass
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: all suites pass after the Phase 3b changes
+  - metrics:
+    - `Reasoning Phase 3a Trainability Smoke`: `17/17`
+    - `Phase 3a language helpers`: `25/25`
+    - `Phase 3a bounded train run`: `7/7`
+    - `Phase 3a bounded resume run`: `8/8`
+    - `Legacy checkpoint compatibility guards`: `4/4`
+
+### Best Current Checkpoint / Config Recommendation
+- The bounded smoke workflow should now request GPU teacher execution directly:
+  - `./scripts/launch_reasoning_pipeline.sh --smoke`
+  - `./scripts/launch_reasoning_pipeline.sh --phase 3b --smoke`
+  - `./scripts/launch_reasoning_pipeline.sh --phase 3b --smoke --resume`
+- Keep `--local-files-only true` for reproducible local bounded tests.
+- The best current smoke distillation checkpoint is:
+  - `checkpoints/reasoning_drafter_smoke/phase3b/best.jld2`
+  - latest bounded resumed best KL: `5.5612`
+
+### Unresolved Issues And Next Actions
+- `NativeTeacherLM` still deserves direct low-level CUDA unit coverage; the current restoration is validated through bounded script runs and probe behavior, not through a dedicated native-GPU forward test suite.
+- The next worthwhile step is a slightly longer Phase 3b GPU run over several checkpoints to measure stability and throughput beyond `max_steps=1`.
+
+## 2026-03-20 (Phase 3b GPU resource bench)
+
+### Objectives Attempted
+- Measure longer bounded Phase 3b GPU-teacher stability and resource usage beyond smoke-scale `max_steps=1`.
+- Estimate practical wall-clock cost and peak GPU memory for the restored GPU teacher path.
+
+### Code / Config Changes Made
+- No code changes in this step.
+- Updated this session report with the new benchmark data.
+
+### Experiment Commands And Key Metrics
+- `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_10step_bench --epochs 5 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 10 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - result: completed all 10 bounded GPU-teacher Phase 3b steps successfully
+  - per-step KL:
+    - `step=1  kl_loss=5.5823`
+    - `step=2  kl_loss=5.0390`
+    - `step=3  kl_loss=5.5414`
+    - `step=4  kl_loss=5.0044`
+    - `step=5  kl_loss=5.5015`
+    - `step=6  kl_loss=4.9701`
+    - `step=7  kl_loss=5.4621`
+    - `step=8  kl_loss=4.9361`
+    - `step=9  kl_loss=4.9192`
+    - `step=10 kl_loss=5.4040`
+  - epoch averages:
+    - `epoch_1 avg_kl=5.3106`
+    - `epoch_2 avg_kl=5.2729`
+    - `epoch_3 avg_kl=5.2358`
+    - `epoch_4 avg_kl=5.1991`
+    - `epoch_5 avg_kl=5.1616`
+  - checkpoint metadata at completion:
+    - `global_step=10`
+    - `epoch=5`
+    - `training_stage=phase3b_distill`
+  - wall time:
+    - `real 186.73`
+    - `user 144.40`
+    - `sys 32.14`
+  - monitored GPU memory:
+    - startup idle band around `179 MiB`
+    - teacher activation ramp through `10199 MiB`, `14167 MiB`
+    - observed peak `15196 MiB`
+
+### Best Current Checkpoint / Config Recommendation
+- For bounded validation with real GPU teacher execution, the current best practical Phase 3b command is:
+  - `julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_10step_bench --epochs 5 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 10 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+- On this machine, a reasonable planning number for bounded Phase 3b GPU tests is:
+  - about `18.7s/step` end-to-end at `max_steps=10`, including teacher load and checkpointing
+  - about `15.2 GiB` peak observed GPU memory for this bounded configuration
+
+### Unresolved Issues And Next Actions
+- The main remaining unknown is scaling behavior past this tiny 2-example bounded dataset; the current measurements include a large startup component and may overstate per-step cost for longer continuous runs.
+- The next useful experiment is a longer Phase 3b GPU run with:
+  - more than 10 steps
+  - resume from `checkpoint_last.jld2`
+  - explicit throughput reporting after startup, not just total wall time
+
+## 2026-03-20 (Phase 3b GPU resumed throughput window)
+
+### Objectives Attempted
+- Measure a second bounded Phase 3b GPU-teacher window by resuming from the 10-step benchmark checkpoint.
+- Check whether continued training remains stable and whether best KL keeps improving across resumed windows.
+- Inspect the resulting checkpoint metadata after resume.
+
+### Code / Config Changes Made
+- No code changes in this step.
+- Updated this session report with the resumed-run measurements and checkpoint observations.
+
+### Experiment Commands And Key Metrics
+- `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint /tmp/phase3b_gpu_10step_bench/checkpoint_last.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_10step_bench --epochs 5 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 10 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - result: completed an additional 10 resumed GPU-teacher steps successfully
+  - per-step KL:
+    - `step=11  kl_loss=5.3847`
+    - `step=12  kl_loss=4.8688`
+    - `step=13  kl_loss=5.3461`
+    - `step=14  kl_loss=4.8357`
+    - `step=15  kl_loss=5.3079`
+    - `step=16  kl_loss=4.8029`
+    - `step=17  kl_loss=5.2699`
+    - `step=18  kl_loss=4.7703`
+    - `step=19  kl_loss=4.7541`
+    - `step=20  kl_loss=5.2139`
+  - epoch averages:
+    - `epoch_6 avg_kl=5.1267`
+    - `epoch_7 avg_kl=5.0909`
+    - `epoch_8 avg_kl=5.0554`
+    - `epoch_9 avg_kl=5.0201`
+    - `epoch_10 avg_kl=4.9840`
+  - wall time:
+    - `real 194.84`
+    - `user 148.54`
+    - `sys 33.50`
+- Checkpoint metadata after the resumed run:
+  - `checkpoint_last.jld2`
+    - `global_step=20`
+    - `epoch=10`
+    - `best_loss=5.020123481750488`
+    - `training_stage=phase3b_distill`
+  - `best.jld2`
+    - `global_step=20`
+    - `epoch=10`
+    - `best_loss=4.984002113342285`
+    - `training_stage=phase3b_distill`
+
+### Best Current Checkpoint / Config Recommendation
+- The best bounded resumed Phase 3b GPU checkpoint from this series is:
+  - `/tmp/phase3b_gpu_10step_bench/best.jld2`
+  - `best_loss=4.984002113342285`
+- If you want to compare “best so far” across resumed windows, read `best.jld2`, not `checkpoint_last.jld2`.
+
+### Unresolved Issues And Next Actions
+- `checkpoint_last.jld2` does not carry the most recent epoch-best value when an epoch-average improvement happens after the last in-loop save; operationally, `best.jld2` is the authoritative best checkpoint.
+- The next useful experiment is a single longer invocation, not many short resumed windows, to amortize Granite startup cost and estimate steady-state per-step throughput more cleanly.
+
+## 2026-03-20 (Checkpoint metadata sync coverage and 20-step Phase 3b GPU run)
+
+### Objectives Attempted
+- Eliminate the remaining `checkpoint_last.jld2` metadata ambiguity by keeping `best_loss` synchronized with `best.jld2` after epoch-best updates.
+- Add regression coverage so Phase 1, Phase 3a, and Phase 3b all fail loudly if checkpoint metadata drifts again.
+- Run a single longer bounded Phase 3b GPU-teacher invocation to get a cleaner per-step throughput number than the earlier short resumed slices.
+
+### Code / Config Changes Made
+- Updated [test/runtests.jl](../test/runtests.jl) to include a dedicated Phase 1 checkpoint regression test in the default local suite.
+- Added [test/test_train_chess_reasoning.jl](../test/test_train_chess_reasoning.jl) with a `Phase 1 checkpoint metadata sync` test that verifies `checkpoint_last.jld2` and `best.jld2` agree on `best_loss`, `global_step`, and `epoch`, and still retain `opt_state_cpu`.
+- Extended [test/test_reasoning_trainability.jl](../test/test_reasoning_trainability.jl) so the bounded Phase 3a train/resume path now asserts both `checkpoint_last.jld2` and `best.jld2` carry the same final `best_loss`.
+- Extended [test/test_distill_granite.jl](../test/test_distill_granite.jl) with a `Phase 3b checkpoint metadata sync` test that checks the same invariants for the distillation checkpoint writer.
+- The runtime checkpoint writers already patched earlier in the day are now covered by tests:
+  - [scripts/train_chess_reasoning.jl](../scripts/train_chess_reasoning.jl)
+  - [scripts/train_reasoning_language.jl](../scripts/train_reasoning_language.jl)
+  - [scripts/distill_granite.jl](../scripts/distill_granite.jl)
+
+### Experiment Commands And Key Metrics
+- `julia --project=. test/test_train_chess_reasoning.jl`
+  - result: `Phase 1 checkpoint metadata sync | 4/4 pass`
+- `julia --project=. test/test_distill_granite.jl`
+  - result: `Phase 3b teacher backend probe | 6/6 pass`
+  - result: `Phase 3b checkpoint metadata sync | 6/6 pass`
+- `julia --project=. test/test_reasoning_trainability.jl`
+  - result: all suites pass
+  - key suite totals:
+    - `Reasoning Phase 3a Trainability Smoke | 17/17 pass`
+    - `Phase 3a language helpers | 25/25 pass`
+    - `Phase 3a bounded train run | 7/7 pass`
+    - `Phase 3a bounded resume run | 13/13 pass`
+    - `Legacy checkpoint compatibility guards | 4/4 pass`
+- Direct Phase 1 bounded validation:
+  - `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/smoke.jsonl --max-positions 128 --checkpoint-dir /tmp/phase1_checkpoint_sync --steps 0 --batch-size 8 --learning-rate 1e-3 --checkpoint-every 1 --log-every 1 --max-steps 1 --embedding-dim 64 --heads 4 --layers 2 --time-dim 32 --rc-code-dim 32 --rc-codebook-size 64 --rc-steps 4 --frontend-wave-heads 2 --circuit-leaves 8 --circuit-sums 4 --circuit-circuits 2 --seed 41`
+  - result: `step=1  loss=12.0838  move_loss=10.6520  eval_loss=2.8637`
+  - metadata check:
+    - `/tmp/phase1_checkpoint_sync/checkpoint_last.jld2`: `best_loss=12.08383560180664`, `global_step=1`, `epoch=1`
+    - `/tmp/phase1_checkpoint_sync/best.jld2`: `best_loss=12.08383560180664`, `global_step=1`, `epoch=1`
+- Direct Phase 3b short sync validation:
+  - `julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_checkpoint_sync --epochs 1 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 2 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - result:
+    - `step=1  kl_loss=5.5823`
+    - `step=2  kl_loss=5.0390`
+    - `epoch_1 avg_kl=5.3106`
+  - metadata check:
+    - `/tmp/phase3b_checkpoint_sync/checkpoint_last.jld2`: `best_loss=5.310642957687378`, `global_step=2`, `epoch=1`
+    - `/tmp/phase3b_checkpoint_sync/best.jld2`: `best_loss=5.310642957687378`, `global_step=2`, `epoch=1`
+- Longer single-shot Phase 3b GPU benchmark:
+  - `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_20step_single --epochs 10 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 20 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - result: completed 20 GPU-teacher steps without fallback
+  - per-step KL:
+    - `1: 5.5823`
+    - `2: 5.0390`
+    - `3: 5.5414`
+    - `4: 5.0044`
+    - `5: 5.5015`
+    - `6: 4.9701`
+    - `7: 5.4621`
+    - `8: 4.9361`
+    - `9: 4.9192`
+    - `10: 5.4040`
+    - `11: 4.8854`
+    - `12: 5.3657`
+    - `13: 4.8520`
+    - `14: 5.3276`
+    - `15: 5.3085`
+    - `16: 4.8026`
+    - `17: 5.2703`
+    - `18: 4.7701`
+    - `19: 4.7539`
+    - `20: 5.2140`
+  - epoch averages:
+    - `epoch_1 avg_kl=5.3106`
+    - `epoch_2 avg_kl=5.2729`
+    - `epoch_3 avg_kl=5.2358`
+    - `epoch_4 avg_kl=5.1991`
+    - `epoch_5 avg_kl=5.1616`
+    - `epoch_6 avg_kl=5.1255`
+    - `epoch_7 avg_kl=5.0898`
+    - `epoch_8 avg_kl=5.0555`
+    - `epoch_9 avg_kl=5.0202`
+    - `epoch_10 avg_kl=4.9840`
+  - wall time:
+    - `real 177.36`
+    - `user 150.17`
+    - `sys 31.90`
+  - effective end-to-end planning rate:
+    - about `8.87s/step` over 20 steps
+  - final metadata check:
+    - `/tmp/phase3b_gpu_20step_single/checkpoint_last.jld2`: `best_loss=4.983958721160889`, `global_step=20`, `epoch=10`
+    - `/tmp/phase3b_gpu_20step_single/best.jld2`: `best_loss=4.983958721160889`, `global_step=20`, `epoch=10`
+
+### Best Current Checkpoint / Config Recommendation
+- For bounded Phase 3b GPU validation on this machine, the current best practical checkpoint from a single invocation is:
+  - `/tmp/phase3b_gpu_20step_single/best.jld2`
+  - `best_loss=4.983958721160889`
+- For routine bounded regressions, keep using:
+  - `batch_size=1`
+  - `max_seq_length=64`
+  - `max_per_dataset=1`
+  - `max_steps=20`
+  - `checkpoint_every=1`
+  - `teacher_device=gpu`
+- With that setup, use roughly `9s/step` as the current end-to-end planning estimate for a single continuous Phase 3b run on this workstation.
+
+### Unresolved Issues And Next Actions
+- The remaining high-signal issue is not bounded correctness anymore; it is scaling behavior on larger real reasoning batches and longer continuous Phase 3b runs.
+- Ad hoc `JLD2.load` inspection outside the training/test modules still emits reconstruction warnings for optimizer/config types; those warnings did not affect correctness, but cleaning them up would make artifact inspection less noisy.
+- The next useful experiment is a longer Phase 3b GPU run with the same bounded data shape but more steps, plus explicit GPU-memory monitoring, so startup cost and steady-state throughput can be separated more rigorously.
+
+## 2026-03-20 (40-step continuous Phase 3b GPU benchmark)
+
+### Objectives Attempted
+- Extend the bounded Phase 3b GPU benchmark from 20 steps to a longer continuous 40-step run.
+- Capture process-level GPU memory over the whole run, using the telemetry path that actually works on this GB10 host.
+- Confirm that the checkpoint metadata sync fix still holds after a longer continuous distillation window.
+
+### Code / Config Changes Made
+- No code changes in this step.
+- Updated this session report with the longer-run throughput, memory, and checkpoint results.
+
+### Experiment Commands And Key Metrics
+- Long continuous Phase 3b GPU-teacher run:
+  - `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_40step_single --epochs 20 --batch-size 1 --max-seq-length 64 --max-per-dataset 1 --max-steps 40 --checkpoint-every 1 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - result: completed all `40` steps without GPU fallback
+  - epoch-average KL improved monotonically through the run:
+    - `epoch_10 avg_kl=4.9840`
+    - `epoch_11 avg_kl=4.9506`
+    - `epoch_12 avg_kl=4.9148`
+    - `epoch_13 avg_kl=4.8807`
+    - `epoch_14 avg_kl=4.8467`
+    - `epoch_15 avg_kl=4.8142`
+    - `epoch_16 avg_kl=4.7805`
+    - `epoch_17 avg_kl=4.7470`
+    - `epoch_18 avg_kl=4.7124`
+    - `epoch_19 avg_kl=4.6794`
+    - `epoch_20 avg_kl=4.6479`
+  - late-run per-step KL kept improving as well:
+    - `step=31  5.0118`
+    - `step=32  4.5493`
+    - `step=33  4.9753`
+    - `step=34  4.5187`
+    - `step=35  4.5034`
+    - `step=36  4.9214`
+    - `step=37  4.4730`
+    - `step=38  4.8859`
+    - `step=39  4.8679`
+    - `step=40  4.4278`
+  - final best loss:
+    - `best_loss=4.647860765457153`
+  - wall time:
+    - `real 175.62`
+    - `user 152.11`
+    - `sys 26.93`
+  - effective end-to-end planning rate:
+    - about `4.39s/step` over the full 40-step invocation
+- Process-level GPU memory sampling:
+  - working telemetry command on this machine:
+    - `nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader`
+  - sampled from `/tmp/phase3b_gpu_40step_monitor.log`
+  - parsed summary:
+    - `samples=41`
+    - `min_mib=15126`
+    - `peak_mib=15318`
+  - tail trend:
+    - `15132,15132,15132,15132,15132,15196,15228,15260,15292,15318`
+  - note: `--query-gpu=memory.used` reports `N/A` on this GB10 host, so process-level memory is the correct telemetry source here.
+- Checkpoint metadata validation after the 40-step run:
+  - `/tmp/phase3b_gpu_40step_single/checkpoint_last.jld2`
+    - `best_loss=4.647860765457153`
+    - `global_step=40`
+    - `epoch=20`
+  - `/tmp/phase3b_gpu_40step_single/best.jld2`
+    - `best_loss=4.647860765457153`
+    - `global_step=40`
+    - `epoch=20`
+
+### Best Current Checkpoint / Config Recommendation
+- The best bounded Phase 3b GPU artifact so far is now:
+  - `/tmp/phase3b_gpu_40step_single/best.jld2`
+  - `best_loss=4.647860765457153`
+- For longer bounded benchmarking on this workstation, keep using:
+  - `batch_size=1`
+  - `max_seq_length=64`
+  - `max_per_dataset=1`
+  - `teacher_device=gpu`
+  - process-level GPU monitoring via `--query-compute-apps`
+
+### Unresolved Issues And Next Actions
+- The next scaling question is whether this monotonic improvement pattern holds once the bounded dataset shape is relaxed beyond the current 2-example smoke-style slice.
+- The surprisingly low end-to-end `4.39s/step` over 40 steps suggests startup/compilation overhead is being amortized much better than in the earlier short runs; if precise throughput accounting matters, add per-step timestamp logging inside `distill_granite.jl` rather than inferring from wall time.
+- Artifact inspection via plain `JLD2.load` outside the training/test modules still produces noisy reconstruction warnings for optimizer/config types; that remains a cleanup task, not a correctness blocker.
+
+## 2026-03-20 (Wider real-data Phase 3b benchmark: 64 examples, batch 4)
+
+### Objectives Attempted
+- Move beyond the current 2-example smoke-style Phase 3b benchmark and test a wider real-data slice.
+- Measure how Phase 3b behaves when both the dataset slice and batch size increase, while keeping the rest of the bounded setup controlled.
+- Confirm that the checkpoint metadata sync fix still holds under this wider real-data run.
+
+### Code / Config Changes Made
+- No code changes in this step.
+- Updated this session report with the wider real-data benchmark results and memory numbers.
+
+### Experiment Commands And Key Metrics
+- Dataset inventory:
+  - `data/reasoning/gsm8k.jsonl`: `7473` lines
+  - `data/reasoning/reclor.jsonl`: `4638` lines
+- Wider real-data Phase 3b run:
+  - `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_wider_64ex_b4 --epochs 3 --batch-size 4 --max-seq-length 64 --max-per-dataset 32 --max-steps 48 --checkpoint-every 4 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - loaded:
+    - `32` examples from `gsm8k.jsonl`
+    - `32` examples from `reclor.jsonl`
+    - `64` total reasoning examples
+  - completed all `48` steps without fallback
+  - epoch averages:
+    - `epoch_1 avg_kl=5.3908`
+    - `epoch_2 avg_kl=5.0825`
+    - `epoch_3 avg_kl=4.7916`
+  - selected step KL values:
+    - `step=1  5.6550`
+    - `step=8  5.2544`
+    - `step=16 5.0630`
+    - `step=24 5.0572`
+    - `step=32 4.9995`
+    - `step=40 4.9367`
+    - `step=44 4.5949`
+    - `step=46 4.5392`
+    - `step=48 4.5599`
+  - final best loss:
+    - `best_loss=4.791565328836441`
+  - wall time:
+    - `real 184.40`
+    - `user 158.31`
+    - `sys 30.87`
+  - effective end-to-end planning rate:
+    - about `3.84s/step` over the full 48-step invocation
+- Process-level GPU memory sampling:
+  - monitor source:
+    - `nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader`
+  - parsed summary from `/tmp/phase3b_gpu_wider_monitor.log`:
+    - `all_peak_mib=18204`
+    - `active_min_mib=14167`
+    - `active_peak_mib=18204`
+  - active tail:
+    - `18076,18076,18076,18076,18076,18108,18108,18140,18204,18198`
+- Checkpoint metadata validation after the wider run:
+  - `/tmp/phase3b_gpu_wider_64ex_b4/checkpoint_last.jld2`
+    - `best_loss=4.791565328836441`
+    - `global_step=48`
+    - `epoch=3`
+  - `/tmp/phase3b_gpu_wider_64ex_b4/best.jld2`
+    - `best_loss=4.791565328836441`
+    - `global_step=48`
+    - `epoch=3`
+
+### Best Current Checkpoint / Config Recommendation
+- For the wider real-data bounded setup tested here, the best checkpoint is:
+  - `/tmp/phase3b_gpu_wider_64ex_b4/best.jld2`
+  - `best_loss=4.791565328836441`
+- For scale-oriented bounded Phase 3b testing on this machine, two useful reference points now exist:
+  - narrow continuous run:
+    - `/tmp/phase3b_gpu_40step_single/best.jld2`
+    - `batch_size=1`, 2-example slice, `best_loss=4.647860765457153`, peak GPU memory `15318 MiB`
+  - wider real-data run:
+    - `/tmp/phase3b_gpu_wider_64ex_b4/best.jld2`
+    - `batch_size=4`, 64-example slice, `best_loss=4.791565328836441`, active peak GPU memory `18204 MiB`
+
+### Unresolved Issues And Next Actions
+- The next useful comparison is to separate the effect of wider data from the effect of larger batch size:
+- run `64` examples with `batch_size=1`
+- or run the 2-example slice with `batch_size=4`
+- so memory and convergence changes can be attributed cleanly
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; this remains a usability cleanup item.
+
+## 2026-03-20 (Phase 3b memory attribution: batch size vs dataset breadth)
+
+### Objectives Attempted
+- Separate the GPU-memory impact of wider real-data coverage from the impact of larger batch size.
+- Hold one factor fixed at a time with two bounded Phase 3b runs:
+  - wider `64`-example slice at `batch_size=1`
+  - tiny `4`-example slice at `batch_size=4`
+- Confirm that the checkpoint metadata sync behavior remains correct in both attribution runs.
+
+### Code / Config Changes Made
+- No code changes in this step.
+- Updated this session report with the attribution runs and conclusions.
+
+### Experiment Commands And Key Metrics
+- Wider data, small batch:
+  - `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_wider_64ex_b1 --epochs 1 --batch-size 1 --max-seq-length 64 --max-per-dataset 32 --max-steps 40 --checkpoint-every 4 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - loaded:
+    - `32` examples from `gsm8k.jsonl`
+    - `32` examples from `reclor.jsonl`
+    - `64` total examples
+  - completed all `40` steps
+  - result:
+    - `best_loss=5.19685800075531`
+    - `real 171.70`
+    - `user 150.26`
+    - `sys 26.80`
+    - about `4.29s/step`
+  - process-level GPU memory:
+    - `active_min_mib=12695`
+    - `active_peak_mib=15324`
+    - active tail:
+      - `15132,15132,15132,15132,15132,15196,15196,15228,15260,15324`
+  - checkpoint metadata:
+    - `/tmp/phase3b_gpu_wider_64ex_b1/checkpoint_last.jld2`
+      - `best_loss=5.19685800075531`
+      - `global_step=40`
+      - `epoch=1`
+    - `/tmp/phase3b_gpu_wider_64ex_b1/best.jld2`
+      - `best_loss=5.19685800075531`
+      - `global_step=40`
+      - `epoch=1`
+- Tiny data, larger batch:
+  - `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_tiny4ex_b4 --epochs 40 --batch-size 4 --max-seq-length 64 --max-per-dataset 2 --max-steps 40 --checkpoint-every 4 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - loaded:
+    - `2` examples from `gsm8k.jsonl`
+    - `2` examples from `reclor.jsonl`
+    - `4` total examples
+  - completed all `40` steps
+  - result:
+    - `best_loss=4.766773223876953`
+    - `real 179.22`
+    - `user 157.73`
+    - `sys 26.16`
+    - about `4.48s/step`
+  - process-level GPU memory:
+    - `active_min_mib=14167`
+    - `active_peak_mib=18236`
+    - active tail:
+      - `17852,17852,17852,18108,18140,18140,18172,18204,18204,18236`
+  - checkpoint metadata:
+    - `/tmp/phase3b_gpu_tiny4ex_b4/checkpoint_last.jld2`
+      - `best_loss=4.766773223876953`
+      - `global_step=40`
+      - `epoch=40`
+    - `/tmp/phase3b_gpu_tiny4ex_b4/best.jld2`
+      - `best_loss=4.766773223876953`
+      - `global_step=40`
+      - `epoch=40`
+
+### Best Current Checkpoint / Config Recommendation
+- The attribution result is clear:
+  - widening from the tiny slice to `64` real examples at `batch_size=1` kept active peak memory near the old narrow-run band:
+    - `15324 MiB`
+  - keeping the slice tiny but raising to `batch_size=4` pushed active peak memory into the same high-memory regime as the wider `batch_size=4` run:
+    - `18236 MiB`
+- Operational recommendation:
+  - if GPU memory is the concern, control `batch_size` first
+  - `max_per_dataset` is a much weaker lever than `batch_size` for the Phase 3b footprint in this setup
+- Best bounded artifacts from these attribution runs:
+  - wider-data small-batch: `/tmp/phase3b_gpu_wider_64ex_b1/best.jld2`
+  - tiny-data larger-batch: `/tmp/phase3b_gpu_tiny4ex_b4/best.jld2`
+
+### Unresolved Issues And Next Actions
+- The next useful benchmark is a medium setting that may be closer to practical operation:
+- for example `64` examples with `batch_size=2`
+- that should show whether memory and throughput scale roughly linearly between the `15.3 GiB` and `18.2 GiB` regimes
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a cleanup task, not a correctness issue.
+
+## 2026-03-20 (Phase 3b midpoint benchmark: 64 examples, batch 2)
+
+### Objectives Attempted
+- Run the medium configuration suggested by the earlier attribution results: `64` real examples with `batch_size=2`.
+- Check whether memory and throughput land between the established `batch_size=1` and `batch_size=4` regimes.
+- Confirm checkpoint metadata sync after this midpoint run.
+
+### Code / Config Changes Made
+- No code changes in this step.
+- Updated this session report with the midpoint benchmark results.
+
+### Experiment Commands And Key Metrics
+- Midpoint Phase 3b run:
+  - `/usr/bin/time -p julia --project=. scripts/distill_granite.jl --drafter-checkpoint checkpoints/reasoning_drafter_smoke/phase3a/best.jld2 --granite-model ibm-granite/granite-4.0-micro --data-dir data/reasoning --output-dir /tmp/phase3b_gpu_mid_64ex_b2 --epochs 2 --batch-size 2 --max-seq-length 64 --max-per-dataset 32 --max-steps 40 --checkpoint-every 4 --log-every 1 --local-files-only true --teacher-device gpu --seed 41`
+  - loaded:
+    - `32` examples from `gsm8k.jsonl`
+    - `32` examples from `reclor.jsonl`
+    - `64` total examples
+  - completed all `40` steps
+  - epoch averages:
+    - `epoch_1 avg_kl=5.2415`
+    - `epoch_2 avg_kl=4.8578`
+  - selected step KL values:
+    - `step=1  5.5365`
+    - `step=12 5.1023`
+    - `step=16 4.8632`
+    - `step=24 4.9233`
+    - `step=32 4.7840`
+    - `step=40 4.8463`
+  - final best loss:
+    - `best_loss=4.857775986194611`
+  - wall time:
+    - `real 178.98`
+    - `user 152.99`
+    - `sys 31.05`
+  - effective end-to-end planning rate:
+    - about `4.47s/step`
+- Process-level GPU memory:
+  - parsed from `/tmp/phase3b_gpu_mid_64ex_b2_monitor.log`
+  - summary:
+    - `all_peak_mib=16252`
+    - `active_peak_mib=16252`
+  - active tail:
+    - `16028,16028,16028,16156,16156,16156,16188,16252,16252,16246`
+- Checkpoint metadata:
+  - `/tmp/phase3b_gpu_mid_64ex_b2/checkpoint_last.jld2`
+    - `best_loss=4.857775986194611`
+    - `global_step=40`
+    - `epoch=2`
+  - `/tmp/phase3b_gpu_mid_64ex_b2/best.jld2`
+    - `best_loss=4.857775986194611`
+    - `global_step=40`
+    - `epoch=2`
+
+### Best Current Checkpoint / Config Recommendation
+- The memory interpolation is now explicit:
+  - `batch_size=1`, `64` examples:
+    - peak `15324 MiB`
+  - `batch_size=2`, `64` examples:
+    - peak `16252 MiB`
+  - `batch_size=4`, `64` examples:
+    - peak `18204 MiB`
+- Operationally, `batch_size=2` looks like a reasonable middle ground on this host:
+  - materially lower memory than `batch_size=4`
+  - better per-run loss than the single-epoch `batch_size=1` wider-data run
+  - still fully stable on GPU teacher execution
+- Best bounded artifact from this midpoint setting:
+  - `/tmp/phase3b_gpu_mid_64ex_b2/best.jld2`
+  - `best_loss=4.857775986194611`
+
+### Unresolved Issues And Next Actions
+- The next useful step is no longer memory attribution; it is choosing a practical default Phase 3b bounded profile for routine validation, likely one of:
+- `64` examples, `batch_size=2`
+- `64` examples, `batch_size=4` when memory headroom is available
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a training blocker.
+
+## 2026-03-20 (Pipeline-level bounded-medium Phase 3b profile)
+
+### Objectives Attempted
+- Turn the recommended Phase 3b bounded validation profile into a first-class pipeline entrypoint instead of leaving it as a manual command recipe.
+- Validate that the pipeline wrapper can run the recommended `64`-example, `batch_size=2` profile end to end.
+- Fix any wrapper-level preflight assumptions that do not match the actual Phase 3b data requirements.
+
+### Code / Config Changes Made
+- Updated [scripts/launch_reasoning_pipeline.sh](../scripts/launch_reasoning_pipeline.sh):
+  - added `--bounded-medium`
+  - made it explicitly supported only with `--phase 3b`
+  - made `--smoke` and `--bounded-medium` mutually exclusive
+  - added a bounded-medium Phase 3b profile:
+    - `epochs=2`
+    - `batch_size=2`
+    - `max_seq_length=64`
+    - `max_per_dataset=32`
+    - `max_steps=40`
+    - `checkpoint_every=4`
+    - `log_every=1`
+    - `teacher_device=gpu`
+    - `seed=41`
+- Fixed the pipeline data preflight so bounded-medium no longer tries to redownload reasoning datasets when the local two-file set already satisfies the Phase 3b run:
+  - `prepare_data()` now requires `2` reasoning JSONL files for `--bounded-medium`, rather than the full `3`-file expectation used by the broader pipeline.
+
+### Experiment Commands And Key Metrics
+- Negative guard validation:
+  - `./scripts/launch_reasoning_pipeline.sh --bounded-medium`
+  - result: fails immediately with
+    - `ERROR: --bounded-medium is currently supported only with --phase 3b.`
+- Pipeline wrapper validation:
+  - `REASONING_CHECKPOINT_DIR=checkpoints/reasoning_drafter_smoke ./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium`
+  - result: completed successfully through the wrapper using the recommended bounded profile
+  - loaded:
+    - `32` examples from `gsm8k.jsonl`
+    - `32` examples from `reclor.jsonl`
+    - `64` total examples
+  - epoch averages:
+    - `epoch_1 avg_kl=5.2415`
+    - `epoch_2 avg_kl=4.8578`
+  - final best loss:
+    - `best_loss=4.857775986194611`
+  - final artifact:
+    - `checkpoints/reasoning_drafter_smoke/phase3b/`
+- Post-run checkpoint validation:
+  - `checkpoints/reasoning_drafter_smoke/phase3b/checkpoint_last.jld2`
+    - `best_loss=4.857775986194611`
+    - `global_step=40`
+    - `epoch=2`
+  - `checkpoints/reasoning_drafter_smoke/phase3b/best.jld2`
+    - `best_loss=4.857775986194611`
+    - `global_step=40`
+    - `epoch=2`
+
+### Best Current Checkpoint / Config Recommendation
+- The recommended routine bounded Phase 3b validation entrypoint is now:
+  - `REASONING_CHECKPOINT_DIR=checkpoints/reasoning_drafter_smoke ./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium`
+- This profile is the current best practical middle ground on this host:
+  - real-data slice of `64` examples
+  - `batch_size=2`
+  - active GPU memory around the `16.3 GiB` regime from the direct benchmark
+  - better representativeness than smoke, but materially cheaper than `batch_size=4`
+
+### Unresolved Issues And Next Actions
+- The next meaningful step is to decide whether this bounded-medium profile should remain Phase-3b-only or whether a similar “medium” profile should be added for Phase 3a as well.
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a correctness or training blocker.
+
+## 2026-03-20 (Phase 3a bounded-medium profile and pipeline support)
+
+### Objectives Attempted
+- Evaluate whether Phase 3a also deserves a first-class bounded-medium pipeline profile instead of only Phase 3b.
+- Benchmark a practical Phase 3a medium configuration on real reasoning data using the current smoke-root Phase 2 surgery checkpoint.
+- If the profile is stable and cheap enough, expose it through the pipeline wrapper and validate it there.
+
+### Code / Config Changes Made
+- Updated [scripts/launch_reasoning_pipeline.sh](../scripts/launch_reasoning_pipeline.sh):
+  - `--bounded-medium` is now supported with `--phase 3a` as well as `--phase 3b`
+  - updated the guard message accordingly
+  - added a bounded-medium Phase 3a profile:
+    - `epochs=2`
+    - `batch_size=2`
+    - `max_seq_length=64`
+    - `max_per_dataset=32`
+    - `max_steps=40`
+    - `checkpoint_every=4`
+    - `log_every=1`
+    - `seed=41`
+
+### Experiment Commands And Key Metrics
+- Direct Phase 3a medium benchmark:
+  - `/usr/bin/time -p julia --project=. scripts/train_reasoning_language.jl --checkpoint checkpoints/reasoning_drafter_smoke/phase2/surgery.jld2 --data-dir data/reasoning --output-dir /tmp/phase3a_medium_64ex_b2 --epochs 2 --batch-size 2 --max-seq-length 64 --max-per-dataset 32 --max-steps 40 --checkpoint-every 4 --log-every 1 --seed 41`
+  - loaded:
+    - `32` examples from `gsm8k.jsonl`
+    - `32` examples from `reclor.jsonl`
+    - `64` total examples
+  - completed all `40` steps
+  - epoch averages:
+    - `epoch_1 avg_loss=4.8948`
+    - `epoch_2 avg_loss=4.1658`
+  - final best loss:
+    - `best_loss=4.165805637836456`
+  - wall time:
+    - `real 106.22`
+    - `user 104.28`
+    - `sys 3.85`
+  - effective end-to-end planning rate:
+    - about `2.66s/step`
+  - process-level GPU memory from `/tmp/phase3a_medium_64ex_b2_monitor.log`:
+    - `all_peak_mib=348`
+    - `active_min_mib=215`
+    - `active_peak_mib=348`
+    - active tail:
+      - `252,252,252,252,252,252,252,252,284,348`
+  - checkpoint metadata:
+    - `/tmp/phase3a_medium_64ex_b2/checkpoint_last.jld2`
+      - `best_loss=4.165805637836456`
+      - `global_step=40`
+      - `epoch=2`
+    - `/tmp/phase3a_medium_64ex_b2/best.jld2`
+      - `best_loss=4.165805637836456`
+      - `global_step=40`
+      - `epoch=2`
+- Wrapper guard validation:
+  - `./scripts/launch_reasoning_pipeline.sh --bounded-medium`
+  - result:
+    - `ERROR: --bounded-medium is currently supported only with --phase 3a or --phase 3b.`
+- Pipeline wrapper validation for Phase 3a:
+  - `REASONING_CHECKPOINT_DIR=checkpoints/reasoning_drafter_smoke ./scripts/launch_reasoning_pipeline.sh --phase 3a --bounded-medium`
+  - completed successfully
+  - final best loss:
+    - `4.165805637836456`
+  - final artifact:
+    - `checkpoints/reasoning_drafter_smoke/phase3a/`
+  - checkpoint metadata:
+    - `checkpoints/reasoning_drafter_smoke/phase3a/checkpoint_last.jld2`
+      - `best_loss=4.165805637836456`
+      - `global_step=40`
+      - `epoch=2`
+    - `checkpoints/reasoning_drafter_smoke/phase3a/best.jld2`
+      - `best_loss=4.165805637836456`
+      - `global_step=40`
+      - `epoch=2`
+
+### Best Current Checkpoint / Config Recommendation
+- The practical bounded-medium wrapper entrypoints are now:
+  - Phase 3a:
+    - `REASONING_CHECKPOINT_DIR=checkpoints/reasoning_drafter_smoke ./scripts/launch_reasoning_pipeline.sh --phase 3a --bounded-medium`
+  - Phase 3b:
+    - `REASONING_CHECKPOINT_DIR=checkpoints/reasoning_drafter_smoke ./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium`
+- Phase 3a is much cheaper than Phase 3b on this host:
+  - Phase 3a medium profile peaks around `348 MiB` GPU process memory
+  - Phase 3b medium profile peaks around `16252 MiB`
+- The current best bounded-medium Phase 3a artifact is:
+  - `checkpoints/reasoning_drafter_smoke/phase3a/best.jld2`
+  - `best_loss=4.165805637836456`
+
+### Unresolved Issues And Next Actions
+- The bounded-medium profiles are now in place for both Phase 3a and Phase 3b; the next useful step is deciding whether the pipeline should gain an “all bounded-medium” mode or keep medium runs phase-specific.
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a training issue.
+
+## 2026-03-20 (All bounded-medium pipeline mode)
+
+### Objectives Attempted
+- Extend the new bounded-medium support beyond phase-specific runs and make it usable for the full end-to-end pipeline.
+- Keep the all-mode bounded-medium chain internally compatible by pairing small bounded Phase 1/2 settings with the already-validated bounded-medium Phase 3a/3b profiles.
+- Validate the entire bounded-medium pipeline from Phase 1 through Phase 3b in a dedicated checkpoint tree.
+
+### Code / Config Changes Made
+- Updated [scripts/launch_reasoning_pipeline.sh](../scripts/launch_reasoning_pipeline.sh):
+  - `--bounded-medium` now works in `--all` mode
+  - default checkpoint root for bounded-medium runs is now:
+    - `checkpoints/reasoning_drafter_medium`
+  - retained phase guard for phase mode:
+    - `--phase 1 --bounded-medium` still fails intentionally
+  - added bounded-medium Phase 1 settings:
+    - use `data/chess/smoke.jsonl`
+    - `max_positions=128`
+    - compact smoke-compatible model
+    - `max_steps=3`
+  - bounded-medium Phase 2 uses:
+    - `target_vocab=132`
+    - same current-layout surgery path used by smoke-compatible language/distillation runs
+
+### Experiment Commands And Key Metrics
+- Guard validation:
+  - `./scripts/launch_reasoning_pipeline.sh --phase 1 --bounded-medium`
+  - result:
+    - `ERROR: --bounded-medium phase mode is currently supported only with --phase 3a or --phase 3b.`
+- Full bounded-medium pipeline validation:
+  - `./scripts/launch_reasoning_pipeline.sh --bounded-medium`
+  - result: completed successfully end to end into `checkpoints/reasoning_drafter_medium/`
+- Phase 1 bounded-medium:
+  - `step=1  loss=12.0838`
+  - `step=2  loss=10.4906`
+  - `step=3  loss=10.6297`
+  - `epoch_1 avg_loss=11.0680`
+  - best Phase 1 checkpoint:
+    - `checkpoints/reasoning_drafter_medium/phase1/best.jld2`
+- Phase 2 bounded-medium:
+  - input:
+    - `checkpoints/reasoning_drafter_medium/phase1/best.jld2`
+  - output:
+    - `checkpoints/reasoning_drafter_medium/phase2/surgery.jld2`
+  - target vocab:
+    - `132`
+  - total params after surgery:
+    - `0.301M`
+- Phase 3a bounded-medium:
+  - used the new wrapper profile:
+    - `64` examples
+    - `batch_size=2`
+    - `max_steps=40`
+  - epoch averages:
+    - `epoch_1 avg_loss=4.8790`
+    - `epoch_2 avg_loss=4.1741`
+  - best Phase 3a checkpoint:
+    - `checkpoints/reasoning_drafter_medium/phase3a/best.jld2`
+    - `best_loss=4.174050144851208`
+- Phase 3b bounded-medium:
+  - used the new wrapper profile:
+    - `64` examples
+    - `batch_size=2`
+    - `max_steps=40`
+  - epoch averages:
+    - `epoch_1 avg_kl=5.4682`
+    - `epoch_2 avg_kl=5.0349`
+  - best Phase 3b checkpoint:
+    - `checkpoints/reasoning_drafter_medium/phase3b/best.jld2`
+    - `best_loss=5.034869313240051`
+  - checkpoint metadata validation:
+    - `checkpoints/reasoning_drafter_medium/phase3b/checkpoint_last.jld2`
+      - `best_loss=5.034869313240051`
+      - `global_step=40`
+      - `epoch=2`
+    - `checkpoints/reasoning_drafter_medium/phase3b/best.jld2`
+      - `best_loss=5.034869313240051`
+      - `global_step=40`
+      - `epoch=2`
+
+### Best Current Checkpoint / Config Recommendation
+- The bounded-medium pipeline is now a real end-to-end option:
+  - `./scripts/launch_reasoning_pipeline.sh --bounded-medium`
+- It writes to its own root by default:
+  - `checkpoints/reasoning_drafter_medium/`
+- Current recommended entrypoints:
+  - full bounded-medium chain:
+    - `./scripts/launch_reasoning_pipeline.sh --bounded-medium`
+  - phase-specific bounded-medium checks:
+    - `REASONING_CHECKPOINT_DIR=checkpoints/reasoning_drafter_smoke ./scripts/launch_reasoning_pipeline.sh --phase 3a --bounded-medium`
+    - `REASONING_CHECKPOINT_DIR=checkpoints/reasoning_drafter_smoke ./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium`
+
+### Unresolved Issues And Next Actions
+- The bounded-medium workflow is now operational; the next worthwhile step is choosing whether the medium root should become the default day-to-day validation path in docs and developer workflow, or remain an explicit opt-in.
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a correctness issue.
+
+## 2026-03-20 (Runbook update for bounded-medium workflow)
+
+### Objectives Attempted
+- Make the new bounded-medium workflow visible in the main Spark runbook rather than leaving it discoverable only via shell help and session logs.
+- Document the practical day-to-day validation path, the checkpoint-root split, and the current measured bounded-medium Phase 3a/3b profiles.
+
+### Code / Config Changes Made
+- Updated [docs/SPARK_REASONING_RUNBOOK.md](../docs/SPARK_REASONING_RUNBOOK.md):
+  - Quick Start now includes:
+    - `--smoke`
+    - `--bounded-medium`
+    - `--all`
+  - added a new `Recommended Modes` section describing:
+    - `--smoke`
+    - `--bounded-medium`
+    - phase-specific bounded-medium runs
+    - `--all`
+  - documented default checkpoint roots:
+    - `checkpoints/reasoning_drafter_smoke/`
+    - `checkpoints/reasoning_drafter_medium/`
+    - `checkpoints/reasoning_drafter/`
+  - documented the bounded-medium Phase 1/2/3a/3b behavior and current measured resource profiles
+
+### Experiment Commands And Key Metrics
+- No new training runs in this step.
+- This was a documentation pass based on the already-validated bounded-medium measurements from earlier entries today.
+
+### Best Current Checkpoint / Config Recommendation
+- The runbook now reflects the current practical recommendation:
+  - `./scripts/launch_reasoning_pipeline.sh --bounded-medium`
+- Phase-specific bounded-medium entries are also documented:
+  - `./scripts/launch_reasoning_pipeline.sh --phase 3a --bounded-medium`
+  - `./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium`
+
+### Unresolved Issues And Next Actions
+- The next workflow-level decision is whether the bounded-medium path should be treated as the explicit team default in other docs and CI notes, not just in the Spark runbook.
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a training blocker.
+
+## 2026-03-20 (README workflow alignment for bounded-medium pipeline)
+
+### Objectives Attempted
+- Align the repository front page with the newly implemented reasoning pipeline modes.
+- Make the practical reasoning workflow discoverable from `README.md`, not only from the Spark runbook and script help text.
+
+### Code / Config Changes Made
+- Updated [README.md](../README.md):
+  - added a `Reasoning Pipeline` section
+  - documented:
+    - `--smoke`
+    - `--bounded-medium`
+    - `--all`
+    - phase-specific `--phase 3a --bounded-medium`
+    - phase-specific `--phase 3b --bounded-medium`
+  - documented the three default checkpoint roots:
+    - `checkpoints/reasoning_drafter_smoke/`
+    - `checkpoints/reasoning_drafter_medium/`
+    - `checkpoints/reasoning_drafter/`
+  - summarized the current measured bounded-medium Phase 3a and Phase 3b profiles
+  - added a short operational recommendation on when to use smoke, bounded-medium, and full runs
+
+### Experiment Commands And Key Metrics
+- No new training runs in this step.
+- This was a documentation alignment pass based on the already-validated bounded-medium pipeline and phase-specific benchmarks from earlier entries today.
+
+### Best Current Checkpoint / Config Recommendation
+- The README now matches the current practical recommendation:
+  - use `./scripts/launch_reasoning_pipeline.sh --bounded-medium` for day-to-day reasoning pipeline validation
+- Phase-specific bounded-medium paths are also documented directly in the repository front page.
+
+### Unresolved Issues And Next Actions
+- If the team wants bounded-medium to become the explicit default beyond docs, the next place to align would be CI notes or task templates rather than more implementation work.
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a training blocker.
+
+## 2026-03-20 (CI policy alignment for reasoning pipeline workflow)
+
+### Objectives Attempted
+- Align CI-facing documentation with the newly introduced bounded-medium reasoning workflow.
+- Make it explicit that the reasoning pipeline is not part of the GitHub Actions merge gate, and that this is intentional rather than missing coverage.
+
+### Code / Config Changes Made
+- Updated [docs/CI.md](../docs/CI.md):
+  - added a new `Reasoning Pipeline Scope` section
+  - documented why reasoning pipeline runs are not part of GitHub Actions lanes:
+    - GPU-oriented Spark GB10 workflow
+    - Granite teacher dependency
+    - heavier systems-validation purpose
+  - documented the current operational split:
+    - CI lanes for fast correctness
+    - local/manual reasoning validation via `--smoke` and `--bounded-medium`
+  - extended `Local Parity Commands` with the reasoning pipeline entrypoints
+
+### Experiment Commands And Key Metrics
+- No new training runs in this step.
+- This was a documentation/policy alignment pass based on the already-validated bounded-medium workflow.
+
+### Best Current Checkpoint / Config Recommendation
+- The CI document now matches the intended practice:
+  - use test lanes for merge protection
+  - use `./scripts/launch_reasoning_pipeline.sh --bounded-medium` for day-to-day reasoning validation on the Spark host
+
+### Unresolved Issues And Next Actions
+- If the team wants stronger operationalization, the next likely step is a human-run checklist or task template that points contributors to `--bounded-medium` when their changes touch the reasoning pipeline.
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a training blocker.
+
+## 2026-03-20 (PR template for reasoning pipeline validation)
+
+### Objectives Attempted
+- Add a lightweight contributor-facing checklist so the bounded-medium reasoning workflow is enforced socially at review time, not just documented in runbooks and CI notes.
+
+### Code / Config Changes Made
+- Added [pull_request_template.md](../.github/pull_request_template.md):
+  - includes the standard local test-lane reminder
+  - adds an explicit checkbox for reasoning-drafter changes to run:
+    - `./scripts/launch_reasoning_pipeline.sh --bounded-medium`
+    - or a justified phase-specific bounded-medium equivalent
+  - reminds contributors to update `docs/SESSION_REPORT.md`
+
+### Experiment Commands And Key Metrics
+- No new training runs in this step.
+- This was a workflow/process change only.
+
+### Best Current Checkpoint / Config Recommendation
+- The PR template now points contributors at the same practical recommendation documented elsewhere:
+  - use `./scripts/launch_reasoning_pipeline.sh --bounded-medium` when a PR touches the reasoning pipeline
+
+### Unresolved Issues And Next Actions
+- If stricter enforcement is desired, the next step would be repository automation or a dedicated CI/manual-dispatch note rather than more documentation.
+- Artifact inspection via plain `JLD2.load` still emits reconstruction warnings outside the training/test modules; still a usability cleanup item rather than a training blocker.
+
+## 2026-03-20 (Phase 1 legal-move masking and chess-pattern supervision)
+
+### Objectives Attempted
+- Replace the Phase 1 move loss with legal-move-masked policy training so the model learns among legal choices instead of all `20480` encoded moves.
+- Add Phase 1 logging that exposes whether targets are actually legal, plus the effective legal branching factor.
+- Expose move/eval loss weights on the CLI for easier tuning.
+
+### Code / Config Changes Made
+- Updated [src/chess/ChessTokenizer.jl](../src/chess/ChessTokenizer.jl):
+  - added legal move generation for standard chess moves, promotions, castling, and en passant
+  - exported `legal_move_ids` and `legal_move_mask`
+- Updated [src/chess/ChessDataset.jl](../src/chess/ChessDataset.jl):
+  - `prepare_batch` now returns `legal_move_mask`, `legal_move_counts`, and `target_legal_flags`
+  - keeps the target move enabled in the mask as a fallback if the dataset target is not in the generated legal set
+- Updated [scripts/train_chess_reasoning.jl](../scripts/train_chess_reasoning.jl):
+  - Phase 1 move CE now applies a legal-move mask before `logsoftmax`
+  - added Phase 1 logging for `legal_top1`, `avg_legal`, and `target_legal`
+  - added CLI flags `--move-loss-weight` and `--eval-loss-weight`
+  - threaded the new loss weights through `train_phase1`
+- Updated [test/test_chess_pipeline.jl](../test/test_chess_pipeline.jl):
+  - added legal move tests for the start position, castling, and en passant
+  - added batch-mask integrity checks
+  - added a regression check that real positions from `data/chess/sample_100k.jsonl` keep targets legal
+
+### Experiment Commands And Key Metrics
+- `julia --project=. test/test_chess_pipeline.jl`
+  - pass: `38/38` ChessTokenizer, `27/27` ChessDataset, `3/3` integration
+- `julia --project=. test/test_train_chess_reasoning.jl`
+  - pass: `4/4`
+- Bounded real-data Phase 1 smoke:
+  - `julia --project=. scripts/train_chess_reasoning.jl --data data/chess/sample_100k.jsonl --max-positions 24 --checkpoint-dir /tmp/phase1_legal_mask_real_smoke --batch-size 8 --learning-rate 1e-3 --checkpoint-every 1 --log-every 1 --max-steps 3 --embedding-dim 64 --heads 4 --layers 2 --time-dim 32 --rc-code-dim 32 --rc-codebook-size 64 --rc-steps 4 --frontend-wave-heads 2 --circuit-leaves 8 --circuit-sums 4 --circuit-circuits 2 --seed 41`
+  - step 1: `loss=3.7591 move_loss=3.0405 eval_loss=1.4372 legal_top1=0.125 avg_legal=19.38 target_legal=100.0%`
+  - step 2: `loss=3.3984 move_loss=3.2805 eval_loss=0.2359 legal_top1=0.125 avg_legal=25.12 target_legal=100.0%`
+  - step 3: `loss=4.4091 move_loss=4.2643 eval_loss=0.2897 legal_top1=0.0 avg_legal=30.25 target_legal=100.0%`
+  - epoch average: `3.8556`
+- Synthetic smoke-data check:
+  - `data/chess/smoke.jsonl` produced `target_legal=0.0%`
+  - inspection showed the file contains synthetic/impossible boards and is not a valid legality benchmark for the new Phase 1 objective
+
+### Best Current Checkpoint / Config Recommendation
+- For real Phase 1 validation of chess-pattern learning, use legal-move masking with the current default weights:
+  - `--move-loss-weight 1.0`
+  - `--eval-loss-weight 0.5`
+- For bounded validation, prefer real chess data over `data/chess/smoke.jsonl`:
+  - `data/chess/sample_100k.jsonl` or `data/chess/lichess_db_eval.jsonl`
+- The move-loss scale is now in the expected legal-choice regime (`~3-4` on small real-data runs), which is much more meaningful than the old unmasked `~10+` scale over all `20480` move IDs.
+
+### Unresolved Issues And Next Actions
+- `data/chess/smoke.jsonl` is still useful for plumbing/speed checks, but it is not suitable for validating legal-move-target behavior. If Phase 1 smoke needs legality-based assertions, it should use a small real-data slice instead.
+- The current legal-move generator is now covered on start position, castling, en passant, and sample Lichess data; the next optional improvement would be a deeper perft-style validation set if more confidence is needed.
+- Loss-weight tuning is now exposed on the CLI; if Phase 1 is treated as representation learning rather than pure policy imitation, the next experiment should be a small sweep over move/eval weights on real data.
+
+## 2026-03-20 (Phase 1 checkpoint directory reset)
+
+### Objectives Attempted
+- Clear the existing Phase 1 checkpoint directory before starting a fresh training run.
+
+### Code / Config Changes Made
+- No code changes.
+- Removed all contents from [checkpoints/reasoning_drafter/phase1](../checkpoints/reasoning_drafter/phase1).
+
+### Experiment Commands And Key Metrics
+- Command run:
+  - `mkdir -p checkpoints/reasoning_drafter/phase1 && find checkpoints/reasoning_drafter/phase1 -mindepth 1 -maxdepth 1 -exec rm -rf {} + && ls -la checkpoints/reasoning_drafter/phase1`
+- Result:
+  - directory verified empty except for `.` and `..`
+
+### Best Current Checkpoint / Config Recommendation
+- Start the next fresh Phase 1 run into `checkpoints/reasoning_drafter/phase1` with no resume flag.
+
+### Unresolved Issues And Next Actions
+- None for the reset itself.
+- Next action is to launch a fresh Phase 1 training run on the real chess dataset.
+
+## 2026-03-20 (Phase 1 config support and 260M accumulated training path)
+
+### Objectives Attempted
+- Add a real config-file path for Phase 1 chess training instead of forcing large launches through long CLI flag lists.
+- Find a way to run the 260M-class Phase 1 architecture after the direct `batch_size=32` launch was hard-killed before the first optimizer step.
+
+### Code / Config Changes Made
+- Updated [scripts/train_chess_reasoning.jl](../scripts/train_chess_reasoning.jl):
+  - added TOML-backed `--config` loading via `load_phase1_config`
+  - added `validate_phase1_options!` to catch invalid model shapes such as non-divisible `embedding_dimension / number_of_heads`
+  - added `gradient_accumulation_steps` to Phase 1 training
+  - changed logging so `batch_size` is the microbatch size and the script prints the effective batch size
+  - changed Phase 1 stepping/checkpointing/logging to operate on optimizer updates, not raw microbatches
+  - fixed the debug hook so it does not fire on every microbatch before the first accumulated update
+- Added new Phase 1 config presets:
+  - [configs/chess_phase1_small.toml](../configs/chess_phase1_small.toml)
+  - [configs/chess_phase1_medium.toml](../configs/chess_phase1_medium.toml)
+  - [configs/chess_phase1_260m.toml](../configs/chess_phase1_260m.toml)
+- Updated [test/test_train_chess_reasoning.jl](../test/test_train_chess_reasoning.jl):
+  - added config-loading coverage for the 260M Phase 1 preset
+
+### Experiment Commands And Key Metrics
+- Phase 1 trainer tests:
+  - `julia --project=. test/test_train_chess_reasoning.jl`
+  - pass: checkpoint metadata `4/4`, config loading `7/7`
+- Phase 1 chess pipeline tests:
+  - `julia --project=. test/test_chess_pipeline.jl`
+  - pass: ChessTokenizer `38/38`, ChessDataset `27/27`, integration `3/3`
+- Config inspection:
+  - `julia --project=. -e 'include("scripts/train_chess_reasoning.jl"); println(load_phase1_config("configs/chess_phase1_260m.toml"))'`
+  - verified `batch_size=4`, `gradient_accumulation_steps=8`, `embedding_dimension=1024`, `number_of_heads=16`, `number_of_layers=24`
+- 260M accumulated one-update validation:
+  - `JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/sample_100k.jsonl --max-positions 32 --checkpoint-dir /tmp/phase1_260m_cfg_smoke --max-steps 1`
+  - startup:
+    - `Parameters: 260.867M`
+    - `Gradient accumulation: 8 (effective batch=32)`
+  - completed one real optimizer update successfully:
+    - `step=1`
+    - `loss=3.7242`
+    - `move_loss=2.9258`
+    - `eval_loss=1.5967`
+    - `legal_top1=0.1562`
+    - `avg_legal=24.19`
+    - `target_legal=100.0%`
+    - `accum=8`
+  - result:
+    - saved best checkpoint to `/tmp/phase1_260m_cfg_smoke/best.jld2`
+
+### Best Current Checkpoint / Config Recommendation
+- For the 260M-class Phase 1 architecture, use the config-backed launch path rather than a raw large microbatch:
+  - `configs/chess_phase1_260m.toml`
+- The large-shape run is viable with:
+  - microbatch `4`
+  - gradient accumulation `8`
+  - effective batch `32`
+  - `JULIA_CUDA_MEMORY_POOL=none`
+- Recommended launch command:
+  - `JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml`
+
+### Unresolved Issues And Next Actions
+- The original direct large launch (`260.867M`, microbatch `32`) still gets hard-killed before the first logged step, so the practical path is accumulation rather than single-shot large microbatches.
+- The next useful validation is a longer real-data run with the 260M config, not another one-step smoke:
+  - same config
+  - full `data/chess/lichess_db_eval.jsonl`
+  - monitor whether throughput and checkpoint cadence are acceptable over many updates.
+
+## 2026-03-20 (Phase 1 260M training launched in tmux)
+
+### Objectives Attempted
+- Start the 260M Phase 1 chess training run in a detached tmux session using the new config-backed path.
+
+### Code / Config Changes Made
+- No code changes.
+- Started training with:
+  - `JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml`
+
+### Experiment Commands And Key Metrics
+- Training was launched in tmux session:
+  - `phase1_260m_run`
+- Log file:
+  - `logs/phase1_260m_20260320.log`
+- Verified startup lines in the log:
+  - `Loaded config: configs/chess_phase1_260m.toml`
+  - `Batch size: 4`
+  - `Gradient accumulation: 8 (effective batch=32)`
+  - `Parameters: 260.867M`
+
+### Best Current Checkpoint / Config Recommendation
+- Continue using the detached tmux run with:
+  - `configs/chess_phase1_260m.toml`
+  - `JULIA_CUDA_MEMORY_POOL=none`
+
+### Unresolved Issues And Next Actions
+- The tmux pane itself is not rendering captured output cleanly through the current CLI capture path, but the log file is streaming correctly and should be treated as the authoritative output surface.
+- Next action is simply to monitor `logs/phase1_260m_20260320.log` and checkpoint creation under `checkpoints/reasoning_drafter/phase1_260m`.
+
+## 2026-03-20 (Phase 1 260M run restarted with 12x3 shape)
+
+### Objectives Attempted
+- Restart the live Phase 1 260M training run with a larger microbatch and lower accumulation to improve GPU utilization.
+
+### Code / Config Changes Made
+- No code changes.
+- Restarted the tmux-run training job with CLI overrides:
+  - `--batch-size 12`
+  - `--gradient-accumulation-steps 3`
+  - `--log-every 5`
+  - `JULIA_NUM_THREADS=20`
+
+### Experiment Commands And Key Metrics
+- Detached launch command:
+  - `stdbuf -oL -eL env JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --batch-size 12 --gradient-accumulation-steps 3 --log-every 5 2>&1 | tee logs/phase1_260m_20260320_b12x3.log`
+- Verified startup log:
+  - `Batch size: 12`
+  - `Gradient accumulation: 3 (effective batch=36)`
+  - `Data: data/chess/lichess_db_eval.jsonl`
+
+### Best Current Checkpoint / Config Recommendation
+- Current active live run:
+  - tmux session: `phase1_260m_run`
+  - log: `logs/phase1_260m_20260320_b12x3.log`
+- This `12 x 3` shape is now the active utilization experiment for the 260M config.
+
+### Unresolved Issues And Next Actions
+- Need a few logged optimizer steps to judge whether `12 x 3` materially improves utilization and throughput versus `4 x 8`.
+- If stable, keep this shape; if it hard-kills or stalls, fall back to the previously validated `4 x 8` profile.
+
+## 2026-03-20 (Phase 1 260M run restarted with 24x1 shape)
+
+### Objectives Attempted
+- Push single-step batch size directly instead of preserving the old effective batch, to probe raw GPU utilization more honestly.
+- Follow the requested rule: if `24 x 1` dies, scale down; otherwise leave the larger single-step run active.
+
+### Code / Config Changes Made
+- No code changes.
+- Restarted the live Phase 1 run with CLI overrides on top of `configs/chess_phase1_260m.toml`:
+  - `--batch-size 24`
+  - `--gradient-accumulation-steps 1`
+  - `--log-every 5`
+  - `JULIA_NUM_THREADS=20`
+
+### Experiment Commands And Key Metrics
+- Detached launch command:
+  - `stdbuf -oL -eL env JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --batch-size 24 --gradient-accumulation-steps 1 --log-every 5 2>&1 | tee logs/phase1_260m_20260320_b24x1.log`
+- Verified startup log:
+  - `Batch size: 24`
+  - `Gradient accumulation: 1 (effective batch=24)`
+  - `Parameters: 260.867M`
+- Follow-up status check:
+  - process still alive after startup and first long step window
+  - sampled GPU-process memory: `5328 MiB`
+  - no hard kill observed during the initial observation window
+
+### Best Current Checkpoint / Config Recommendation
+- Current active run:
+  - tmux session: `phase1_260m_run`
+  - log: `logs/phase1_260m_20260320_b24x1.log`
+- This is now the highest active single-step batch probe for the 260M Phase 1 config.
+
+### Unresolved Issues And Next Actions
+- Need actual logged optimizer steps to judge whether `24 x 1` improves utilization/throughput in practice or is simply shifting where the first long step spends time.
+- If `24 x 1` later hard-kills, the next fallback should be `16 x 1`, not a return to heavy accumulation unless stability forces it.
+
+## 2026-03-20 (Phase 1 24x1 failure observed; 16x1 fallback launched)
+
+### Objectives Attempted
+- Check the live `24 x 1` Phase 1 run after startup.
+- If it had died, immediately fall back to `16 x 1` as the next highest single-step batch.
+
+### Code / Config Changes Made
+- No code changes.
+- Observed `24 x 1` had exited.
+- Restarted the detached Phase 1 run with:
+  - `--batch-size 16`
+  - `--gradient-accumulation-steps 1`
+  - `--log-every 5`
+  - `JULIA_NUM_THREADS=20`
+
+### Experiment Commands And Key Metrics
+- `24 x 1` log before exit:
+  - `step=1 loss=3.6451`
+  - `step=5 loss=3.5905`
+  - `step=10 loss=3.9582`
+  - `step=15 loss=3.3757`
+- `24 x 1` status on inspection:
+  - process no longer alive
+  - tmux session no longer present
+  - no checkpoint written under `checkpoints/reasoning_drafter/phase1_260m`
+- Active fallback launch:
+  - `stdbuf -oL -eL env JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --batch-size 16 --gradient-accumulation-steps 1 --log-every 5 2>&1 | tee logs/phase1_260m_20260320_b16x1.log`
+- Verified startup:
+  - `Batch size: 16`
+  - `Gradient accumulation: 1 (effective batch=16)`
+  - sampled GPU-process memory: `3171 MiB`
+
+### Best Current Checkpoint / Config Recommendation
+- Current active run:
+  - tmux session: `phase1_260m_run`
+  - log: `logs/phase1_260m_20260320_b16x1.log`
+- Current highest live single-step batch after observed failure:
+  - `16 x 1`
+
+### Unresolved Issues And Next Actions
+- Need to see whether `16 x 1` survives beyond the first few logged steps and whether utilization improves enough to justify staying there.
+- If `16 x 1` also dies, the next fallback should likely be `12 x 1` before returning to accumulated shapes.
+
+## 2026-03-20 (Phase 1 mixed precision path added; spectral bf16 fixed; large-batch stability still partial)
+
+### Objectives Attempted
+- Add a real config-driven mixed-precision path to Phase 1 instead of hand-tuned shell flags only.
+- Make the `260M` chess Phase 1 model train in `bfloat16` on GPU.
+- Remove the hard `cuFFT` blocker that rejected `Complex{Core.BFloat16}` in the WavePDE spectral path.
+- Probe whether the larger `24 x 1` true-batch configuration becomes viable once bf16 is enabled.
+
+### Code / Config Changes Made
+- Extended [scripts/train_chess_reasoning.jl](../scripts/train_chess_reasoning.jl) with:
+  - `--config`
+  - `--mixed-precision`
+  - `--precision`
+  - config loading from `[training]` / `[hardware]`
+  - parameter/state casting helpers for float trees
+  - gradient sanitization before `Optimisers.update(...)` so non-finite bf16 gradients do not immediately abort in `ClipNorm`
+- Updated Phase 1 config presets:
+  - [configs/chess_phase1_small.toml](../configs/chess_phase1_small.toml)
+  - [configs/chess_phase1_medium.toml](../configs/chess_phase1_medium.toml)
+  - [configs/chess_phase1_260m.toml](../configs/chess_phase1_260m.toml)
+- Patched the spectral operators to upcast FFT work to `Float32` only inside the Laplacian:
+  - [src/WavePDE.jl](../src/WavePDE.jl)
+  - [src/RuleConditionedWavePDE.jl](../src/RuleConditionedWavePDE.jl)
+- Added low-precision regression coverage:
+  - [test/test_wavepde.jl](../test/test_wavepde.jl)
+  - [test/test_reasoning_drafter.jl](../test/test_reasoning_drafter.jl)
+  - [test/test_train_chess_reasoning.jl](../test/test_train_chess_reasoning.jl)
+
+### Experiment Commands And Key Metrics
+- Validation:
+  - `julia --project=. test/test_wavepde.jl`
+    - passed
+  - `julia --project=. test/test_reasoning_drafter.jl`
+    - passed
+  - `julia --project=. test/test_train_chess_reasoning.jl`
+    - Phase 1 checkpoint metadata sync and config-loading suites passed after precision validation fix
+- Bounded bf16 smoke:
+  - `JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/sample_100k.jsonl --max-positions 4 --batch-size 4 --gradient-accumulation-steps 1 --log-every 1 --max-steps 1 --checkpoint-dir /tmp/phase1_260m_bf16_smoke`
+  - result:
+    - `step=1  loss=4.0315`
+    - `move_loss=3.2114`
+    - `eval_loss=1.6403`
+    - `target_legal=100.0%`
+  - wrote:
+    - `/tmp/phase1_260m_bf16_smoke/checkpoint_last.jld2`
+    - `/tmp/phase1_260m_bf16_smoke/best.jld2`
+- Large true-batch bf16 probe before gradient sanitization:
+  - `batch_size=24`, `gradient_accumulation_steps=1`, `learning_rate=6e-4`
+  - got past the old FFT failure and reached:
+    - `step=1  loss=3.6654`
+  - then hit NaN gradients during `ClipNorm`
+- Large true-batch bf16 probe after gradient sanitization:
+  - `JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/sample_100k.jsonl --max-positions 128 --batch-size 24 --gradient-accumulation-steps 1 --learning-rate 3e-4 --log-every 1 --max-steps 3 --checkpoint-dir /tmp/phase1_260m_bf16_b24_lr3e4_sanitized`
+  - observed live metric:
+    - `step=1  loss=3.6654`
+    - `move_loss=2.8820`
+    - `eval_loss=1.5669`
+    - `legal_top1=0.1667`
+    - `avg_legal=24.92`
+    - `target_legal=100.0%`
+  - final on-disk state after process exit:
+    - `/tmp/phase1_260m_bf16_b24_lr3e4_sanitized/checkpoint_last.jld2`
+    - `global_step=3`
+    - `epoch=1`
+    - `best_loss=Inf`
+    - no `best.jld2`
+
+### Best Current Checkpoint / Config Recommendation
+- Best confirmed stable bf16 checkpoint path:
+  - `/tmp/phase1_260m_bf16_smoke/checkpoint_last.jld2`
+- Best current config recommendation for Phase 1 bf16 bring-up:
+  - [configs/chess_phase1_260m.toml](../configs/chess_phase1_260m.toml)
+  - start with a bounded confirmation run:
+    - `JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/sample_100k.jsonl --max-positions 4 --batch-size 4 --gradient-accumulation-steps 1 --log-every 1 --max-steps 1 --checkpoint-dir /tmp/phase1_260m_bf16_smoke`
+
+### Unresolved Issues And Next Actions
+- The hard bf16 spectral failure is fixed, but large-batch bf16 stability is still incomplete.
+- The sanitized `24 x 1` run no longer dies at the FFT layer and did produce `checkpoint_last.jld2`, but it did not finish cleanly enough to write a best checkpoint or a finite `best_loss`.
+- There is still a dtype-mismatch warning path in LuxLib (`bf16` weights receiving `Float32` activations and promoting to `Float32`), which reduces the expected memory/perf win.
+- Next actions:
+  - trace which activations remain `Float32` in the 260M Phase 1 path and align them with the requested mixed-precision policy
+  - add an explicit finite-gradient diagnostic around the optimizer step so the first offending parameter path is logged cleanly
+  - re-run the `24 x 1` probe after dtype alignment, then decide whether Phase 1 should default to `bf16` or remain `float32` for large production runs
+
+## 2026-03-20 (Phase 1 safer bf16 full-data restart launched)
+
+### Objectives Attempted
+- Restart Phase 1 training with a safer, non-passive bf16 profile after confirming the `24 x 1` probe had exited.
+- Use the full `lichess_db_eval.jsonl` corpus rather than another toy smoke.
+- Keep the large `260M` config, but reduce risk versus the unstable `24 x 1` path.
+
+### Code / Config Changes Made
+- No code changes.
+- Launched a new detached tmux training session:
+  - session name: `phase1_260m_safe`
+  - checkpoint dir: `checkpoints/reasoning_drafter/phase1_260m_bf16_safe`
+  - log file: `logs/phase1_260m_bf16_safe_20260320.log`
+
+### Experiment Commands And Key Metrics
+- Verified prior large-batch sanitized probe was no longer running:
+  - no active `train_chess_reasoning.jl` process for `/tmp/phase1_260m_bf16_b24_lr3e4_sanitized`
+  - no active compute process in `nvidia-smi`
+- Inspected leftover checkpoint from the sanitized probe:
+  - `global_step=3`
+  - `epoch=1`
+  - `best_loss=Inf`
+  - `has_opt_state=true`
+- New launch command:
+  - `env JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/lichess_db_eval.jsonl --checkpoint-dir checkpoints/reasoning_drafter/phase1_260m_bf16_safe --batch-size 16 --gradient-accumulation-steps 1 --learning-rate 3e-4 --checkpoint-every 100 --log-every 5 --seed 42`
+- Live status right after launch:
+  - Julia process present under tmux
+  - GPU process visible in `nvidia-smi`
+  - sampled GPU memory during startup: `687 MiB`
+  - log file created: `logs/phase1_260m_bf16_safe_20260320.log`
+
+### Best Current Checkpoint / Config Recommendation
+- Current active run recommendation:
+  - use the `260M` bf16 config
+  - safer shape: `batch_size=16`, `gradient_accumulation_steps=1`, `learning_rate=3e-4`
+- Active output root:
+  - `checkpoints/reasoning_drafter/phase1_260m_bf16_safe`
+
+### Unresolved Issues And Next Actions
+- Need first logged training steps from the full-data run to confirm this safer shape survives the transition from startup into repeated optimizer updates.
+- If `16 x 1` is stable, the next issue is utilization, not correctness.
+- If `16 x 1` still destabilizes later, next move should be targeted dtype-alignment work, not another large jump in accumulation.
+
+## 2026-03-20 (Phase 1 16x1 invalidated; bounded 20x1 probe launched)
+
+### Objectives Attempted
+- Re-check the supposedly stable `16 x 1` bf16 full-data run before promoting it.
+- If it was genuinely stable, test `20 x 1`.
+- If it was already numerically broken, stop it and run a cleaner bounded `20 x 1` probe instead of compounding the bad regime.
+
+### Code / Config Changes Made
+- No code changes.
+- Stopped the broken tmux run in `phase1_260m_safe`.
+- Launched a new detached tmux session:
+  - session name: `phase1_260m_b20_probe`
+  - log file: `logs/phase1_260m_bf16_b20_probe_20260320.log`
+  - checkpoint dir: `checkpoints/reasoning_drafter/phase1_260m_bf16_b20_probe`
+
+### Experiment Commands And Key Metrics
+- Re-inspection of the `16 x 1` full-data run log showed it was not stable:
+  - `step=1  loss=3.5882`
+  - `step=5  loss=NaN`
+  - remained `NaN` through at least `step=165`
+  - wrote `checkpoint_last.jld2` at `step=100`, but this checkpoint is from a numerically invalid run
+- Therefore the `16 x 1` run was cancelled with `Ctrl-C`.
+- New bounded probe launched:
+  - `env JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/sample_100k.jsonl --checkpoint-dir checkpoints/reasoning_drafter/phase1_260m_bf16_b20_probe --batch-size 20 --gradient-accumulation-steps 1 --learning-rate 1e-4 --checkpoint-every 10 --log-every 1 --max-steps 20 --seed 42`
+- Verified startup:
+  - `Batch size: 20`
+  - `Gradient accumulation: 1 (effective batch=20)`
+  - `LR: 0.0001`
+  - `Precision: bfloat16`
+  - process visible in `nvidia-smi`
+
+### Best Current Checkpoint / Config Recommendation
+- The old `phase1_260m_bf16_safe` full-data checkpoint is not trustworthy because training was already `NaN`.
+- The only confirmed good bf16 checkpoint remains:
+  - `/tmp/phase1_260m_bf16_smoke/checkpoint_last.jld2`
+- Current active test recommendation:
+  - `20 x 1`, `bf16`, `lr=1e-4`, bounded to `20` steps
+
+### Unresolved Issues And Next Actions
+- Need real step outputs from the `20 x 1` probe to decide whether larger true batch is viable at lower LR.
+- If `20 x 1` still goes `NaN`, the next move is not more blind batch tuning; it is explicit finite-gradient diagnostics and dtype-alignment in the bf16 path.
+
+## 2026-03-20 (Phase 1 20x1 probe inspected; process already exited)
+
+### Objectives Attempted
+- Verify whether the bounded `20 x 1` Phase 1 bf16 probe was still running.
+- Inspect the final log and checkpoint state before making any further recommendation.
+
+### Code / Config Changes Made
+- No code changes.
+- No new run launched in this inspection step.
+
+### Experiment Commands And Key Metrics
+- Confirmed no active process remained for:
+  - `checkpoints/reasoning_drafter/phase1_260m_bf16_b20_probe`
+- Final log state from [phase1_260m_bf16_b20_probe_20260320.log](../logs/phase1_260m_bf16_b20_probe_20260320.log):
+  - `step=1  loss=3.5281  move_loss=2.7303  eval_loss=1.5956  legal_top1=0.2`
+  - `step=2` onward: `loss=NaN`, `move_loss=NaN`, `eval_loss=NaN`
+  - `step=20` reached under `max_steps=20`
+  - epoch summary: `avg_loss=NaN`
+  - final banner: `Best loss: Inf`
+- On-disk output:
+  - `checkpoints/reasoning_drafter/phase1_260m_bf16_b20_probe/checkpoint_last.jld2`
+  - no `best.jld2`
+
+### Best Current Checkpoint / Config Recommendation
+- The `20 x 1` probe is not a valid training configuration in its current bf16 form.
+- The only confirmed good bf16 checkpoint remains:
+  - `/tmp/phase1_260m_bf16_smoke/checkpoint_last.jld2`
+
+### Unresolved Issues And Next Actions
+- The failure is numerical, not operational: the run survives startup and continues stepping, but goes `NaN` starting at step 2.
+- Next step should be targeted numerical debugging of the bf16 path rather than further increasing batch size.
+
+## 2026-03-20 (Phase 1 bf16 NaN bug fixed with fp32 master weights; production run relaunched)
+
+### Objectives Attempted
+- Fix the Phase 1 bf16 numerical instability that produced `NaN` from step 2 onward.
+- Validate the fix on the exact previously failing `20 x 1` path.
+- Relaunch a real detached full-data training run once the fix was proven.
+
+### Code / Config Changes Made
+- Updated [scripts/train_chess_reasoning.jl](../scripts/train_chess_reasoning.jl):
+  - keep master trainable parameters and optimizer state in `Float32`
+  - cast a forward-only parameter tree to the requested low precision (`bfloat16`) inside the loss closure
+  - stop casting persistent training state and resumed optimizer state to bf16
+  - keep pooling scale in the activation dtype instead of hard-wiring `Float32`
+- This changes Phase 1 mixed precision from “bf16 parameters + bf16 Adam state” to the correct “fp32 master weights with bf16 forward compute” pattern.
+
+### Experiment Commands And Key Metrics
+- Phase 1 tests after the fix:
+  - `julia --project=. test/test_train_chess_reasoning.jl`
+  - passed
+- Re-validation on the formerly broken bounded path:
+  - `JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/sample_100k.jsonl --checkpoint-dir /tmp/phase1_260m_bf16_masterfp32_probe --batch-size 20 --gradient-accumulation-steps 1 --learning-rate 1e-4 --checkpoint-every 10 --log-every 1 --max-steps 5 --seed 42`
+  - result:
+    - `step=1  loss=3.5281`
+    - `step=2  loss=3.6581`
+    - `step=3  loss=3.0085`
+    - `step=4  loss=3.1594`
+    - `step=5  loss=3.3606`
+    - epoch average: `3.3430`
+    - wrote `best.jld2` and `checkpoint_last.jld2`
+- Full-data bounded validation:
+  - `JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/lichess_db_eval.jsonl --checkpoint-dir /tmp/phase1_260m_bf16_masterfp32_full10 --batch-size 20 --gradient-accumulation-steps 1 --learning-rate 1e-4 --checkpoint-every 10 --log-every 1 --max-steps 10 --seed 42`
+  - result:
+    - steps `1..10` all finite
+    - `step=10  loss=3.5590`
+    - epoch average: `3.4331`
+    - wrote:
+      - `/tmp/phase1_260m_bf16_masterfp32_full10/checkpoint_last.jld2`
+      - `/tmp/phase1_260m_bf16_masterfp32_full10/best.jld2`
+- Production relaunch:
+  - tmux session: `phase1_260m_train`
+  - log: `logs/phase1_260m_bf16_masterfp32_20260320.log`
+  - checkpoint dir: `checkpoints/reasoning_drafter/phase1_260m_bf16_masterfp32`
+  - command shape:
+    - full `lichess_db_eval.jsonl`
+    - `batch_size=20`
+    - `gradient_accumulation_steps=1`
+    - `learning_rate=1e-4`
+    - `checkpoint_every=100`
+    - `log_every=5`
+
+### Best Current Checkpoint / Config Recommendation
+- Recommended Phase 1 large-model training configuration:
+  - [configs/chess_phase1_260m.toml](../configs/chess_phase1_260m.toml)
+  - override runtime flags:
+    - `--batch-size 20`
+    - `--gradient-accumulation-steps 1`
+    - `--learning-rate 1e-4`
+- Recommended active checkpoint root:
+  - `checkpoints/reasoning_drafter/phase1_260m_bf16_masterfp32`
+- Best validated bounded checkpoint:
+  - `/tmp/phase1_260m_bf16_masterfp32_full10/best.jld2`
+
+### Unresolved Issues And Next Actions
+- The LuxLib warning about bf16 weights receiving Float32 activations still appears during startup, so dtype alignment is not fully clean yet, though the run is now numerically stable over the validated window.
+- Next step is operational monitoring:
+  - confirm the relaunched long run reaches repeated checkpoint writes on the full corpus
+  - if utilization remains good, treat this as the new default large Phase 1 recipe
+
+## 2026-03-20 (Phase 1 converted to a 15k-step few-day run)
+
+### Objectives Attempted
+- Replace the effectively month-scale unlimited Phase 1 run with a bounded run that finishes in a few days.
+- Preserve the validated stable configuration while making the wall-clock target operationally sane.
+
+### Code / Config Changes Made
+- No code changes.
+- Relaunched Phase 1 in a fresh tmux session:
+  - session name: `phase1_260m_15k`
+  - checkpoint dir: `checkpoints/reasoning_drafter/phase1_260m_bf16_masterfp32_15k`
+  - log file: `logs/phase1_260m_bf16_masterfp32_15k_20260320.log`
+
+### Experiment Commands And Key Metrics
+- Measured current live throughput before rebudgeting:
+  - latest logged step on the stable run: `40`
+  - wall-clock elapsed: about `11m 39s`
+  - implied throughput: about `17.5s/step`
+- Converted that to a few-day target:
+  - `15000` steps ≈ `72.9h` ≈ `3.04 days`
+- New launch command:
+  - `env JULIA_NUM_THREADS=20 JULIA_CUDA_MEMORY_POOL=none julia --project=. scripts/train_chess_reasoning.jl --config configs/chess_phase1_260m.toml --data data/chess/lichess_db_eval.jsonl --checkpoint-dir checkpoints/reasoning_drafter/phase1_260m_bf16_masterfp32_15k --batch-size 20 --gradient-accumulation-steps 1 --learning-rate 1e-4 --checkpoint-every 250 --log-every 25 --max-steps 15000 --seed 42`
+- Live status after relaunch:
+  - tmux session active
+  - Julia process visible in `nvidia-smi`
+  - startup log lines present in `logs/phase1_260m_bf16_masterfp32_15k_20260320.log`
+
+### Best Current Checkpoint / Config Recommendation
+- Recommended active Phase 1 run:
+  - `batch_size=20`
+  - `gradient_accumulation_steps=1`
+  - `learning_rate=1e-4`
+  - `max_steps=15000`
+- Recommended checkpoint root:
+  - `checkpoints/reasoning_drafter/phase1_260m_bf16_masterfp32_15k`
+
+### Unresolved Issues And Next Actions
+- Need the first several logged updates and first checkpoint from the `15k` run to confirm it is behaving identically to the bounded `10`-step validation.
+- If throughput changes materially over the first few hundred steps, the few-day estimate should be revised using real checkpoint-to-checkpoint timing rather than the early startup-derived estimate.
+
+## 2026-03-20 (Repository commit and push preparation)
+
+### Objectives Attempted
+- Prepare a clean repository commit containing code, tests, configs, and documentation only.
+- Exclude runtime artifacts such as logs, checkpoints, datasets, caches, and other generated files.
+- Publish the accumulated reasoning-drafter and Phase 1 training work to the remote branch.
+
+### Code / Config Changes Made
+- No functional code changes.
+- Added this final session-report entry to record the release/commit step.
+
+### Experiment Commands And Key Metrics
+- No new experiments were run for this step.
+- Repository release step:
+  - stage tracked source/doc/test/config changes
+  - stage new non-artifact files such as configs, tests, and docs
+  - exclude `logs/`, dataset directories, checkpoint trees, caches, and loose runtime artifacts
+
+### Best Current Checkpoint / Config Recommendation
+- Keep using the active Phase 1 large-model recipe:
+  - `configs/chess_phase1_260m.toml`
+  - runtime overrides:
+    - `--batch-size 20`
+    - `--gradient-accumulation-steps 1`
+    - `--learning-rate 1e-4`
+    - `--max-steps 15000`
+- Active checkpoint root:
+  - `checkpoints/reasoning_drafter/phase1_260m_bf16_masterfp32_15k`
+
+### Unresolved Issues And Next Actions
+- Confirm the running `15k`-step Phase 1 job reaches repeated checkpoints cleanly.
+- If downstream work continues, keep runtime artifacts out of future commits and continue using the config-driven Phase 1 entrypoint.

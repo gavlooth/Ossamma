@@ -101,23 +101,7 @@ end
 # Forward Pass
 # ============================================================================
 
-"""
-    (layer::AlgebraicCircuitLayer)(hidden_state, ps, st) → (output, state)
-
-Evaluate a bank of algebraic circuits on neural leaf predicates derived
-from the hidden state, compose their outputs, and gate-inject the result.
-
-All operations are standard tensor ops (einsum-native), fully GPU-compatible.
-"""
-function (layer::AlgebraicCircuitLayer)(hidden_state, ps, st)
-    is_batched = ndims(hidden_state) == 3
-
-    if !is_batched
-        hidden_b = reshape(hidden_state, size(hidden_state, 1), size(hidden_state, 2), 1)
-    else
-        hidden_b = hidden_state
-    end
-
+function _algebraic_circuit_forward(layer::AlgebraicCircuitLayer, hidden_b, ps)
     dim, seq_len, batch_size = size(hidden_b)
     N = seq_len * batch_size
     hidden_flat = reshape(hidden_b, dim, N)  # (dim, N)
@@ -136,19 +120,13 @@ function (layer::AlgebraicCircuitLayer)(hidden_state, ps, st)
     #    Uses log-space for numerical stability.
     # =====================================================================
     # Reshape: (product_arity, num_products, N, nc) → sum logs → exp
-    leaves = clamp.(leaves, 1f-6, 1f0 - 1f-6)
-    log_leaves = log.(leaves)
-    log_leaves_grouped = reshape(log_leaves, layer.product_arity, layer.num_products, N, nc)
-    log_products = dropdims(sum(log_leaves_grouped, dims=1), dims=1)  # (num_products, N, nc)
-    products = exp.(log_products)  # (num_products, N, nc)
+    products = _compute_products(leaves, layer.product_arity, layer.num_products, N, nc)
 
     # =====================================================================
     # 3. Sum layer: smooth disjunction (weighted sum)
     #    Non-negative weights via softplus ensure valid mixture.
     # =====================================================================
-    sum_weights = NNlib.softplus.(ps.SumLogWeights)  # (num_sums, num_products, nc)
-    # Normalize per sum node for probabilistic interpretation
-    sum_weights_norm = sum_weights ./ (sum(sum_weights, dims=2) .+ 1f-8)
+    sum_weights_norm = _normalize_sum_weights(ps.SumLogWeights)
 
     # Batched matmul: for each circuit c, sums_c = W_c * products_c
     # products: (num_products, N, nc) → need (num_products, N) per circuit
@@ -158,29 +136,39 @@ function (layer::AlgebraicCircuitLayer)(hidden_state, ps, st)
     # =====================================================================
     # 4. Compose circuits: mix or multiply
     # =====================================================================
-    composed = if layer.compose_mode == :mix
-        # Softmax mixture weights across circuits
-        mix_weights = NNlib.softmax(ps.ComposeLogWeights)  # (nc,)
-        mix_w = reshape(mix_weights, 1, 1, nc)
-        dropdims(sum(sums .* mix_w, dims=3), dims=3)  # (num_sums, N)
-    else  # :product
-        # Element-wise product across circuits (conjunction)
-        dropdims(prod(sums, dims=3), dims=3)  # (num_sums, N)
-    end
+    composed = _compose_circuits(Val(layer.compose_mode), sums, ps.ComposeLogWeights, nc)
 
     # =====================================================================
     # 5. Output projection + gate + inject
     # =====================================================================
-    projected = ps.OutputWeight * composed .+ ps.OutputBias  # (embedding_dim, N)
-    gate = NNlib.sigmoid.(ps.GateWeight * hidden_flat .+ ps.GateBias)
-    output_flat = hidden_flat .+ gate .* projected
+    output_flat = _project_and_gate(
+        hidden_flat,
+        composed,
+        ps.OutputWeight,
+        ps.OutputBias,
+        ps.GateWeight,
+        ps.GateBias,
+    )
 
-    output = reshape(output_flat, dim, seq_len, batch_size)
-    if !is_batched
-        output = dropdims(output, dims=3)
-    end
+    return reshape(output_flat, dim, seq_len, batch_size)
+end
 
-    return output, st
+"""
+    (layer::AlgebraicCircuitLayer)(hidden_state, ps, st) → (output, state)
+
+Evaluate a bank of algebraic circuits on neural leaf predicates derived
+from the hidden state, compose their outputs, and gate-inject the result.
+
+All operations are standard tensor ops (einsum-native), fully GPU-compatible.
+"""
+function (layer::AlgebraicCircuitLayer)(hidden_state::AbstractMatrix, ps, st)
+    hidden_b = reshape(hidden_state, size(hidden_state, 1), size(hidden_state, 2), 1)
+    output_b = _algebraic_circuit_forward(layer, hidden_b, ps)
+    return dropdims(output_b, dims=3), st
+end
+
+function (layer::AlgebraicCircuitLayer)(hidden_state::AbstractArray{<:Any, 3}, ps, st)
+    return _algebraic_circuit_forward(layer, hidden_state, ps), st
 end
 
 # ============================================================================
@@ -213,6 +201,19 @@ function _compute_leaves(hidden_flat, leaf_weights, leaf_biases, nc)
     return NNlib.sigmoid.(logits)
 end
 
+function _compute_products(leaves, product_arity, num_products, N, nc)
+    leaves = clamp.(leaves, 1f-6, 1f0 - 1f-6)
+    log_leaves = log.(leaves)
+    log_leaves_grouped = reshape(log_leaves, product_arity, num_products, N, nc)
+    log_products = dropdims(sum(log_leaves_grouped, dims=1), dims=1)
+    return exp.(log_products)
+end
+
+function _normalize_sum_weights(sum_log_weights)
+    sum_weights = NNlib.softplus.(sum_log_weights)
+    return sum_weights ./ (sum(sum_weights, dims=2) .+ 1f-8)
+end
+
 function _batched_sum_layer(weights_norm, products, num_sums, N, nc)
     # weights_norm: (num_sums, num_products, nc)
     # products: (num_products, N, nc)
@@ -226,6 +227,22 @@ function _batched_sum_layer(weights_norm, products, num_sums, N, nc)
     # B: (num_products, N, nc) — already correct
     # Result: (num_sums, N, nc)
     return NNlib.batched_mul(weights_norm, products)
+end
+
+function _compose_circuits(::Val{:mix}, sums, compose_log_weights, nc)
+    mix_weights = NNlib.softmax(compose_log_weights)
+    mix_w = reshape(mix_weights, 1, 1, nc)
+    return dropdims(sum(sums .* mix_w, dims=3), dims=3)
+end
+
+function _compose_circuits(::Val{:product}, sums, compose_log_weights, nc)
+    return dropdims(prod(sums, dims=3), dims=3)
+end
+
+function _project_and_gate(hidden_flat, composed, output_weight, output_bias, gate_weight, gate_bias)
+    projected = output_weight * composed .+ output_bias
+    gate = NNlib.sigmoid.(gate_weight * hidden_flat .+ gate_bias)
+    return hidden_flat .+ gate .* projected
 end
 
 # ============================================================================

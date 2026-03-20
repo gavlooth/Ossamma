@@ -28,7 +28,7 @@ using NNlib
 using ChainRulesCore
 using Statistics: mean
 
-using ..Swamma: LuxLayer
+using ..Swamma: LuxLayer, state_with_training, state_is_training
 
 # ============================================================================
 # PredicateEngram
@@ -102,7 +102,7 @@ function _init_rule_bank(rng::Random.AbstractRNG, num_roles::Int, codebook_size:
 end
 
 function Lux.initialstates(rng::Random.AbstractRNG, layer::PredicateEngram)
-    return (
+    return state_with_training(
         # EMA codebook update state (for training)
         ema_cluster_size = ones(Float32, layer.codebook_size),  # N_i running counts
         ema_embed_sum = zeros(Float32, layer.code_dim, layer.codebook_size),  # sum of assigned encodings
@@ -118,34 +118,38 @@ end
 
 Vector quantization with straight-through estimator.
 Forward: returns nearest codebook vector. Backward: gradient passes through
-as identity on `query` (codebook gets gradients via the gather).
+as identity on `query`.
 
 Distance computation stays on-device (no CPU round-trip).
 """
-function vq_quantize(query, codebook)
-    # query: (code_dim, N), codebook: (code_dim, codebook_size)
-
+function _nearest_code_indices(query, codebook)
     # Find nearest codebook entry on-device (no gradient through argmin)
-    indices = ChainRulesCore.ignore_derivatives() do
-        # ||q - c||² = ||q||² + ||c||² - 2 q·c  — all ops stay on device
-        q_sq = sum(query .^ 2, dims=1)         # (1, N)
-        c_sq = sum(codebook .^ 2, dims=1)      # (1, codebook_size)
-        dots = codebook' * query                # (codebook_size, N)
-        dists = q_sq .+ c_sq' .- 2 .* dots     # (codebook_size, N)
-        idx_cart = argmin(dists, dims=1)         # CartesianIndex array
-        vec(map(ci -> ci[1], Array(idx_cart)))   # (N,) — only argmin indices to CPU
+    q_sq = sum(query .^ 2, dims=1)
+    c_sq = sum(codebook .^ 2, dims=1)
+    dots = codebook' * query
+    dists = q_sq .+ c_sq' .- 2 .* dots
+    idx_cart = argmin(dists, dims=1)
+    return vec(map(ci -> ci[1], Array(idx_cart)))
+end
+
+ChainRulesCore.@non_differentiable _nearest_code_indices(query, codebook)
+
+function vq_quantize(query, codebook)
+    indices = _nearest_code_indices(query, codebook)
+    return codebook[:, indices], indices
+end
+
+function ChainRulesCore.rrule(::typeof(vq_quantize), query, codebook)
+    indices = _nearest_code_indices(query, codebook)
+    quantized = codebook[:, indices]
+
+    function pullback(Δ)
+        Δ_quantized = ChainRulesCore.unthunk(Δ[1])
+        query_tangent = Δ_quantized === nothing ? ChainRulesCore.ZeroTangent() : Δ_quantized
+        return ChainRulesCore.NoTangent(), query_tangent, ChainRulesCore.ZeroTangent()
     end
 
-    # Gather quantized vectors (differentiable w.r.t. codebook)
-    quantized = codebook[:, indices]  # (code_dim, N)
-
-    # Straight-through: forward = quantized, backward = identity on query
-    diff = ChainRulesCore.ignore_derivatives() do
-        quantized .- query
-    end
-    quantized_st = query .+ diff
-
-    return quantized_st, indices
+    return (quantized, indices), pullback
 end
 
 # ============================================================================
@@ -232,8 +236,13 @@ function (layer::PredicateEngram)(hidden_state, ps, st)
     # =====================================================================
     # 9. EMA codebook update (mutates state, only meaningful during training)
     # =====================================================================
-    new_st = ChainRulesCore.ignore_derivatives() do
-        _ema_codebook_update(layer, query, indices, st)
+    new_st = if state_is_training(st)
+        ema_updates = ChainRulesCore.ignore_derivatives() do
+            _ema_codebook_update(layer, query, indices, st)
+        end
+        merge(st, ema_updates)
+    else
+        st
     end
 
     return output, new_st

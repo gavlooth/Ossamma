@@ -1,0 +1,41 @@
+# Phase 1 chess pretraining - large 260M-class architecture
+# Uses a small microbatch with gradient accumulation so the model can train
+# without needing the full effective batch resident in one step.
+
+[data]
+path = "data/chess/lichess_db_eval.jsonl"
+max_positions = 1000000
+min_depth = 10
+
+[training]
+checkpoint_dir = "checkpoints/reasoning_drafter/phase1_260m"
+num_epochs = 10
+batch_size = 4
+gradient_accumulation_steps = 8
+learning_rate = 0.0006
+proposer_lr_scale = 0.25
+move_loss_weight = 1.0
+eval_loss_weight = 0.5
+checkpoint_every = 300
+log_every = 25
+debug_every = 1000
+seed = 42
+
+[hardware]
+mixed_precision = true
+precision = "bfloat16"
+
+[model]
+embedding_dimension = 1024
+number_of_heads = 16
+number_of_layers = 24
+time_dimension = 256
+rc_code_dim = 256
+rc_codebook_size = 1024
+rc_integration_steps = 8
+frontend_wave_heads = 8
+circuit_num_leaves = 16
+circuit_product_arity = 2
+circuit_num_sums = 8
+circuit_num_circuits = 4
+use_adapters = false

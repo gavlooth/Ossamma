@@ -1,9 +1,8 @@
 using Lux
 using Random
 using Test
-
-include("../src/Swamma.jl")
-using .Swamma
+using CUDA
+using Swamma
 
 const SW = Swamma
 
@@ -44,6 +43,46 @@ const SW = Swamma
     @test size(outputs.relation_logits) == (config.num_relations, config.max_candidate_pairs, 1)
     @test sum(outputs.span_mask[:, 1]) <= config.max_candidate_spans
     @test sum(outputs.relation_mask[:, 1]) <= config.max_candidate_pairs
+end
+
+@testset "Relation Extraction cache state is mode-safe" begin
+    config = SW.RelationExtractionConfig(
+        vocab_size = 128,
+        max_sequence_length = 16,
+        embedding_dimension = 32,
+        number_of_heads = 4,
+        number_of_layers = 2,
+        num_entity_labels = 5,
+        num_relations = 4,
+        time_dimension = 16,
+        state_dimension = 32,
+        window_size = 2,
+        dropout_rate = 0.0f0,
+        max_candidate_spans = 6,
+        max_candidate_pairs = 8,
+        max_span_width = 4,
+        biaffine_rank = 8,
+        pair_neighbor_radius = 2,
+    )
+
+    model = SW.SwammaRelationExtractor(config)
+    rng = Random.default_rng()
+    ps, st = Lux.setup(rng, model)
+    eval_st = Lux.testmode(st)
+    train_st = Lux.trainmode(eval_st)
+
+    @test !hasproperty(st, :training)
+    @test eval_st.position_indices == st.position_indices
+    @test train_st.position_indices == st.position_indices
+
+    token_ids = reshape(rand(rng, 1:config.vocab_size, 12), 12, 1)
+    outputs_eval, eval_st2 = model((token_ids = token_ids,), ps, eval_st)
+    outputs_train, train_st2 = model((token_ids = token_ids,), ps, train_st)
+
+    @test outputs_eval.entity_logits == outputs_train.entity_logits
+    @test outputs_eval.relation_logits == outputs_train.relation_logits
+    @test eval_st2.position_indices == eval_st.position_indices
+    @test train_st2.position_indices == train_st.position_indices
 end
 
 @testset "Relation Extraction Sparse Routed Proposal" begin
@@ -485,6 +524,148 @@ end
     @test size(outputs.evidence_summary) == (config.embedding_dimension, config.max_candidate_pairs, 1)
     @test size(outputs.retrieval_logits) == (1, config.max_candidate_pairs, 1)
     @test size(outputs.relation_logits) == (config.num_relations, config.max_candidate_pairs, 1)
+end
+
+@testset "Relation Extraction Evidence Diagnostics Stay Host-Side" begin
+    config = SW.RelationExtractionConfig(
+        vocab_size = 128,
+        max_sequence_length = 16,
+        embedding_dimension = 32,
+        number_of_heads = 4,
+        number_of_layers = 2,
+        num_entity_labels = 5,
+        num_relations = 4,
+        time_dimension = 16,
+        state_dimension = 32,
+        window_size = 2,
+        dropout_rate = 0.0f0,
+        max_candidate_spans = 6,
+        max_candidate_pairs = 8,
+        max_span_width = 4,
+        biaffine_rank = 8,
+        pair_neighbor_radius = 2,
+        pair_evidence_dimension = 16,
+        relation_decoder_mode = :fused_evidence,
+        relation_decoder_residual_scale = 0.25f0,
+    )
+
+    model = SW.SwammaRelationExtractor(config)
+    rng = Random.default_rng()
+    ps, st = Lux.setup(rng, model)
+
+    token_ids = reshape(rand(rng, 1:config.vocab_size, 12), 12, 1)
+    token_mask = trues(12, 1)
+
+    ps_run = ps
+    st_run = st
+    token_ids_run = token_ids
+    token_mask_run = token_mask
+    if CUDA.functional()
+        ps_run = CUDA.cu(ps)
+        st_run = CUDA.cu(st)
+        token_ids_run = CUDA.cu(token_ids)
+        token_mask_run = CUDA.cu(token_mask)
+    end
+
+    outputs, _ = model(
+        (
+            token_ids = token_ids_run,
+            token_mask = token_mask_run,
+            emit_evidence_diagnostics = true,
+        ),
+        ps_run,
+        st_run,
+    )
+
+    @test outputs.evidence_top_token_index !== nothing
+    @test outputs.evidence_attention_entropy !== nothing
+    @test outputs.evidence_attention_max_weight !== nothing
+    @test size(outputs.evidence_top_token_index) == (config.max_candidate_pairs, 1)
+    @test size(outputs.evidence_attention_entropy) == (config.max_candidate_pairs, 1)
+    @test size(outputs.evidence_attention_max_weight) == (config.max_candidate_pairs, 1)
+    if CUDA.functional()
+        @test !(outputs.evidence_top_token_index isa CUDA.CuArray)
+        @test !(outputs.evidence_attention_entropy isa CUDA.CuArray)
+        @test !(outputs.evidence_attention_max_weight isa CUDA.CuArray)
+    end
+end
+
+@testset "Relation Extraction Proposal Outputs Stay Device-Resident" begin
+    if CUDA.functional()
+        config = SW.RelationExtractionConfig(
+            vocab_size = 128,
+            max_sequence_length = 16,
+            embedding_dimension = 32,
+            number_of_heads = 4,
+            number_of_layers = 2,
+            num_entity_labels = 5,
+            num_relations = 4,
+            time_dimension = 16,
+            state_dimension = 32,
+            window_size = 2,
+            dropout_rate = 0.0f0,
+            max_candidate_spans = 6,
+            max_candidate_pairs = 8,
+            max_span_width = 4,
+            biaffine_rank = 8,
+            pair_neighbor_radius = 2,
+        )
+
+        model = SW.SwammaRelationExtractor(config)
+        rng = Random.default_rng()
+        ps, st = Lux.setup(rng, model)
+        ps = CUDA.cu(ps)
+        st = CUDA.cu(st)
+
+        token_ids = CUDA.cu(reshape(rand(rng, 1:config.vocab_size, 12), 12, 1))
+        hidden, encoder_state = SW.RelationExtraction.encode_tokens(model, token_ids, ps, st)
+        hidden_flat = reshape(hidden, config.embedding_dimension, :)
+        entity_logits_flat, _ = model.EntityHead(hidden_flat, ps.EntityHead, st.EntityHead)
+        boundary_logits_flat, _ = model.BoundaryHead(hidden_flat, ps.BoundaryHead, st.BoundaryHead)
+        entity_logits = reshape(entity_logits_flat, config.num_entity_labels, 12, 1)
+        boundary_logits = reshape(boundary_logits_flat, 2, 12, 1)
+
+        spans, span_mask, span_scores, span_state, mention_state = SW.RelationExtraction.propose_candidate_spans(
+            model,
+            hidden,
+            entity_logits,
+            boundary_logits;
+            params = ps,
+            state = st,
+            max_candidate_spans = config.max_candidate_spans,
+            max_span_width = config.max_span_width,
+        )
+
+        @test spans isa CUDA.CuArray
+        @test span_mask isa CUDA.CuArray
+        @test span_scores isa CUDA.CuArray
+
+        span_reps, _ = SW.RelationExtraction.build_span_representations(
+            model,
+            hidden,
+            spans,
+            span_mask,
+            ps,
+            st,
+        )
+        combined_scores, _, _ = SW.RelationExtraction.score_existing_spans(
+            model,
+            span_reps,
+            span_mask,
+            entity_logits,
+            boundary_logits,
+            spans,
+            ps,
+            st,
+        )
+
+        @test combined_scores isa CUDA.CuArray
+        @test size(combined_scores) == (config.max_candidate_spans, 1)
+        @test !isempty(findall(@view(span_mask[:, 1])))
+        @test encoder_state !== nothing
+        @test span_state !== nothing
+        @test mention_state !== nothing
+    end
 end
 
 @testset "Relation Extraction Pair MLP Decoder" begin

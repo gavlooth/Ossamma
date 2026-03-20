@@ -51,6 +51,28 @@ using Test
         end
     end
 
+    @testset "legal move generation" begin
+        start_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        start_ids = legal_move_ids(start_fen)
+        @test length(start_ids) == 20
+        @test uci_to_move_id("e2e4") in start_ids
+        @test uci_to_move_id("g1f3") in start_ids
+
+        castle_fen = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
+        castle_ids = legal_move_ids(castle_fen)
+        @test uci_to_move_id("e1g1") in castle_ids
+        @test uci_to_move_id("e1c1") in castle_ids
+
+        ep_fen = "8/8/8/3pP3/8/8/8/4K2k w - d6 0 1"
+        ep_ids = legal_move_ids(ep_fen)
+        @test uci_to_move_id("e5d6") in ep_ids
+
+        mask = legal_move_mask(start_fen)
+        @test size(mask) == (MOVE_VOCAB_SIZE,)
+        @test mask[uci_to_move_id("e2e4")] == 1.0f0
+        @test mask[uci_to_move_id("e1e2")] == 0.0f0
+    end
+
     @testset "metadata" begin
         meta = fen_to_metadata("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
         @test meta[1] == 1.0f0  # black to move
@@ -90,6 +112,14 @@ end
         @test size(batch.metadata) == (6, 3)
         @test length(batch.best_move_ids) == 3
         @test length(batch.eval_scores) == 3
+        @test size(batch.legal_move_mask) == (MOVE_VOCAB_SIZE, 3)
+        @test length(batch.legal_move_counts) == 3
+        @test length(batch.target_legal_flags) == 3
+        @test all(batch.target_legal_flags)
+        @test all(batch.legal_move_counts .== 20)
+        for i in 1:3
+            @test batch.legal_move_mask[pos.best_move_id, i] == 1.0f0
+        end
     end
 
     @testset "eval normalization" begin
@@ -97,6 +127,22 @@ end
         @test normalize_eval(400) > 0.7f0
         @test normalize_eval(-400) < -0.7f0
         @test abs(normalize_eval(10000)) > 0.99f0  # near mate
+    end
+
+    @testset "real sample targets stay legal" begin
+        sample_positions = Swamma.ChessDataset.ChessPosition[]
+        open(joinpath(@__DIR__, "..", "data", "chess", "sample_100k.jsonl"), "r") do io
+            for line in eachline(io)
+                pos = ChessDataset.parse_lichess_eval_line(line)
+                pos === nothing && continue
+                push!(sample_positions, pos)
+                length(sample_positions) >= 5 && break
+            end
+        end
+        @test length(sample_positions) == 5
+        batch = prepare_batch(sample_positions)
+        @test all(batch.target_legal_flags)
+        @test all(batch.legal_move_counts .> 0)
     end
 end
 

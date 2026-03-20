@@ -116,9 +116,17 @@ function WavePDELayer(
     )
 end
 
+_fft_work_type(::Type{T}) where {T<:AbstractFloat} = T
+_fft_work_type(::Type{Float16}) = Float32
+_fft_work_type(::Type{Core.BFloat16}) = Float32
+
 function laplacian_batch(u::AbstractMatrix, λ::AbstractVector)
-    U = fft(u, 1)
-    real.(ifft(λ .* U, 1))
+    input_type = eltype(u)
+    work_type = _fft_work_type(input_type)
+    u_fft = work_type === input_type ? u : work_type.(u)
+    λ_fft = eltype(λ) === work_type ? λ : work_type.(λ)
+    spectral = real.(ifft(λ_fft .* fft(u_fft, 1), 1))
+    return work_type === input_type ? spectral : input_type.(spectral)
 end
 
 function leapfrog_step(
@@ -161,8 +169,23 @@ end
 # ============================================================================
 
 function Lux.initialstates(_rng::Random.AbstractRNG, _layer::WavePDELayer)
-    # Projection-free Wave-PDE block is stateless across forwards.
-    NamedTuple()
+    return (lambda_cache = nothing,)
+end
+
+function _ensure_lambda_cache(layer::WavePDELayer, template, state)
+    cache = get(state, :lambda_cache, nothing)
+    template_is_gpu = occursin("CuArray", string(typeof(template)))
+    cache_matches = cache !== nothing &&
+                    occursin("CuArray", string(typeof(cache))) == template_is_gpu &&
+                    length(cache) == length(layer.lambda)
+    cache_matches && return cache, state
+
+    λ = if template_is_gpu
+        CUDA.CuArray(layer.lambda)
+    else
+        copy(layer.lambda)
+    end
+    return λ, merge(state, (lambda_cache = λ,))
 end
 
 # ============================================================================
@@ -188,33 +211,30 @@ function (layer::WavePDELayer)(input_sequence::AbstractArray, parameters, state)
         "WavePDELayer expects first input axis = state_dimension ($N), got $n_spatial.",
     ))
 
-    c = NNlib.softplus.(parameters.log_wave_speed)
-    γ = NNlib.softplus.(parameters.log_damping)
-    length(c) == N || throw(ArgumentError("Expected $(N) wave-speed params, got $(length(c))."))
-    length(γ) == N || throw(ArgumentError("Expected $(N) damping params, got $(length(γ))."))
-
     dt = layer.default_time_step
-    maximum(c) * dt >= 1f0 &&
-        @warn "WavePDE stability condition violated: Δt·max(c) = $(dt * maximum(c)) ≥ 1"
 
-    c_sq = reshape(c .^ 2, N, 1)
-    d = reshape(exp.(-γ .* dt ./ 2f0), N, 1)
+    # Entire PDE computation detached from AD tape to prevent memory blowup.
+    # Modulation + leapfrog integration all inside ignore_derivatives.
+    λ, state = _ensure_lambda_cache(layer, standardized, state)
 
-    # Run PDE on each column independently (columns = sequence*batch).
-    u = reshape(standardized, N, :)
-    v = zero(eltype(u)) .* u
+    final_output = ChainRulesCore.ignore_derivatives() do
+        c = NNlib.softplus.(parameters.log_wave_speed)
+        γ = NNlib.softplus.(parameters.log_damping)
 
-    # Put λ on the same device/container as parameters.
-    λ = ChainRulesCore.ignore_derivatives() do
-        c isa CUDA.CuArray ? CUDA.CuArray(layer.lambda) : copy(layer.lambda)
+        c_sq = reshape(c .^ 2, N, 1)
+        d = reshape(exp.(-γ .* dt ./ 2f0), N, 1)
+
+        u = reshape(standardized, N, :)
+        v = zero(eltype(u)) .* u
+
+        for _ in 1:layer.integration_steps
+            u, v = leapfrog_step(u, v, c_sq, d, λ, dt)
+        end
+
+        output_tensor = reshape(u, N, n_columns, n_batches)
+        is_batched ? output_tensor : dropdims(output_tensor; dims = 3)
     end
 
-    for _ in 1:layer.integration_steps
-        u, v = leapfrog_step(u, v, c_sq, d, λ, dt)
-    end
-
-    output_tensor = reshape(u, N, n_columns, n_batches)
-    final_output = is_batched ? output_tensor : dropdims(output_tensor; dims = 3)
     return (final_output, state)
 end
 

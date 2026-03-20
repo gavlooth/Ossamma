@@ -21,7 +21,9 @@ using TOML
 using Serialization
 
 using ..LLaDA: LLaDAModel, LLaDAConfig, apply_subtoken_mask, sample_mask_ratio
+using ..LLaDA: prepare_prime_forward_inputs
 using ..LLaDA: token_ids_to_subtokens
+using ..Swamma: is_gpu_array, to_device_like
 
 # ============================================================================
 # Loss Functions
@@ -74,27 +76,18 @@ Uses one-hot encoding created outside the gradient tape.
 """
 function masked_cross_entropy_vectorized(logits, targets, mask)
     vocab_size, seq_len, batch_size = size(logits)
+    token_count = seq_len * batch_size
 
     # Log softmax
     log_probs = NNlib.logsoftmax(logits, dims=1)
-
-    # Create one-hot encoding outside gradient computation.
-    targets_onehot = ChainRulesCore.ignore_derivatives() do
-        oh = zeros(Float32, vocab_size, seq_len, batch_size)
-        for b in 1:batch_size
-            for s in 1:seq_len
-                t = targets[s, b]
-                if 1 <= t <= vocab_size
-                    oh[t, s, b] = 1.0f0
-                end
-            end
-        end
-        oh
+    log_probs_flat = reshape(log_probs, vocab_size, :)
+    target_indices = ChainRulesCore.ignore_derivatives() do
+        clamped_targets = clamp.(targets, 1, vocab_size)
+        offsets_cpu = reshape(Int.(0:vocab_size:(token_count - 1) * vocab_size), seq_len, batch_size)
+        offsets = to_device_like(clamped_targets, offsets_cpu)
+        vec(clamped_targets .+ offsets)
     end
-
-    # Element-wise multiply and sum over vocab dimension
-    # Result: (seq, batch) - this IS differentiated
-    target_log_probs = dropdims(sum(log_probs .* targets_onehot, dims=1), dims=1)
+    target_log_probs = reshape(log_probs_flat[target_indices], seq_len, batch_size)
 
     # Mask and average
     mask_float = Float32.(mask)
@@ -134,7 +127,68 @@ function diffusion_loss(
         )
         (masked_subtokens, token_mask)
     end
-    inputs = (subtoken_state = masked_subtokens, mask_ratio = t)
+    prime_runtime = ChainRulesCore.ignore_derivatives() do
+        prepare_prime_forward_inputs(
+            model,
+            masked_subtokens;
+            reference_device = masked_subtokens,
+        )
+    end
+    inputs = (
+        subtoken_state = masked_subtokens,
+        mask_ratio = t,
+        prime_compatibility_mask = prime_runtime.prime_compatibility_mask,
+        token_ids_for_engram = prime_runtime.token_ids_for_engram,
+    )
+    logits, new_state = model(inputs, params, state)
+    loss = masked_cross_entropy_vectorized(logits, token_ids, token_mask)
+
+    return loss, new_state
+end
+
+function diffusion_loss_with_padding(
+    model::LLaDAModel,
+    params,
+    state,
+    token_ids::AbstractArray,
+    pad_id::Integer;
+    rng::Random.AbstractRNG = Random.default_rng(),
+    schedule::Symbol = :uniform,
+    mask_ratio = nothing,
+)
+    t = isnothing(mask_ratio) ? sample_mask_ratio(rng; schedule = schedule) : Float32(mask_ratio)
+
+    token_ids_cpu = ChainRulesCore.ignore_derivatives() do
+        is_gpu_array(token_ids) ? Array(token_ids) : token_ids
+    end
+    masked_subtokens_cpu, token_mask_cpu = ChainRulesCore.ignore_derivatives() do
+        subtoken_state = token_ids_to_subtokens(token_ids_cpu, model.prime_code_table)
+        masked_subtokens, _, token_mask = apply_subtoken_mask(
+            subtoken_state, t, model.prime_mask_subtoken_id; rng = rng
+        )
+        token_mask .&= token_ids_cpu .!= pad_id
+        (masked_subtokens, token_mask)
+    end
+
+    masked_subtokens, token_mask = ChainRulesCore.ignore_derivatives() do
+        (
+            to_device_like(token_ids, masked_subtokens_cpu),
+            to_device_like(token_ids, token_mask_cpu),
+        )
+    end
+    prime_runtime = ChainRulesCore.ignore_derivatives() do
+        prepare_prime_forward_inputs(
+            model,
+            masked_subtokens;
+            reference_device = masked_subtokens,
+        )
+    end
+    inputs = (
+        subtoken_state = masked_subtokens,
+        mask_ratio = t,
+        prime_compatibility_mask = prime_runtime.prime_compatibility_mask,
+        token_ids_for_engram = prime_runtime.token_ids_for_engram,
+    )
     logits, new_state = model(inputs, params, state)
     loss = masked_cross_entropy_vectorized(logits, token_ids, token_mask)
 
@@ -590,7 +644,7 @@ end
 # Exports
 # ============================================================================
 
-export masked_cross_entropy, masked_cross_entropy_vectorized, diffusion_loss
+export masked_cross_entropy, masked_cross_entropy_vectorized, diffusion_loss, diffusion_loss_with_padding
 export TrainState, create_train_state, train_step!
 export clip_gradients
 export warmup_cosine_schedule, create_scheduled_optimizer

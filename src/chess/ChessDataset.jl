@@ -166,6 +166,9 @@ Collate a vector of ChessPositions into training-ready batch arrays:
 - metadata: (6, batch) Float32 matrix
 - best_move_ids: (batch,) Int vector
 - eval_scores: (batch,) Float32 vector (normalized)
+- legal_move_mask: (MOVE_VOCAB_SIZE, batch) Float32 matrix
+- legal_move_counts: (batch,) Int vector
+- target_legal_flags: (batch,) Bool vector
 """
 function prepare_batch(positions::AbstractVector{ChessPosition})
     batch_size = length(positions)
@@ -173,12 +176,26 @@ function prepare_batch(positions::AbstractVector{ChessPosition})
     metadata = Matrix{Float32}(undef, 6, batch_size)
     best_move_ids = Vector{Int}(undef, batch_size)
     eval_scores = Vector{Float32}(undef, batch_size)
+    legal_move_mask = zeros(Float32, MOVE_VOCAB_SIZE, batch_size)
+    legal_move_counts = Vector{Int}(undef, batch_size)
+    target_legal_flags = Vector{Bool}(undef, batch_size)
 
     for (i, pos) in enumerate(positions)
         board_tokens[:, i] = pos.tokens
         metadata[:, i] = pos.metadata
         best_move_ids[i] = pos.best_move_id
         eval_scores[i] = pos.eval_normalized
+        legal_ids = legal_move_ids(pos.fen)
+        legal_count = length(legal_ids)
+        legal_move_counts[i] = legal_count
+        target_legal = pos.best_move_id in legal_ids
+        target_legal_flags[i] = target_legal
+        for move_id in legal_ids
+            legal_move_mask[move_id, i] = 1.0f0
+        end
+        if !target_legal
+            legal_move_mask[pos.best_move_id, i] = 1.0f0
+        end
     end
 
     return (
@@ -186,6 +203,9 @@ function prepare_batch(positions::AbstractVector{ChessPosition})
         metadata = metadata,
         best_move_ids = best_move_ids,
         eval_scores = eval_scores,
+        legal_move_mask = legal_move_mask,
+        legal_move_counts = legal_move_counts,
+        target_legal_flags = target_legal_flags,
     )
 end
 

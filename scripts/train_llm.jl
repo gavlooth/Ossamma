@@ -18,7 +18,6 @@ using Zygote
 using Optimisers
 using Statistics: mean
 using Serialization
-using NNlib: logsoftmax, onehotbatch
 using Printf
 
 # GPU support
@@ -29,9 +28,7 @@ using LuxCUDA
 if CUDA.functional()
     println("✓ CUDA available: $(CUDA.name(CUDA.device()))"); flush(stdout)
     println("  Memory: $(round(CUDA.total_memory() / 1e9, digits=1)) GB"); flush(stdout)
-    # Allow scalar operations - some operations fall back to CPU
-    # This is slower but necessary until all ops are GPU-native
-    CUDA.allowscalar(true)
+    CUDA.allowscalar(false)
     const GPU_DEVICE = gpu_device()
 else
     println("✗ CUDA not available, using CPU"); flush(stdout)
@@ -123,28 +120,53 @@ function finish!(pb::ProgressBar)
     update!(pb, pb.total)
 end
 
+function env_flag(name::String, default::Bool = false)
+    value = get(ENV, name, default ? "1" : "0")
+    return lowercase(strip(value)) in ("1", "true", "yes", "on")
+end
+
+function env_int(name::String, default::Int)
+    value = get(ENV, name, string(default))
+    parsed = tryparse(Int, value)
+    return isnothing(parsed) ? default : parsed
+end
+
+function env_float(name::String, default::Float64)
+    value = get(ENV, name, string(default))
+    parsed = tryparse(Float64, value)
+    return isnothing(parsed) ? default : parsed
+end
+
+const SMOKE_MODE = env_flag("SWAMMA_LLM_SMOKE", false)
+
 # Higher complexity configuration - MAX GPU utilization for RTX 5090
 const CONFIG = (
     # Model architecture - meaningful LLM size
-    embedding_dim = 512,      # Larger embedding
-    num_heads = 8,            # 8 heads
-    num_layers = 6,           # 6 layers (~32M params)
-    seq_length = 256,         # Longer context
+    embedding_dim = env_int("SWAMMA_LLM_EMBEDDING_DIM", SMOKE_MODE ? 128 : 512),
+    num_heads = env_int("SWAMMA_LLM_NUM_HEADS", SMOKE_MODE ? 4 : 8),
+    num_layers = env_int("SWAMMA_LLM_NUM_LAYERS", SMOKE_MODE ? 2 : 6),
+    seq_length = env_int("SWAMMA_LLM_SEQ_LENGTH", SMOKE_MODE ? 64 : 256),
 
     # Training - LARGE batch for 32GB VRAM
-    batch_size = 64,          # Large batch for RTX 5090
-    num_epochs = 20,          # More epochs
-    learning_rate = 3e-4,     # Higher LR for large batch
-    min_lr = 1e-6,
-    warmup_steps = 200,
+    batch_size = env_int("SWAMMA_LLM_BATCH_SIZE", SMOKE_MODE ? 4 : 64),
+    num_epochs = env_int("SWAMMA_LLM_NUM_EPOCHS", SMOKE_MODE ? 1 : 20),
+    learning_rate = env_float("SWAMMA_LLM_LEARNING_RATE", 3e-4),
+    min_lr = env_float("SWAMMA_LLM_MIN_LR", 1e-6),
+    warmup_steps = env_int("SWAMMA_LLM_WARMUP_STEPS", SMOKE_MODE ? 1 : 200),
 
     # Tokenization
-    max_vocab_size = 10000,   # Larger vocab
-    min_word_freq = 2,        # Keep more words
+    max_vocab_size = env_int("SWAMMA_LLM_MAX_VOCAB", SMOKE_MODE ? 512 : 10000),
+    min_word_freq = env_int("SWAMMA_LLM_MIN_WORD_FREQ", 2),
+    max_books = env_int("SWAMMA_LLM_MAX_BOOKS", SMOKE_MODE ? 2 : 10),
+    max_chunks = env_int("SWAMMA_LLM_MAX_CHUNKS", SMOKE_MODE ? 64 : 0),
+    max_train_batches = env_int("SWAMMA_LLM_MAX_TRAIN_BATCHES", SMOKE_MODE ? 2 : 0),
+    max_val_batches = env_int("SWAMMA_LLM_MAX_VAL_BATCHES", SMOKE_MODE ? 1 : 0),
+    skip_generation = env_flag("SWAMMA_LLM_SKIP_GENERATION", SMOKE_MODE),
+    generation_steps = env_int("SWAMMA_LLM_GENERATION_STEPS", SMOKE_MODE ? 8 : 75),
 
     # Checkpointing
-    checkpoint_dir = "checkpoints_llm",
-    log_every = 10,           # More frequent logging
+    checkpoint_dir = get(ENV, "SWAMMA_LLM_CHECKPOINT_DIR", "checkpoints_llm"),
+    log_every = env_int("SWAMMA_LLM_LOG_EVERY", SMOKE_MODE ? 1 : 10),
     save_every_epoch = 1,
 )
 
@@ -156,6 +178,7 @@ println("  Sequence length: $(CONFIG.seq_length)"); flush(stdout)
 println("  Vocab size: $(CONFIG.max_vocab_size)"); flush(stdout)
 println("  Batch size: $(CONFIG.batch_size)"); flush(stdout)
 println("  Epochs: $(CONFIG.num_epochs)"); flush(stdout)
+println("  Smoke mode: $(SMOKE_MODE)"); flush(stdout)
 
 mkpath(CONFIG.checkpoint_dir)
 
@@ -339,7 +362,8 @@ end
 
 # Load all texts
 all_texts = String[]
-for (name, url) in GUTENBERG_URLS
+selected_books = collect(Iterators.take(pairs(GUTENBERG_URLS), CONFIG.max_books))
+for (name, url) in selected_books
     println("  Loading: $name"); flush(stdout)
     raw = download_gutenberg(url)
     if !isempty(raw)
@@ -362,6 +386,9 @@ for text in all_texts
             push!(chunks, para)
         end
     end
+end
+if CONFIG.max_chunks > 0 && length(chunks) > CONFIG.max_chunks
+    resize!(chunks, CONFIG.max_chunks)
 end
 println("    Total chunks: $(length(chunks))"); flush(stdout)
 
@@ -401,8 +428,7 @@ function create_batches(data::Vector{Vector{Int}}, batch_size::Int)
     for i in 1:batch_size:length(data)
         end_idx = min(i + batch_size - 1, length(data))
         batch_data = data[i:end_idx]
-        if length(batch_data) == batch_size
-            # Stack into (seq_length, batch_size) matrix
+        if !isempty(batch_data)
             batch = hcat([ids for ids in batch_data]...)
             push!(batches, batch)
         end
@@ -412,6 +438,14 @@ end
 
 train_batches = create_batches(train_ids, CONFIG.batch_size)
 val_batches = create_batches(val_ids, CONFIG.batch_size)
+if CONFIG.max_train_batches > 0 && length(train_batches) > CONFIG.max_train_batches
+    resize!(train_batches, CONFIG.max_train_batches)
+end
+if CONFIG.max_val_batches > 0 && length(val_batches) > CONFIG.max_val_batches
+    resize!(val_batches, CONFIG.max_val_batches)
+end
+isempty(train_batches) && error("No training batches available. Reduce batch size or increase available chunks.")
+isempty(val_batches) && error("No validation batches available. Reduce batch size or increase available chunks.")
 println("  Train batches: $(length(train_batches)), Val batches: $(length(val_batches))"); flush(stdout)
 
 # ============================================================================
@@ -462,41 +496,18 @@ println("  Architecture: $(CONFIG.num_layers) layers, $(CONFIG.num_heads) heads,
 
 function compute_loss_with_padding(model, params, state, batch_cpu, tokenizer, mask_ratio)
     pad_id = tokenizer.pad_id
-    vocab_size = tokenizer.vocab_size
 
     # Move batch to GPU
     batch = CuArray(batch_cpu)
-
-    inputs = (token_ids = batch, mask_ratio = mask_ratio)
-    logits, new_state = model(inputs, params, state)
-
-    seq_len, batch_sz = size(batch)
-    n = seq_len * batch_sz
-
-    # Flatten
-    logits_flat = reshape(logits, vocab_size, :)  # (vocab, n)
-    targets_flat = reshape(batch, :)               # (n,) - on GPU
-
-    # Numerically stable log softmax
-    log_probs = logsoftmax(logits_flat, dims=1)   # (vocab, n)
-
-    # GPU-friendly one-hot: create on CPU then transfer as Float32 array
-    targets_cpu = Array(targets_flat)
-    one_hot_cpu = Float32.(onehotbatch(targets_cpu, 1:vocab_size))  # (vocab, n) Float32 on CPU
-    one_hot = CuArray(one_hot_cpu)  # Move to GPU
-
-    # Gather target log probs via element-wise multiply and sum
-    target_log_probs = sum(log_probs .* one_hot, dims=1)  # (1, n)
-
-    # Create padding mask (1 for non-pad, 0 for pad) on GPU
-    mask_cpu = Float32.(targets_cpu .!= pad_id)  # (n,) on CPU
-    mask = CuArray(reshape(mask_cpu, 1, :))  # (1, n) on GPU
-
-    # Masked cross-entropy loss
-    num_tokens = sum(mask)
-    loss = -sum(target_log_probs .* mask) / max(num_tokens, 1.0f0)
-
-    return loss, new_state
+    return diffusion_loss_with_padding(
+        model,
+        params,
+        state,
+        batch,
+        pad_id;
+        rng = rng,
+        mask_ratio = mask_ratio,
+    )
 end
 
 # ============================================================================
@@ -514,6 +525,7 @@ opt_state = Optimisers.setup(optimizer, ps)
 global_step = 0
 best_val_loss = Inf32
 start_time = time()
+total_train_steps = max(CONFIG.num_epochs * length(train_batches), 1)
 
 for epoch in 1:CONFIG.num_epochs
     global global_step, best_val_loss, ps, st, opt_state
@@ -537,10 +549,14 @@ for epoch in 1:CONFIG.num_epochs
         global_step += 1
 
         # Learning rate schedule with warmup and cosine decay
-        if global_step < CONFIG.warmup_steps
+        if total_train_steps <= CONFIG.warmup_steps
+            lr = Float32(CONFIG.learning_rate)
+        elseif global_step <= CONFIG.warmup_steps
             lr = Float32(CONFIG.learning_rate * global_step / CONFIG.warmup_steps)
         else
-            progress = Float32(global_step - CONFIG.warmup_steps) / Float32(CONFIG.num_epochs * length(train_batches) - CONFIG.warmup_steps)
+            decay_steps = max(total_train_steps - CONFIG.warmup_steps, 1)
+            progress = Float32(global_step - CONFIG.warmup_steps) / Float32(decay_steps)
+            progress = clamp(progress, 0.0f0, 1.0f0)
             lr = Float32(CONFIG.min_lr + 0.5 * (CONFIG.learning_rate - CONFIG.min_lr) * (1 + cos(π * progress)))
         end
         Optimisers.adjust!(opt_state, lr)
@@ -589,13 +605,14 @@ for epoch in 1:CONFIG.num_epochs
     avg_loss = num_steps > 0 ? epoch_loss / num_steps : 0.0f0
     epoch_time = time() - epoch_start
     println("Epoch $epoch done | Avg Loss: $(round(avg_loss, digits=4)) | Time: $(round(epoch_time/60, digits=1)) min"); flush(stdout)
+    eval_st = Lux.testmode(st)
 
     # Validation with progress bar
     val_loss = 0.0f0
     val_steps = 0
     val_pb = ProgressBar(length(val_batches); width=30, desc="Validate ")
     for (i, batch) in enumerate(val_batches)
-        loss, _ = compute_loss_with_padding(model, ps, st, batch, tokenizer, 0.5f0)
+        loss, _ = compute_loss_with_padding(model, ps, eval_st, batch, tokenizer, 0.5f0)
         if !isnan(loss)
             val_loss += loss
             val_steps += 1
@@ -631,16 +648,18 @@ for epoch in 1:CONFIG.num_epochs
         println("  New best model!"); flush(stdout)
     end
 
-    # Generate sample
-    println("Sample generation:"); flush(stdout)
-    try
-        gen_ids = generate(model, ps, st, CONFIG.seq_length; num_steps=50, batch_size=1, rng=rng)
-        text = decode_ids(tokenizer, vec(gen_ids))
-        # Show first 150 chars
-        sample = length(text) > 150 ? text[1:150] * "..." : text
-        println("  \"$sample\""); flush(stdout)
-    catch e
-        println("  Generation failed: $e"); flush(stdout)
+    if !CONFIG.skip_generation
+        println("Sample generation:"); flush(stdout)
+        try
+            gen_ids = generate(model, ps, eval_st, CONFIG.seq_length; num_steps=CONFIG.generation_steps, batch_size=1, rng=rng)
+            text = decode_ids(tokenizer, vec(gen_ids))
+            sample = length(text) > 150 ? text[1:150] * "..." : text
+            println("  \"$sample\""); flush(stdout)
+        catch e
+            println("  Generation failed: $e"); flush(stdout)
+        end
+    else
+        println("Sample generation skipped"); flush(stdout)
     end
 end
 
@@ -654,14 +673,17 @@ println("  Checkpoints: $(CONFIG.checkpoint_dir)/"); flush(stdout)
 println("=" ^ 70); flush(stdout)
 
 # Final generation samples
-println("\n--- Final Generated Samples ---"); flush(stdout)
-for i in 1:5
-    try
-        gen_ids = generate(model, ps, st, CONFIG.seq_length; num_steps=75, batch_size=1, rng=Random.MersenneTwister(i * 42))
-        text = decode_ids(tokenizer, vec(gen_ids))
-        println("\nSample $i:"); flush(stdout)
-        println(text[1:min(300, length(text))]); flush(stdout)
-    catch e
-        println("Sample $i failed: $e"); flush(stdout)
+if !CONFIG.skip_generation
+    final_eval_st = Lux.testmode(st)
+    println("\n--- Final Generated Samples ---"); flush(stdout)
+    for i in 1:5
+        try
+            gen_ids = generate(model, ps, final_eval_st, CONFIG.seq_length; num_steps=CONFIG.generation_steps, batch_size=1, rng=Random.MersenneTwister(i * 42))
+            text = decode_ids(tokenizer, vec(gen_ids))
+            println("\nSample $i:"); flush(stdout)
+            println(text[1:min(300, length(text))]); flush(stdout)
+        catch e
+            println("Sample $i failed: $e"); flush(stdout)
+        end
     end
 end

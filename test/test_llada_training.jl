@@ -2,14 +2,12 @@ using Test
 using Random
 using Lux
 using Optimisers
-
-include("../src/Swamma.jl")
-using .Swamma
+using Swamma
 
 @testset "LLaDA Training Smoke" begin
     rng = Random.MersenneTwister(123)
-    cfg = small_config()
-    model = LLaDAModel(cfg)
+    cfg = Swamma.small_config()
+    model = Swamma.LLaDA.LLaDAModel(cfg)
 
     # Small synthetic batch in the expected token-id range.
     batch = rand(rng, 1:cfg.vocab_size, cfg.max_sequence_length, 2)
@@ -27,9 +25,9 @@ using .Swamma
 
     @testset "Single Train Step Advances State" begin
         optimizer = Optimisers.Adam(1f-3)
-        train_state = create_train_state(model, optimizer; rng = rng)
+        train_state = Swamma.Training.create_train_state(model, optimizer; rng = rng)
 
-        loss = train_step!(
+        loss = Swamma.Training.train_step!(
             train_state, model, batch;
             rng = rng, schedule = :cosine, gradient_clip = 1.0f0
         )
@@ -41,7 +39,7 @@ end
 
 @testset "LLaDA PRIME Subtoken Smoke" begin
     rng = Random.MersenneTwister(321)
-    cfg = LLaDAConfig(
+    cfg = Swamma.LLaDAConfig(
         vocab_size = 512,
         max_sequence_length = 32,
         embedding_dimension = 64,
@@ -54,7 +52,7 @@ end
         prime_subtoken_length = 4,
         prime_subtoken_base = 8,
     )
-    model = LLaDAModel(cfg)
+    model = Swamma.LLaDA.LLaDAModel(cfg)
     batch = rand(rng, 1:cfg.vocab_size, cfg.max_sequence_length, 2)
 
     @test size(model.prime_code_table) == (cfg.prime_subtoken_length, cfg.vocab_size)
@@ -70,8 +68,8 @@ end
     @test loss > 0
 
     optimizer = Optimisers.Adam(1f-3)
-    train_state = create_train_state(model, optimizer; rng = rng)
-    step_loss = train_step!(
+    train_state = Swamma.Training.create_train_state(model, optimizer; rng = rng)
+    step_loss = Swamma.Training.train_step!(
         train_state, model, batch;
         rng = rng, schedule = :cosine, gradient_clip = 1.0f0
     )

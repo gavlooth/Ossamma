@@ -17,7 +17,7 @@ using ChainRulesCore
 
 # Import parent module components
 using ..Swamma: SwammaBlock, LuxLayer, to_device_like, is_gpu_array
-using ..EngramMod: EngramModule, subtokens_to_token_ids
+using ..EngramMod: EngramModule, prepare_engram_indices, subtokens_to_token_ids
 
 function required_subtoken_base(vocab_size::Int, subtoken_length::Int)
     subtoken_length >= 1 || throw(ArgumentError("subtoken_length must be >= 1"))
@@ -748,14 +748,67 @@ function prime_compatibility_mask(model::LLaDAModel, subtoken_state_cpu::Array{<
     return compat
 end
 
-function apply_prime_carryover_filter(model::LLaDAModel, logits, subtoken_state_batched)
+function prepare_prime_forward_inputs(
+    model::LLaDAModel,
+    subtoken_state_batched;
+    reference_device = subtoken_state_batched,
+    include_engram::Bool = model.use_engram && model.EngramModules !== nothing,
+)
+    subtoken_state_cpu = ChainRulesCore.ignore_derivatives() do
+        is_gpu_array(subtoken_state_batched) ? Array(subtoken_state_batched) : subtoken_state_batched
+    end
     compat_cpu = ChainRulesCore.ignore_derivatives() do
-        subtoken_state_cpu = Array(subtoken_state_batched)
         prime_compatibility_mask(model, subtoken_state_cpu)
     end
-    compat = to_device_like(logits, compat_cpu)
+    token_ids_for_engram = if include_engram
+        ChainRulesCore.ignore_derivatives() do
+            subtokens_to_token_ids(subtoken_state_cpu, model.prime_subtoken_base)
+        end
+    else
+        nothing
+    end
+    return (
+        prime_compatibility_mask = to_device_like(reference_device, compat_cpu),
+        token_ids_for_engram = isnothing(token_ids_for_engram) ? nothing : to_device_like(reference_device, token_ids_for_engram),
+    )
+end
+
+function apply_prime_carryover_filter(logits, compat_mask)
+    compat = to_device_like(logits, compat_mask)
     neg_large = convert(eltype(logits), -1.0f9)
     return ifelse.(compat, logits, neg_large)
+end
+
+function apply_prime_carryover_filter(model::LLaDAModel, logits, subtoken_state_batched)
+    runtime_inputs = prepare_prime_forward_inputs(
+        model,
+        subtoken_state_batched;
+        reference_device = logits,
+        include_engram = false,
+    )
+    return apply_prime_carryover_filter(logits, runtime_inputs.prime_compatibility_mask)
+end
+
+function prepare_engram_forward_inputs(
+    model::LLaDAModel,
+    token_ids_for_engram,
+    state;
+    reference_device = token_ids_for_engram,
+)
+    (model.use_engram && model.EngramModules !== nothing) || return NamedTuple()
+    token_ids_cpu = is_gpu_array(token_ids_for_engram) ? Array(token_ids_for_engram) : token_ids_for_engram
+    num_engrams = length(model.EngramModules)
+    engram_keys = ntuple(i -> Symbol("Engram_$i"), num_engrams)
+    engram_indices = Tuple(
+        prepare_engram_indices(
+            model.EngramModules[i],
+            token_ids_cpu,
+            state.Engrams[Symbol("Engram_$i")].hash_multipliers;
+            reference_device = reference_device,
+        )
+        for i in 1:num_engrams
+    )
+    return NamedTuple{engram_keys}(engram_indices)
 end
 
 function (model::LLaDAModel)(inputs::NamedTuple, params, state)
@@ -783,6 +836,15 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     seq_len = size(subtoken_state_batched, 2)
     batch_size = size(subtoken_state_batched, 3)
     source_for_device = subtoken_state_batched
+    needs_runtime_inputs = !haskey(inputs, :prime_compatibility_mask) || (
+        model.use_engram && model.EngramModules !== nothing && !haskey(inputs, :token_ids_for_engram)
+    )
+    runtime_inputs = needs_runtime_inputs ? prepare_prime_forward_inputs(
+        model,
+        subtoken_state_batched;
+        reference_device = source_for_device,
+    ) : nothing
+    prime_compat_mask = haskey(inputs, :prime_compatibility_mask) ? inputs.prime_compatibility_mask : runtime_inputs.prime_compatibility_mask
 
     subtoken_pairs = ntuple(j -> begin
         key = Symbol("Subtoken_$j")
@@ -833,11 +895,19 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # 5. Reconstruct token IDs for engram (if enabled)
     # =========================================================================
     token_ids_for_engram = if model.use_engram && model.EngramModules !== nothing
-        ChainRulesCore.ignore_derivatives() do
-            subtokens_to_token_ids(Array(subtoken_state_batched), model.prime_subtoken_base)
-        end
+        haskey(inputs, :token_ids_for_engram) ? inputs.token_ids_for_engram : runtime_inputs.token_ids_for_engram
     else
         nothing
+    end
+    engram_indices_for_layers = if model.use_engram && model.EngramModules !== nothing
+        haskey(inputs, :engram_indices) ? inputs.engram_indices : prepare_engram_forward_inputs(
+            model,
+            token_ids_for_engram,
+            state;
+            reference_device = source_for_device,
+        )
+    else
+        NamedTuple()
     end
 
     # =========================================================================
@@ -854,7 +924,7 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
             engram_key = Symbol("Engram_$engram_idx")
             engram_mod = model.EngramModules[engram_idx]
             h_new, _ = engram_mod(
-                (token_ids_for_engram, h),
+                (token_ids_for_engram, h, engram_indices_for_layers[engram_key]),
                 params.Engrams[engram_key],
                 state.Engrams[engram_key],
             )
@@ -885,7 +955,7 @@ function (model::LLaDAModel)(inputs::NamedTuple, params, state)
     # =========================================================================
     # Dense layer can handle 3D input directly
     logits, out_state = model.OutputHead(normalized, params.OutputHead, state.OutputHead)
-    logits = apply_prime_carryover_filter(model, logits, subtoken_state_batched)
+    logits = apply_prime_carryover_filter(logits, prime_compat_mask)
 
     final_logits = was_unbatched ? dropdims(logits, dims = 3) : logits
 
@@ -1086,6 +1156,6 @@ export default_config, small_config, base_config, large_config, production_confi
 
 # Diffusion utilities
 export apply_subtoken_mask, sample_mask_ratio, unmask_subtoken_step, generate
-export token_ids_to_subtokens
+export token_ids_to_subtokens, prepare_prime_forward_inputs
 
 end # module

@@ -1,5 +1,192 @@
 # TODO — SWAMMA Rollout + Legacy Removal
 
+## 2026-03-19 Hardening Queue
+
+This section is the active code-hardening backlog.
+
+Execution rule:
+- Fix strictly from highest risk to lowest risk.
+- Do not optimize around fear of breaking old behavior; when a path is structurally wrong, replace it and add regression coverage.
+- Every item closed here must ship with:
+  - at least one regression test,
+  - one focused benchmark or memory check if the issue is performance-related,
+  - a short session-report entry with the before/after result.
+
+### P0 — Correctness / OOM / Silent Bad Training
+
+- [ ] `scripts/train_reasoning_language.jl` is currently unsafe and likely wrong.
+  - Files:
+    - [`scripts/train_reasoning_language.jl`](/home/christos/code/julia/Swamma/scripts/train_reasoning_language.jl)
+  - Problems:
+    - `b_tokens = to_dev(batch.tokens)` is computed and then ignored.
+    - `make_language_targets(...)` returns `input_tokens` from the original CPU batch, so the model can be called with CPU inputs while params/state live on GPU.
+    - the loss path allocates dense `(vocab, positions)` one-hot targets every batch.
+    - checkpoints save params only, not Lux state, so EMA/stateful behavior is not resumable correctly.
+  - Fix:
+    - move the entire language-loss path to a device-consistent target-index formulation,
+    - pass device-local token indices instead of dense one-hot matrices,
+    - save and restore full train state including `st`,
+    - add a GPU smoke test that proves one training step and one resume step behave identically.
+  - Acceptance:
+    - Phase 3a one-step GPU smoke passes,
+    - resume-from-checkpoint reproduces the same next-step loss within tolerance,
+    - no dense one-hot allocation remains in the hot path.
+
+- [ ] `RelationExtraction` still mixes CPU heuristics and device tensors inside the model hot path.
+  - Files:
+    - [`src/RelationExtraction.jl`](/home/christos/code/julia/Swamma/src/RelationExtraction.jl)
+  - Problems:
+    - candidate span scoring copies logits and masks to CPU in core inference/training paths,
+    - span ranking uses CPU `sortperm` on combined scores,
+    - adjacency construction copies queries/keys/spans to CPU and back,
+    - some diagnostics compute on CPU and then push tensors back to GPU even though they are not model activations.
+  - Fix:
+    - separate model-forward outputs from CPU-only postprocessing/diagnostics,
+    - keep training-time scoring and ranking on device where practical,
+    - if a heuristic must remain on CPU, move it behind an explicit evaluation-only boundary so it cannot silently contaminate training throughput,
+    - keep diagnostics on CPU instead of re-uploading them to GPU.
+  - Acceptance:
+    - training/eval code paths are explicitly split,
+    - a benchmark on a realistic RE batch shows materially fewer host/device sync points,
+    - relation-extraction tests still pass.
+
+- [ ] `LLaDA` PRIME forward still performs full CPU reconstruction work every forward.
+  - Files:
+    - [`src/LLaDA.jl`](/home/christos/code/julia/Swamma/src/LLaDA.jl)
+    - [`src/Engram.jl`](/home/christos/code/julia/Swamma/src/Engram.jl)
+  - Problems:
+    - `apply_prime_carryover_filter` copies full `subtoken_state` to CPU every forward,
+    - engram token reconstruction also copies full subtokens to CPU every forward,
+    - `EngramModule` hashes token IDs on CPU and re-uploads indices every call.
+  - Fix:
+    - redesign PRIME compatibility masking and engram index computation so they are either:
+      - device-native, or
+      - cached/precomputed at the batch boundary rather than recomputed in the model forward.
+    - make the CPU path explicit if it must remain for now, with benchmarks and a kill switch.
+  - Acceptance:
+    - forward profiling shows the per-forward full-batch CPU conversions are gone or isolated behind explicit precompute hooks,
+    - PRIME tests pass on both training and eval paths.
+
+- [ ] `scripts/train_llm.jl` is structurally too expensive and too permissive for GPU training.
+  - Files:
+    - [`scripts/train_llm.jl`](/home/christos/code/julia/Swamma/scripts/train_llm.jl)
+  - Problems:
+    - global `CUDA.allowscalar(true)` masks real GPU correctness/performance failures,
+    - each batch builds one-hot targets on CPU and copies them to GPU,
+    - batch transfer happens inside the loss function instead of at the batch boundary.
+  - Fix:
+    - rewrite the loss to use indexed target gathering / sparse CE semantics,
+    - move all device transfer outside the loss,
+    - run with `CUDA.allowscalar(false)` and fix any remaining offenders.
+  - Acceptance:
+    - loss path contains no CPU one-hot construction,
+    - scalar indexing is disabled,
+    - a smoke training run completes on GPU without scalar fallback.
+
+### P1 — Major Performance Debt / High Leverage Refactors
+
+- [ ] Remove remaining CPU-bound EMA / VQ bookkeeping from model-facing paths.
+  - Files:
+    - [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+    - [`src/PredicateEngram.jl`](/home/christos/code/julia/Swamma/src/PredicateEngram.jl)
+  - Problems:
+    - argmin indices still route through CPU arrays,
+    - EMA application, diagnostics, and dead-code revival are CPU-heavy and easy to misuse in the wrong place.
+  - Fix:
+    - keep training-only bookkeeping out of hot forwards,
+    - add a clean API boundary between forward pass, stats accumulation, diagnostics, and codebook mutation,
+    - evaluate whether indices/stat updates can stay device-local.
+  - Acceptance:
+    - there is no ambiguity about what is safe in train forward vs eval forward vs post-step maintenance.
+
+- [ ] `ReasoningDrafter` inference still re-forwards the full active prefix at every draft step.
+  - Files:
+    - [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+    - [`src/TiDAR.jl`](/home/christos/code/julia/Swamma/src/TiDAR.jl)
+  - Problems:
+    - generation remains O(T²) in the drafted length,
+    - structured modules are currently blocking any realistic cache design.
+  - Fix:
+    - decide explicitly between:
+      - a cacheable recurrent draft architecture, or
+      - keeping the full-prefix design and constraining draft length hard.
+    - stop carrying both mental models.
+  - Acceptance:
+    - either a new cache exists with tests, or the non-cacheable design is codified with explicit limits and benchmarks.
+
+- [ ] Chess reasoning trainer still mixes heavy diagnostics with the train loop.
+  - Files:
+    - [`scripts/train_chess_reasoning.jl`](/home/christos/code/julia/Swamma/scripts/train_chess_reasoning.jl)
+  - Problems:
+    - debug blocks repeatedly call `Array(...)` on weights and stats,
+    - codebook diagnostics and revival logic live inline in the step loop,
+    - training and experiment instrumentation are too tightly coupled.
+  - Fix:
+    - move diagnostics/revival into explicit callbacks or modes,
+    - ensure the default train path is lean,
+    - keep invasive debug collection opt-in.
+  - Acceptance:
+    - the default train loop contains no heavy host copies except checkpointing,
+    - debug mode preserves current observability.
+
+### P2 — Architectural Ambiguity / Subtle Learning Failures
+
+- [ ] Audit every custom Lux layer for consistent `training` / eval semantics.
+  - Files:
+    - [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+    - [`src/PredicateEngram.jl`](/home/christos/code/julia/Swamma/src/PredicateEngram.jl)
+    - [`src/Engram.jl`](/home/christos/code/julia/Swamma/src/Engram.jl)
+    - any other layer with stateful behavior
+  - Problems:
+    - some custom layers now respect `Lux.testmode`, others do not participate in the same contract,
+    - this makes eval behavior fragile and dependent on caller discipline.
+  - Fix:
+    - define a repo-wide rule for custom Lux states,
+    - add tests proving `Lux.testmode` behavior for every stateful custom layer.
+
+- [ ] Decide whether the detached structured modules are a deliberate product choice or a temporary workaround.
+  - Files:
+    - [`src/ReasoningDrafter.jl`](/home/christos/code/julia/Swamma/src/ReasoningDrafter.jl)
+    - [`src/WavePDE.jl`](/home/christos/code/julia/Swamma/src/WavePDE.jl)
+    - [`src/RuleConditionedWavePDE.jl`](/home/christos/code/julia/Swamma/src/RuleConditionedWavePDE.jl)
+  - Problems:
+    - `LinAttn`, `WaveGate`, `Circuit`, and FFT PDE paths are intentionally detached,
+    - upstream gradients exist, but the actual structured modules are not learning directly.
+  - Fix:
+    - either embrace this and document it with hard tests,
+    - or replace the detach-heavy design with checkpointing/custom rules so these modules can learn directly.
+  - Acceptance:
+    - the intended gradient contract is explicit and tested.
+
+- [ ] Consolidate duplicate device-transfer helpers and CPU/GPU branching patterns.
+  - Files:
+    - [`src/Swamma.jl`](/home/christos/code/julia/Swamma/src/Swamma.jl)
+    - [`src/MoET.jl`](/home/christos/code/julia/Swamma/src/MoET.jl)
+    - multiple scripts with local `to_dev`, `tree_to_device`, `tree_to_cpu`
+  - Problems:
+    - multiple near-identical helper implementations,
+    - higher chance of subtle divergence and missed bug fixes.
+  - Fix:
+    - centralize device helpers and reuse them everywhere.
+
+### P3 — Cleanup Once P0/P1 Are Closed
+
+- [ ] Remove dead comments, stale assumptions, and rollout-era drift from code paths already refactored.
+- [ ] Replace script-local ad hoc benchmarking/diagnostic code with shared helpers.
+- [ ] Add a lightweight perf-regression suite for:
+  - drafter generation,
+  - RE forward/eval,
+  - PRIME/LLaDA forward,
+  - checkpoint resume integrity.
+
+### Immediate Iteration Order
+
+- [ ] Iteration 1: fix `train_reasoning_language.jl` correctness and checkpointing.
+- [ ] Iteration 2: split `RelationExtraction` hot path from CPU heuristics/diagnostics.
+- [ ] Iteration 3: remove per-forward CPU reconstruction from `LLaDA` / `Engram`.
+- [ ] Iteration 4: rewrite `train_llm.jl` loss/device path.
+- [ ] Iteration 5: clean remaining EMA/VQ maintenance boundaries.
+
 ## ReasoningDrafter Stabilization Path
 
 - [x] Unblock `ReasoningDrafter` training before any new reasoning runs:

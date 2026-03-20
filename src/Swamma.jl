@@ -47,11 +47,37 @@ Return `true` if `x` is backed by a CUDA array.
 """
 is_gpu_array(x) = occursin("CuArray", string(typeof(x)))
 
+"""
+    state_with_training(; kwargs...) -> NamedTuple
+
+Repository-wide custom Lux state contract:
+- layers whose forward behavior changes between training and evaluation must
+  include `training = Val(true)` in their initial state;
+- layers that only cache deterministic tensors may omit the flag and should be
+  invariant under `Lux.testmode(...)` / `Lux.trainmode(...)`.
+"""
+state_with_training(; kwargs...) = merge((training = Val(true),), kwargs)
+
+_training_flag_is_true(::Val{true}) = true
+_training_flag_is_true(::Val{false}) = false
+_training_flag_is_true(flag::Bool) = flag
+_training_flag_is_true(_flag) = true
+
+"""
+    state_is_training(state) -> Bool
+
+Return whether a custom Lux state should execute training-only behavior.
+Missing `training` flags default to `true` for backward compatibility.
+"""
+state_is_training(state) = _training_flag_is_true(get(state, :training, Val(true)))
+
 # Core deps needed by submodules (must precede includes)
 using Lux
 using Random
 using NNlib
 using Statistics: mean
+using PrecompileTools: @setup_workload, @compile_workload
+import Zygote
 
 const LuxLayer =
     isdefined(Lux, :AbstractExplicitLayer) ? Lux.AbstractExplicitLayer :
@@ -92,32 +118,26 @@ Benefits:
 - Works well for stabilizing GLU gating and attention outputs
 - Used in LLaMA, Mistral, and other modern architectures
 """
-struct RMSNorm <: LuxLayer
+struct RMSNorm{L<:Lux.RMSNorm} <: LuxLayer
     dim::Int
     eps::Float32
+    inner::L
 end
 
 function RMSNorm(dim::Int; eps::Float32 = 1f-6)
-    return RMSNorm(dim, eps)
+    return RMSNorm(dim, eps, Lux.RMSNorm(dim; epsilon = eps))
 end
 
 function Lux.initialparameters(rng::Random.AbstractRNG, layer::RMSNorm)
-    return (scale = ones(Float32, layer.dim),)
+    return Lux.initialparameters(rng, layer.inner)
 end
 
 function Lux.initialstates(rng::Random.AbstractRNG, layer::RMSNorm)
-    return (;)
+    return Lux.initialstates(rng, layer.inner)
 end
 
 function (layer::RMSNorm)(x, ps, st)
-    # x: (dim, ...) - normalize over first dimension
-    # Compute RMS = √(mean(x²) + ε)
-    rms = sqrt.(mean(x .^ 2, dims=1) .+ layer.eps)
-    # Normalize and scale
-    x_norm = x ./ rms
-    # Apply learnable scale (broadcast over other dims)
-    output = x_norm .* reshape(ps.scale, :, ntuple(_ -> 1, ndims(x) - 1)...)
-    return output, st
+    return layer.inner(x, ps, st)
 end
 
 # ============================================================================
@@ -1280,7 +1300,7 @@ using .LLaDA: token_ids_to_subtokens
 # Training Utilities
 # ============================================================================
 include("Training.jl")
-using .Training: masked_cross_entropy, diffusion_loss
+using .Training: masked_cross_entropy, diffusion_loss, diffusion_loss_with_padding
 using .Training: TrainState, create_train_state, train_step!
 using .Training: warmup_cosine_schedule, evaluate, compute_accuracy
 using .Training: TrainingConfig, load_training_config, train!
@@ -1390,6 +1410,46 @@ include("ReasoningDrafter.jl")
 using .ReasoningDrafterMod: ReasoningDrafterConfig, ReasoningDrafterBlock, ReasoningDrafter
 using .ReasoningDrafterMod: draft_reasoning_tokens, estimate_drafter_parameters, apply_reasoning_drafter_ema_codebook!
 
+# Precompile the draft-reasoning hot path so focused tests do not spend their
+# first execution compiling the entire forward/backward stack.
+@setup_workload begin
+    rng = Random.MersenneTwister(0)
+    config = ReasoningDrafterConfig(
+        vocab_size = 32,
+        max_sequence_length = 8,
+        embedding_dimension = 16,
+        number_of_heads = 2,
+        number_of_layers = 1,
+        time_dimension = 8,
+        rc_code_dim = 8,
+        rc_codebook_size = 16,
+        rc_integration_steps = 1,
+        frontend_wave_heads = 2,
+        circuit_num_leaves = 4,
+        circuit_product_arity = 2,
+        circuit_num_sums = 2,
+        circuit_num_circuits = 2,
+    )
+    model = ReasoningDrafter(config)
+    ps = Lux.initialparameters(rng, model)
+    st = Lux.initialstates(rng, model)
+    batched_tokens = reshape(collect(2:9), :, 1)
+    prompt = vec(batched_tokens[1:4, 1])
+
+    @compile_workload begin
+        logits, st2 = model((token_ids = batched_tokens, mask_ratio = 0.25f0), ps, st)
+        model((token_ids = vec(batched_tokens[:, 1]), mask_ratio = 0.5f0), ps, st)
+        model((token_ids = batched_tokens, mask_ratio = Float32[0.25]), ps, Lux.testmode(st))
+        draft_reasoning_tokens(model, prompt, ps, Lux.testmode(st); num_tokens = 2)
+        apply_reasoning_drafter_ema_codebook!(ps, st2, model)
+        Zygote.withgradient(ps) do p
+            draft_logits, _ = model((token_ids = batched_tokens, mask_ratio = 0.5f0), p, st)
+            sum(abs2, draft_logits)
+        end
+        nothing
+    end
+end
+
 # ============================================================================
 # Native Teacher LM (Lux-native causal decoder foundation)
 # ============================================================================
@@ -1476,7 +1536,7 @@ export apply_subtoken_mask, sample_mask_ratio, unmask_subtoken_step, generate
 export token_ids_to_subtokens
 
 # Training utilities
-export masked_cross_entropy, diffusion_loss
+export masked_cross_entropy, diffusion_loss, diffusion_loss_with_padding
 export TrainState, create_train_state, train_step!
 export warmup_cosine_schedule, evaluate, compute_accuracy
 export TrainingConfig, load_training_config, train!

@@ -2,6 +2,8 @@ using Swamma
 using Swamma.PredicateEngramMod
 using Random
 using Lux
+using Zygote
+using ChainRulesCore
 using Test
 
 @testset "PredicateEngram" begin
@@ -75,6 +77,22 @@ using Test
         @test indices[2] == 3
     end
 
+    @testset "VQ quantization straight-through gradient" begin
+        codebook = Float32[1 0 -1; 0 1 -1]
+        query = Float32[0.9 -0.8; 0.1 -0.9]
+
+        loss, grads = Zygote.withgradient(query, codebook) do q, cb
+            quantized, _ = vq_quantize(q, cb)
+            sum(abs2, quantized)
+        end
+
+        grad_query, grad_codebook = grads
+        @test isfinite(loss)
+        @test grad_query !== nothing
+        @test size(grad_query) == size(query)
+        @test grad_codebook === nothing || grad_codebook isa ChainRulesCore.AbstractZero
+    end
+
     @testset "output close to input at init (gate near-closed)" begin
         pe = PredicateEngram(64; code_dim=32, codebook_size=128, num_roles=4)
         ps = Lux.initialparameters(rng, pe)
@@ -129,6 +147,40 @@ using Test
         _, st2 = pe(hidden, ps, st)
         # With ema_decay=0, state should pass through unchanged
         @test st2.ema_cluster_size == st.ema_cluster_size
+    end
+
+    @testset "train/test mode state contract" begin
+        pe = PredicateEngram(64; code_dim=32, codebook_size=128, num_roles=4)
+        st = Lux.initialstates(rng, pe)
+        eval_st = Lux.testmode(st)
+        train_st = Lux.trainmode(eval_st)
+
+        @test st.training === Val(true)
+        @test eval_st.training === Val(false)
+        @test train_st.training === Val(true)
+    end
+
+    @testset "eval mode skips EMA updates" begin
+        pe = PredicateEngram(64; code_dim=32, codebook_size=128, num_roles=4)
+        ps = Lux.initialparameters(rng, pe)
+        st = Lux.testmode(Lux.initialstates(rng, pe))
+
+        hidden = randn(rng, Float32, 64, 8, 2)
+        _, st2 = pe(hidden, ps, st)
+        @test st2.ema_cluster_size == st.ema_cluster_size
+    end
+
+    @testset "trainmode re-enables EMA updates" begin
+        pe = PredicateEngram(64; code_dim=32, codebook_size=128, num_roles=4)
+        ps = Lux.initialparameters(rng, pe)
+        eval_st = Lux.testmode(Lux.initialstates(rng, pe))
+        train_st = Lux.trainmode(eval_st)
+
+        hidden = randn(rng, Float32, 64, 8, 2)
+        _, st2 = pe(hidden, ps, train_st)
+
+        @test st2.training === Val(true)
+        @test st2.ema_cluster_size !== train_st.ema_cluster_size
     end
 end
 

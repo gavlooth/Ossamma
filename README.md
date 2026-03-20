@@ -59,6 +59,51 @@ CI policy (GitHub Actions):
 - manual dispatch: selectable lane (`default`, `medium`, `full`)
 - branch-protection guidance: [`docs/CI.md`](/home/christos/code/julia/Swamma/docs/CI.md)
 
+## Reasoning Pipeline
+
+The reasoning drafter pipeline now has three practical entrypoints:
+
+```bash
+# Minimal end-to-end sanity path
+./scripts/launch_reasoning_pipeline.sh --smoke
+
+# Recommended bounded validation path
+./scripts/launch_reasoning_pipeline.sh --bounded-medium
+
+# Full long-run pipeline
+./scripts/launch_reasoning_pipeline.sh --all
+```
+
+Phase-specific bounded-medium validation is also available:
+
+```bash
+./scripts/launch_reasoning_pipeline.sh --phase 3a --bounded-medium
+./scripts/launch_reasoning_pipeline.sh --phase 3b --bounded-medium
+```
+
+Default checkpoint roots:
+
+- `--smoke` → [`checkpoints/reasoning_drafter_smoke`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter_smoke)
+- `--bounded-medium` → [`checkpoints/reasoning_drafter_medium`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter_medium)
+- `--all` → [`checkpoints/reasoning_drafter`](/home/christos/code/julia/Swamma/checkpoints/reasoning_drafter)
+
+Current measured bounded-medium profiles on the Spark GB10 host:
+
+- Phase 3a bounded-medium:
+  - `64` examples, `batch_size=2`, `max_steps=40`
+  - best loss ≈ `4.1658`
+  - peak process GPU memory ≈ `348 MiB`
+- Phase 3b bounded-medium:
+  - `64` examples, `batch_size=2`, `max_steps=40`
+  - best KL ≈ `4.8578` in phase-only validation
+  - peak process GPU memory ≈ `16.3 GiB`
+
+Operational recommendation:
+
+- Use `--smoke` for parser/config sanity.
+- Use `--bounded-medium` for day-to-day validation.
+- Use `--all` only when you actually want the full longer pipeline.
+
 ## RE `v1_locked` Reproducible Eval
 
 Current locked relation-extraction baseline (English REDFM path):

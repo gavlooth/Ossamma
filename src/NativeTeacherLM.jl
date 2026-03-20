@@ -91,6 +91,13 @@ end
 Lux.initialparameters(::Random.AbstractRNG, ::RotaryEmbedding) = (;)
 Lux.initialstates(::Random.AbstractRNG, ::RotaryEmbedding) = (;)
 
+_device_like(x, ref) = x
+function _device_like(x::AbstractArray, ref::AbstractArray)
+    target = similar(ref, eltype(x), size(x)...)
+    copyto!(target, x)
+    return target
+end
+
 function rope_frequencies(layer::RotaryEmbedding, sequence_length::Int; position_offset::Int = 0)
     pair_count = layer.head_dimension ÷ 2
     positions = reshape(Float32.(position_offset:(position_offset + sequence_length - 1)), 1, sequence_length)
@@ -106,6 +113,8 @@ function apply_rotary_embedding(layer::RotaryEmbedding, x; position_offset::Int 
     # Broadcast-friendly: (pair_count, 1, seq, 1)
     cos_a = reshape(cos.(angles), pair_count, 1, sequence_length, 1)
     sin_a = reshape(sin.(angles), pair_count, 1, sequence_length, 1)
+    cos_a = _device_like(cos_a, x)
+    sin_a = _device_like(sin_a, x)
 
     x_first  = x[1:pair_count, :, :, :]
     x_second = x[(pair_count + 1):head_dimension, :, :, :]
@@ -296,6 +305,7 @@ function causal_attention_forward(
         permutedims(q_flat, (2, 1, 3)),  # (seq_q, head_dim, nh*batch)
         k_flat,                           # (head_dim, key_len, nh*batch)
     ) .* layer.attention_multiplier
+    bias = _device_like(bias, scores)
 
     # Add causal bias and softmax
     weights = NNlib.softmax(scores .+ bias; dims = 2)
